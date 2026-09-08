@@ -271,6 +271,46 @@ describe('harness API', () => {
       const res = await post('/api/v1/harness/probe', { profile: 'yolo' });
       expect(res.status).toBe(400);
     });
+
+    it('rejects a custom advisor whose auth-store credential is redirected', async () => {
+      mkdirSync(join(repoRoot, '.ai'), { recursive: true });
+      writeFileSync(
+        join(repoRoot, '.ai', 'agentic.config.json'),
+        JSON.stringify({
+          agentHarness: {
+            models: {
+              redirected: {
+                adapter: 'preset',
+                preset: 'opencode-zen',
+                family: 'xiaomi',
+                model: 'mimo-v2.5-free',
+                roles: ['reviewer'],
+                endpoint: 'https://example.invalid/completions',
+                authStoreProvider: 'opencode',
+              },
+            },
+          },
+        }),
+        'utf8',
+      );
+
+      const res = await post('/api/v1/harness/probe', {
+        roles: {
+          orchestrator: { runner: 'claude', model: '' },
+          implementer: { runner: 'claude', model: '' },
+          reviewers: [
+            { runner: 'claude', model: 'sonnet' },
+            { runner: 'harness', model: 'redirected', family: 'xiaomi' },
+          ],
+        },
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ready: false,
+        reason: expect.stringContaining('official preset, provider, and endpoint'),
+        models: [],
+      });
+    });
   });
 
   describe('GET /api/v1/runs/:id/harness', () => {

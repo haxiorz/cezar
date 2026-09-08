@@ -11,7 +11,7 @@ import {
   WorkflowIcon,
   XIcon,
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useParams, useSearchParams } from 'react-router'
 
 import { Link, useNavigate } from '@/lib/project-router'
@@ -118,10 +118,31 @@ import {
   type HarnessModelOption,
   type TaskSource,
 } from './new-task-form'
-import { HarnessPanel, HarnessSetupDialog } from './new-task-harness'
 import { parseNewTaskParams } from './new-task-params'
 import { buildPlannedRunBody, pendingPlanOf, type PendingPlan } from './new-task-plan'
 import { PlanReview } from './plan-review'
+
+/** Multi-model is opt-in and off by default. Keep its substantial picker and
+ * dialog surface out of the New Task route's eager graph until the user opens
+ * that tab; both named exports resolve from one shared Vite chunk. */
+const loadHarnessUi = () => import('./new-task-harness')
+const HarnessPanel = lazy(() => loadHarnessUi().then((module) => ({ default: module.HarnessPanel })))
+const HarnessSetupDialog = lazy(() =>
+  loadHarnessUi().then((module) => ({ default: module.HarnessSetupDialog })),
+)
+
+function HarnessPanelLoading() {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      data-slot="harness-panel-loading"
+      className="rounded-xl border border-border bg-card p-4 text-sm text-muted-foreground"
+    >
+      Loading multi-model controls…
+    </div>
+  )
+}
 
 /**
  * `/new` — the full-screen new-task hero (spec §"New task (full-screen, #386)"; visual
@@ -992,39 +1013,43 @@ export function NewTaskRoute() {
         />
 
         {composerMode === 'multi' ? (
-          <HarnessPanel
-            mode={harnessMode}
-            onMode={(next) => update({ harnessMode: next })}
-            skillProfile={harnessSkillProfile}
-            onSkillProfile={(next) => update({ harnessSkillProfile: next })}
-            probe={harnessProbe.data}
-            base={harnessStatusData?.base}
-            baseAcknowledgementReason={harnessBaseReason}
-            onBaseAcknowledgementReason={setHarnessBaseReason}
-            roles={harnessRoles}
-            onRoles={(next) => update({ harnessRoles: next })}
-            options={harnessOptions}
-            presets={harnessPresets}
-            onApplyPreset={(preset) => update({ harnessRoles: preset.roles })}
-            onSavePreset={saveHarnessPreset}
-            onDeletePreset={(id) => persistHarnessPresets(harnessPresets.filter((p) => p.id !== id))}
-            onAddModels={startHarnessSetup}
-          />
+          <Suspense fallback={<HarnessPanelLoading />}>
+            <HarnessPanel
+              mode={harnessMode}
+              onMode={(next) => update({ harnessMode: next })}
+              skillProfile={harnessSkillProfile}
+              onSkillProfile={(next) => update({ harnessSkillProfile: next })}
+              probe={harnessProbe.data}
+              base={harnessStatusData?.base}
+              baseAcknowledgementReason={harnessBaseReason}
+              onBaseAcknowledgementReason={setHarnessBaseReason}
+              roles={harnessRoles}
+              onRoles={(next) => update({ harnessRoles: next })}
+              options={harnessOptions}
+              presets={harnessPresets}
+              onApplyPreset={(preset) => update({ harnessRoles: preset.roles })}
+              onSavePreset={saveHarnessPreset}
+              onDeletePreset={(id) => persistHarnessPresets(harnessPresets.filter((p) => p.id !== id))}
+              onAddModels={startHarnessSetup}
+            />
+          </Suspense>
         ) : (
           <SuggestedChips onPick={(text) => update({ text })} />
         )}
 
         {composerMode === 'multi' && harnessSetupOpen ? (
-          <HarnessSetupDialog
-            families={harnessRunnerFamilies}
-            advisorFamilies={harnessAdvisorFamilies}
-            onConfigure={startHarnessSetup}
-            onBackToTask={() => {
-              setHarnessSetupOpen(false)
-              update({ composerMode: 'task' })
-            }}
-            onClose={() => setHarnessSetupOpen(false)}
-          />
+          <Suspense fallback={null}>
+            <HarnessSetupDialog
+              families={harnessRunnerFamilies}
+              advisorFamilies={harnessAdvisorFamilies}
+              onConfigure={startHarnessSetup}
+              onBackToTask={() => {
+                setHarnessSetupOpen(false)
+                update({ composerMode: 'task' })
+              }}
+              onClose={() => setHarnessSetupOpen(false)}
+            />
+          </Suspense>
         ) : null}
       </div>
 

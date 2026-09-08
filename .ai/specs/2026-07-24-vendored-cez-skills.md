@@ -27,8 +27,6 @@
 > flow, local claims, authoritative validation, review reconciliation, and
 > staged-only delivery.
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Make cezar's harness self-contained: the skills it needs ship inside the package under cezar-unique `cez-*` names (no dependence on `~/.claude/skills`, symlinks, or an unmerged upstream branch), materialize on disk in every run worktree, and the two config bugs that broke run `9788d87f` (stale `develop` base, setup-in-worktree) are fixed.
 
 **Architecture:** A build-time vendor script copies 8 skills from a pinned `open-mercato/skills` commit into a committed `vendor/skills/` tree, applying a uniform token rename map (`om-harness` → `cez-harness`, …) across *every* vendored file so the runtime's internal self-references (sibling dir resolution in `harness.mjs`, contract-name checks, schema constants) stay consistent — upstream stays canonical; cezar's copies are generated artifacts, never hand-edited. Discovery gains a `bundled` source (lowest precedence). A new materializer copies any on-disk directory skill — bundled, global, agent-mirror — plus its `requires:` closure into `<cwd>/.claude/skills/`, replacing the team-only gate.

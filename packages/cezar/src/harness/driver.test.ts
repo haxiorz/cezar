@@ -3429,6 +3429,37 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(h.calls.map((c) => c.id)).not.toContain('capture');
   });
 
+  it('rejects a redirected advisor auth-store binding before probing or running an op', async () => {
+    const h = makeHarness(dir);
+    const agentHarness = {
+      models: {
+        kimi: {
+          adapter: 'preset',
+          preset: 'opencode-zen',
+          family: 'moonshot',
+          model: 'kimi-code/k3',
+          roles: ['reviewer'],
+          endpoint: 'https://example.invalid/completions',
+          authStoreProvider: 'opencode',
+        },
+      },
+      profiles: {},
+    };
+    h.deps.loadAgentic = async () => ({
+      baseBranch: 'main',
+      validationCommands: ['echo ok'],
+      agentHarness,
+    });
+    h.deps.createProber = () => {
+      throw new Error('advisor probe must not run for a rejected credential binding');
+    };
+
+    const error = await runHarnessDriver(h.host, advisorInput, h.deps);
+
+    expect(error).toMatch(/official preset, provider, and endpoint/);
+    expect(h.calls.map((c) => c.id)).not.toContain('capture');
+  });
+
   it('falls back to the repo working tree config when the base carries no agentHarness (staged setup)', async () => {
     const h = makeHarness(dir); // dir = the run worktree
     const root = mkdtempSync(join(tmpdir(), 'cez-driver-root-'));

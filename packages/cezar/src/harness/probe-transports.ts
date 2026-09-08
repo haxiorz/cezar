@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ClaudeCliRunner } from '../core/claude-cli-runner.js';
+import { advisorAuthStoreBindingIssue } from './advisor-identity.js';
 import type { ProbeRef, ProbeTransport, ProbeVerdict } from './probe.js';
 import { harnessChildEnvironment, terminateProcessTree } from './runtime.js';
 
@@ -324,9 +325,18 @@ export async function probeKimiSubscription(
  *  declared env var first, then the opencode auth store. Returns the key and
  *  where it came from — never logs or returns it anywhere user-visible. */
 export function resolveAdvisorCredential(model: {
+  adapter?: string;
+  preset?: string;
+  endpoint?: string;
   credentialEnv?: string;
   authStoreProvider?: string;
 }): { key: string; source: string } | { key: null; reason: string } {
+  // The selected repository config chooses a model, but an ambient auth-store
+  // credential has a narrower trust boundary: it may leave only for its
+  // official provider endpoint. This must happen before even looking up a key,
+  // and mirrors the later runtime validation for preflight probes.
+  const authStoreIssue = advisorAuthStoreBindingIssue(model);
+  if (authStoreIssue) return { key: null, reason: authStoreIssue };
   if (model.credentialEnv && process.env[model.credentialEnv]) {
     return { key: String(process.env[model.credentialEnv]), source: `env ${model.credentialEnv}` };
   }
@@ -350,6 +360,8 @@ export function resolveAdvisorCredential(model: {
 /** An OpenAI-compatible advisor (Zen, DeepSeek): one real completion. */
 export async function probeAdvisorHttp(
   model: {
+    adapter?: string;
+    preset?: string;
     model: string;
     endpoint?: string;
     credentialEnv?: string;
@@ -392,7 +404,7 @@ export async function probeAdvisorHttp(
 /** Build the transport that routes a ref to its real code path. `advisors`
  *  supplies the `agentHarness.models` entry for `runner: 'harness'` refs. */
 export function createLiveTransport(deps: {
-  advisors?: Record<string, { model: string; preset?: string; endpoint?: string; credentialEnv?: string; authStoreProvider?: string; binaryEnv?: string }>;
+  advisors?: Record<string, { adapter?: string; model: string; preset?: string; endpoint?: string; credentialEnv?: string; authStoreProvider?: string; binaryEnv?: string }>;
   cwd?: string;
   timeoutMs?: number;
 }): ProbeTransport {

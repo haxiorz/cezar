@@ -21,6 +21,7 @@
  */
 
 import type { HarnessRoleRef } from './driver.js';
+import { TRUSTED_AUTH_STORE_PRESETS } from './advisor-identity.js';
 import { familyByModelName } from './model-family.js';
 
 /** A synthesized `agentHarness.models` entry, in the runtime's own shape. */
@@ -29,14 +30,19 @@ export interface ReviewerBinding {
   entry: Record<string, unknown>;
 }
 
-const GATEWAYS: Record<string, { endpoint: string; authStoreProvider: string }> = {
+const GATEWAYS: Record<
+  string,
+  { preset: keyof typeof TRUSTED_AUTH_STORE_PRESETS; endpoint: string; authStoreProvider: string }
+> = {
   opencode: {
-    endpoint: 'https://opencode.ai/zen/v1/chat/completions',
-    authStoreProvider: 'opencode',
+    preset: 'opencode-zen',
+    endpoint: TRUSTED_AUTH_STORE_PRESETS['opencode-zen'].endpoint,
+    authStoreProvider: TRUSTED_AUTH_STORE_PRESETS['opencode-zen'].provider,
   },
   deepseek: {
-    endpoint: 'https://api.deepseek.com/chat/completions',
-    authStoreProvider: 'deepseek',
+    preset: 'deepseek-api',
+    endpoint: TRUSTED_AUTH_STORE_PRESETS['deepseek-api'].endpoint,
+    authStoreProvider: TRUSTED_AUTH_STORE_PRESETS['deepseek-api'].provider,
   },
 };
 
@@ -106,7 +112,7 @@ export function synthesizeReviewerBinding(
     id: `cez-${gateway}-${sanitize(bare)}`,
     entry: {
       adapter: 'preset',
-      preset: gateway === 'deepseek' ? 'deepseek-api' : 'opencode-zen',
+      preset: wire.preset,
       family: reviewerFamily(bare, gateway),
       model: bare,
       roles: ['reviewer'],

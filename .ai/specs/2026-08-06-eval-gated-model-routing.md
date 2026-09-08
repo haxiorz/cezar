@@ -1,6 +1,6 @@
 # Eval-gated model routing — analysis of the OM harness feedback and the incorporation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Phases 2–3 are cross-repo (open-mercato / skills) and gated on the Phase 0 decisions; Phase 1 is implementable in this repo today.
+> Phases 2–3 are cross-repo (open-mercato / skills) and gated on the Phase 0 decisions; Phase 1 is implementable in this repo today.
 
 **Goal:** Replace the offline, human-mediated learning loop behind cezar's model routing with a recorded evaluation gate: a model binding becomes (or stays) a default for a role only when the OM harness case suite, replayed per role, says so.
 

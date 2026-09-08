@@ -4,6 +4,53 @@ export interface AdvisorIdentityRef {
   family?: string;
 }
 
+/**
+ * Ambient OpenCode auth-store credentials are safe only for the provider
+ * endpoints they belong to. Keep this host-side table aligned with the
+ * vendored runtime's AUTH_STORE_ENDPOINTS guard: probes run before the runtime
+ * starts, so the runtime cannot enforce this boundary for them.
+ */
+export const TRUSTED_AUTH_STORE_PRESETS = {
+  'deepseek-api': {
+    provider: 'deepseek',
+    endpoint: 'https://api.deepseek.com/chat/completions',
+  },
+  'opencode-zen': {
+    provider: 'opencode',
+    endpoint: 'https://opencode.ai/zen/v1/chat/completions',
+  },
+} as const;
+
+/**
+ * Return the reason a raw advisor binding must not consume a local auth-store
+ * credential. Environment credentials remain available to explicitly
+ * configured OpenAI-compatible adapters; this guard protects ambient store
+ * credentials, whose destination is pinned by the runtime contract.
+ */
+export function advisorAuthStoreBindingIssue(binding: unknown): string | null {
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding)) return null;
+  const model = binding as Record<string, unknown>;
+  const provider = model.authStoreProvider;
+  if (provider === undefined || provider === '') return null;
+  if (typeof provider !== 'string') {
+    return 'has an invalid local auth-store provider';
+  }
+  const preset = model.preset;
+  const trusted =
+    typeof preset === 'string'
+      ? TRUSTED_AUTH_STORE_PRESETS[preset as keyof typeof TRUSTED_AUTH_STORE_PRESETS]
+      : undefined;
+  if (
+    model.adapter !== 'preset' ||
+    !trusted ||
+    provider !== trusted.provider ||
+    model.endpoint !== trusted.endpoint
+  ) {
+    return 'may use local auth only with its official preset, provider, and endpoint';
+  }
+  return null;
+}
+
 export type CanonicalAdvisorRef<T extends AdvisorIdentityRef> =
   T extends { runner: 'harness' } ? Omit<T, 'family'> & { family: string } : T;
 
@@ -43,6 +90,13 @@ export function canonicalizeAdvisorRefs<T extends AdvisorIdentityRef>(
         error:
           `advisor reviewer "${ref.model}" was labelled as family "${ref.family}", ` +
           `but trusted configuration declares "${family}"`,
+      };
+    }
+    const authStoreIssue = advisorAuthStoreBindingIssue(raw);
+    if (authStoreIssue) {
+      return {
+        ok: false,
+        error: `advisor reviewer "${ref.model}" ${authStoreIssue}`,
       };
     }
     canonical.push({ ...ref, family } as CanonicalAdvisorRef<T>);

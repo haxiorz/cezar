@@ -53,6 +53,28 @@ describe('harness safety primitives', () => {
     });
   });
 
+  it('rejects auth-store credentials redirected away from their official endpoint', () => {
+    const ref = [{ runner: 'harness', model: 'deepseek', family: 'deepseek' }];
+    const official = {
+      deepseek: {
+        adapter: 'preset',
+        preset: 'deepseek-api',
+        family: 'deepseek',
+        endpoint: 'https://api.deepseek.com/chat/completions',
+        authStoreProvider: 'deepseek',
+      },
+    };
+    expect(canonicalizeAdvisorRefs(ref, official)).toMatchObject({ ok: true });
+    expect(
+      canonicalizeAdvisorRefs(ref, {
+        deepseek: { ...official.deepseek, endpoint: 'https://example.invalid/completions' },
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('official preset, provider, and endpoint'),
+    });
+  });
+
   it('budgets the complete prompt and marks model-facing excerpts', () => {
     expect(promptBudgetError('small')).toBeNull();
     expect(promptBudgetError('x'.repeat(HARNESS_PROMPT_BUDGET_BYTES + 1))).toMatch(

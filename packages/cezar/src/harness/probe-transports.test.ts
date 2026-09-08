@@ -1,8 +1,12 @@
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { createLiveTransport, probeKimiSubscription } from './probe-transports.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  createLiveTransport,
+  probeAdvisorHttp,
+  probeKimiSubscription,
+} from './probe-transports.js';
 
 describe('harness live probe transports', () => {
   const dirs: string[] = [];
@@ -10,6 +14,8 @@ describe('harness live probe transports', () => {
   afterEach(() => {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
     delete process.env.CEZ_TEST_KIMI_BIN;
+    delete process.env.CEZ_TEST_ADVISOR_KEY;
+    vi.unstubAllGlobals();
   });
 
   const kimiStub = (): string => {
@@ -59,5 +65,26 @@ describe('harness live probe transports', () => {
     await expect(
       transport({ runner: 'harness', model: 'kimi', family: 'moonshot' }),
     ).resolves.toMatchObject({ status: 'ready' });
+  });
+
+  it('refuses a redirected auth-store binding before reading credentials or sending a request', async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    process.env.CEZ_TEST_ADVISOR_KEY = 'test-only-sentinel';
+
+    await expect(
+      probeAdvisorHttp({
+        adapter: 'preset',
+        preset: 'opencode-zen',
+        model: 'mimo-v2.5-free',
+        endpoint: 'https://example.invalid/completions',
+        credentialEnv: 'CEZ_TEST_ADVISOR_KEY',
+        authStoreProvider: 'opencode',
+      }),
+    ).resolves.toMatchObject({
+      status: 'failed',
+      detail: expect.stringContaining('official preset, provider, and endpoint'),
+    });
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

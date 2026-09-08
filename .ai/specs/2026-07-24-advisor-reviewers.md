@@ -1,7 +1,5 @@
 # Harness Advisor Reviewers in Role-Based Runs Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Configured `agentHarness` advisor bindings (kimi-subscription k3, deepseek-api, …) become pickable reviewers in the Multi-model tab and execute through the vendored `harness.mjs` review council, merged into the driver's existing findings/fix-loop flow.
 
 **Architecture:** A reviewer ref gains a second kind — `{runner: 'harness', model: <advisorId>, family}` — offered in the picker from `GET /harness/status` models. The driver partitions reviewers: runner refs keep the fresh-session path; advisor refs run as ONE packet-less `harness.mjs review` invocation against a **synthesized profile** (`cez-role-council`, exactly the selected advisors, all-required) written into a copy of the trusted config snapshot. No `--review-packet`/`--host-review` pair (that contract stays with the wrapper-skill flow); subject defaults to the op's own worktree diff — the same diff the runner sessions review. Orchestrator/implementer stay runner-only.

@@ -3745,10 +3745,17 @@ export function createApp(deps: ServerDeps) {
       if (!resolved.ok) {
         return c.json({ profile, ready: false, reason: resolved.error, models: [] });
       }
+      const canonical = canonicalizeAdvisorRefs(
+        resolved.plan.reviewers,
+        (agentic.agentHarness?.models ?? {}) as Record<string, unknown>,
+      );
+      if (!canonical.ok) {
+        return c.json({ profile, ready: false, reason: canonical.error, models: [] });
+      }
       const refs = [
         resolved.plan.orchestrator,
         resolved.plan.implementer,
-        ...resolved.plan.reviewers,
+        ...canonical.refs,
       ];
       const prober =
         deps.harnessProber ??

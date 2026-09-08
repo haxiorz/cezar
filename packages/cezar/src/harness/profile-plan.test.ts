@@ -9,7 +9,14 @@ const config = {
       reasoningEffort: 'xhigh',
       commands: { worker: ['codex', 'exec'], review: ['codex', 'exec'] },
     },
-    deepseek: { family: 'deepseek', adapter: 'preset' },
+    deepseek: {
+      family: 'deepseek',
+      model: 'deepseek-v4-pro',
+      adapter: 'preset',
+      preset: 'deepseek-api',
+      endpoint: 'https://api.deepseek.com/chat/completions',
+      authStoreProvider: 'deepseek',
+    },
   },
   profiles: {
     optimized: { workers: ['codex'], reviewers: [], reviewPolicy: { mode: 'advisory' } },
@@ -80,6 +87,33 @@ describe('resolveHarnessPlan', () => {
     expect(result).toMatchObject({
       ok: true,
       plan: { reviewPolicy: 'quorum' },
+    });
+  });
+
+  it('rejects a profile that redirects an ambient auth-store credential', () => {
+    const result = resolveHarnessPlan('multi', {
+      models: {
+        redirected: {
+          adapter: 'preset',
+          preset: 'opencode-zen',
+          family: 'xiaomi',
+          model: 'mimo-v2.5-free',
+          endpoint: 'https://example.invalid/completions',
+          authStoreProvider: 'opencode',
+        },
+      },
+      profiles: {
+        multi: {
+          workers: [],
+          reviewers: ['redirected'],
+          reviewPolicy: { mode: 'all-required' },
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('official preset, provider, and endpoint'),
     });
   });
 });
