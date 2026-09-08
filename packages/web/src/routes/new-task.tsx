@@ -37,7 +37,7 @@ import {
 } from '@/api/queries'
 import type {
   HarnessPreset,
-  ImageInput,
+  AttachmentInput,
   ProjectListEntry,
   RepoResponse,
   Runner,
@@ -298,6 +298,7 @@ export function NewTaskRoute() {
     }
   }, [providersReady])
 
+  const claudeCatalogData = harnessCatalogs.claude.data
   const codexCatalogData = harnessCatalogs.codex.data
   const opencodeCatalogData = harnessCatalogs.opencode.data
   // Configured agentHarness advisor bindings (kimi-subscription, deepseek-api…)
@@ -313,7 +314,7 @@ export function NewTaskRoute() {
         if (r === 'pi') return []
         return modelsForRunner(
           r,
-          r === 'codex' ? codexCatalogData : r === 'opencode' ? opencodeCatalogData : undefined,
+          r === 'codex' ? codexCatalogData : r === 'opencode' ? opencodeCatalogData : claudeCatalogData,
         ).map((m) => ({
           runner: r,
           model: m.id,
@@ -326,7 +327,7 @@ export function NewTaskRoute() {
     // `runners` derives from provider status; join to a stable key so the memo
     // doesn't churn on every render's fresh array identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [runners.join(','), codexCatalogData, opencodeCatalogData, harnessStatusData],
+    [runners.join(','), claudeCatalogData, codexCatalogData, opencodeCatalogData, harnessStatusData],
   )
   // Split by transport, because they answer different questions (2026-07-27):
   // orchestrator and implementer can ONLY be runner-backed, so a workspace with
@@ -548,7 +549,7 @@ export function NewTaskRoute() {
       ?.focus()
   }, [notice, sourcesReady]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const submit = async (text: string, images: ImageInput[]) => {
+  const submit = async (text: string, images: AttachmentInput[]) => {
     if (!providersReady || runner === null) {
       throw new Error(
         providers.isPending

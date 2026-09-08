@@ -277,7 +277,10 @@ function serve(overrides: {
           ? data.providerStatus()
           : json(data.providerStatus, data.providerStatusStatus)
       }
+      // One catalog per discovering runner — the composer reads the selected runner's, so a
+      // single shared answer would let a codex-only fixture stand in for claude's picker.
       if (url === '/api/v1/models?runner=codex') return json({ runner: 'codex', models: [{ id: 'gpt-future', label: 'gpt-future', description: 'Newest' }], source: 'live', stale: false })
+      if (url === '/api/v1/models?runner=claude') return json({ runner: 'claude', models: [{ id: 'opus', label: 'opus', description: 'Opus 5' }, { id: 'sonnet', label: 'sonnet', description: 'Sonnet 5' }], source: 'live', stale: false })
       if (url === '/api/v1/skills') return json(data.skills)
       if (url === '/api/v1/workflows' && method === 'GET') return json(data.workflows)
       if (url === '/api/v1/workflows' && method === 'POST') {
@@ -402,6 +405,28 @@ describe('the hero surface', () => {
 // ---- picker data flows ------------------------------------------------------------------------
 
 describe('picker data flows', () => {
+  it('updates the harness role pickers when Claude model discovery changes', async () => {
+    serve({ health: HEALTH_MULTI, providerStatus: PROVIDERS_MULTI })
+    const { client } = renderNewTask()
+    await pillReady()
+    fireEvent.click(screen.getByRole('tab', { name: 'Multi-model' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Orchestrator model' }))
+    await waitFor(() => expect(client.getQueryState(workspaceQueryKeys.models('claude'))?.fetchStatus).toBe('idle'))
+
+    act(() => {
+      client.setQueryData(workspaceQueryKeys.models('claude'), {
+        runner: 'claude',
+        models: [{ id: 'claude-future', label: 'Future Claude', description: 'Discovered by the CLI' }],
+        source: 'live',
+        stale: false,
+      })
+    })
+
+    fireEvent.click(await screen.findByRole('option', { name: /claude · Future Claude/ }))
+    expect(screen.getByRole('button', { name: 'Orchestrator model' }).textContent).toContain('Future Claude')
+    expect(readDraft().harnessRoles?.orchestrator).toMatchObject({ runner: 'claude', model: 'claude-future' })
+  })
+
   it('hides the runner pill on a single-backend host (legacy rule)', async () => {
     serve()
     renderNewTask()

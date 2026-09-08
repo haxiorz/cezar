@@ -333,9 +333,10 @@ export function sealHarnessRuntime(
     return sha256 ? { script, sha256 } : null;
   } catch {
     // The source is model-writable and therefore untrusted. Cycles, excessive
-    // depth, vanished links, and unreadable entries fail this run's seal
-    // without escaping as a server-level exception or leaving a partial copy.
-    rmSync(skillsDest, { recursive: true, force: true });
+    // depth, vanished links, and unreadable entries fail this run's seal.
+    // Cleanup is best-effort: a read-only destination can reject removal too,
+    // but must still return null rather than escape as a server-level exception.
+    try { rmSync(skillsDest, { recursive: true, force: true }); } catch { /* unavailable destination */ }
     return null;
   }
 }

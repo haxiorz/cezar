@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -100,7 +100,29 @@ describe('sealHarnessRuntime', () => {
     );
 
     expect(sealHarnessRuntime(worktree, dest)).toBeNull();
+    expect(existsSync(join(dest, 'skills'))).toBe(false);
   });
+
+  it('returns null when the destination is a file', () => {
+    const blocked = join(dest, 'not-a-directory');
+    writeFileSync(blocked, 'preserve this file');
+
+    expect(sealHarnessRuntime(worktree, blocked)).toBeNull();
+    expect(readFileSync(blocked, 'utf8')).toBe('preserve this file');
+  });
+
+  it.runIf(process.platform !== 'win32' && process.getuid?.() !== 0)(
+    'returns null when a read-only seal also prevents cleanup', () => {
+      expect(sealHarnessRuntime(worktree, dest)).not.toBeNull();
+      const blocked = join(dest, 'skills');
+      chmodSync(blocked, 0o500);
+      try {
+        expect(sealHarnessRuntime(worktree, dest)).toBeNull();
+      } finally {
+        chmodSync(blocked, 0o700);
+      }
+    },
+  );
 
   it('returns null when there is no runtime to seal', () => {
     rmSync(skillFile('cez-harness'), { recursive: true, force: true });

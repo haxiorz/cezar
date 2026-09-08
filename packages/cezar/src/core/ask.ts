@@ -63,12 +63,14 @@ export interface AskParseIssue {
 }
 
 /** The diagnostic parse result used at turn-end. The compatibility wrapper
- * below deliberately keeps returning `AskRequest | null`. */
+ * below deliberately keeps returning `AskRequest | null`. `repaired` marks a
+ * card that only exists because the payload's missing closers were appended
+ * (#936) — callers surface it as a note rather than claiming a clean parse. */
 export type AskMarkerParseResult =
   | { kind: 'none' }
   | { kind: 'invalid-json'; message: string }
   | { kind: 'invalid-structure'; issues: AskParseIssue[] }
-  | { kind: 'valid'; request: AskRequest; normalized: boolean };
+  | { kind: 'valid'; request: AskRequest; normalized: boolean; repaired?: boolean };
 
 /**
  * Parse a value into a validated `AskRequest`, or `null` when it does not match
@@ -195,6 +197,51 @@ export function formatAskAsProse(value: unknown): string | null {
   return blocks.length > 0 ? blocks.join('\n\n') : null;
 }
 
+/**
+ * Repair the one syntax slip that actually happens (#936): a payload complete
+ * except for its closing brackets, because an agent hand-writing a long
+ * one-line JSON blob dropped a trailing `}` or the output-token limit cut the
+ * stream. Scan `src` tracking string/escape state and the stack of open
+ * `{` / `[`, then append the missing closers in reverse. Returns `null` when
+ * the text is not *only* missing closers.
+ *
+ * The guards keep a genuinely truncated stream refused rather than silently
+ * turned into a half-question: the payload must end on a **completed**
+ * structural value (`}` or `]` — never mid-string, after a `,`, or after a
+ * `:`), the scan must end outside a string literal, every closer must match its
+ * opener, and at least one opener must still be unclosed (an already-balanced
+ * payload has nothing to repair — it failed `JSON.parse` for some other reason,
+ * e.g. a trailing comma, and stays rejected). Only syntax is repaired: the
+ * result goes through the unchanged `askRequestSchema`, so a repair that yields
+ * fewer than 2 options or a bad header still degrades to plain text.
+ */
+function closeUnbalancedJson(src: string): string | null {
+  const text = src.trimEnd();
+  if (!/[}\]]$/.test(text)) return null;
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (const ch of text) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') stack.push('}');
+    else if (ch === '[') stack.push(']');
+    else if (ch === '}' || ch === ']') {
+      if (stack.pop() !== ch) return null;
+    }
+  }
+  if (inString || stack.length === 0) return null;
+  return text + stack.reverse().join('');
+}
+
 function issuesOf(error: z.ZodError): AskParseIssue[] {
   return error.issues.map((issue) => ({
     code: issue.code,
@@ -204,32 +251,41 @@ function issuesOf(error: z.ZodError): AskParseIssue[] {
 }
 
 /**
- * Parse a trailing marker with an actionable result for diagnostics. A
- * parseable near-valid request gets one bounded repair pass
- * (`repairAskCandidate`); structural violations remain rejected so the raw
- * fallback stays readable, and the reported issues come from the repaired
- * candidate so they point at the structural problem rather than cosmetic
- * drift.
+ * Parse a trailing marker with an actionable result for diagnostics. Two
+ * bounded forgiveness layers sit under the schema, and neither loosens it: a
+ * payload that fails `JSON.parse` only for missing closers is repaired
+ * (`closeUnbalancedJson`, #936), then a parseable near-valid request gets one
+ * normalization pass (`repairAskCandidate`). Structural violations remain
+ * rejected so the raw fallback stays readable.
  */
 export function parseAskMarkerResult(turnText: string): AskMarkerParseResult {
   const match = ASK_MARKER_CANDIDATE_RE.exec(turnText.trimEnd());
   if (!match || match[1] === undefined) return { kind: 'none' };
   let raw: unknown;
+  let repaired = false;
   try {
     raw = JSON.parse(match[1]);
   } catch (error) {
-    return {
-      kind: 'invalid-json',
-      message: error instanceof Error ? error.message : 'invalid JSON',
-    };
+    const closed = closeUnbalancedJson(match[1]);
+    try {
+      if (closed === null) throw error;
+      raw = JSON.parse(closed);
+      repaired = true;
+    } catch {
+      return {
+        kind: 'invalid-json',
+        message: error instanceof Error ? error.message : 'invalid JSON',
+      };
+    }
   }
 
   const strict = askRequestSchema.safeParse(raw);
-  if (strict.success) return { kind: 'valid', request: strict.data, normalized: false };
+  if (strict.success) return { kind: 'valid', request: strict.data, normalized: false, repaired };
 
-  const repaired = askRequestSchema.safeParse(repairAskCandidate(raw));
-  if (repaired.success) return { kind: 'valid', request: repaired.data, normalized: true };
-  return { kind: 'invalid-structure', issues: issuesOf(repaired.error) };
+  const normalized = askRequestSchema.safeParse(repairAskCandidate(raw));
+  if (normalized.success)
+    return { kind: 'valid', request: normalized.data, normalized: true, repaired };
+  return { kind: 'invalid-structure', issues: issuesOf(normalized.error) };
 }
 
 /**
@@ -259,9 +315,9 @@ export function parseAskMarker(turnText: string): AskRequest | null {
  * as the `CEZ:DONE` / `CEZ:MONITORING` strippers).
  */
 export function stripAskMarker(text: string): string {
+  if (parseAskMarker(text) !== null) return text.replace(/\s*CEZ:ASK[ \t]+[\s\S]*$/, '');
   const match = ASK_MARKER_RE.exec(text.trimEnd());
   if (!match || match[1] === undefined) return text;
-  if (parseAskMarker(text) !== null) return text.replace(/\s*CEZ:ASK[ \t]+\{[\s\S]*\}\s*$/, '');
   let raw: unknown;
   try {
     raw = JSON.parse(match[1]);
