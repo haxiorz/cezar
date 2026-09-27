@@ -92,9 +92,60 @@ export function parseAskRequest(value: unknown): AskRequest | null {
  */
 export const ASK_MARKER_RE = /CEZ:ASK[ \t]+(\{[\s\S]*\})\s*$/;
 
-/** Looser than `ASK_MARKER_RE` so diagnostics can distinguish a malformed
- * trailing marker from ordinary assistant prose. */
-const ASK_MARKER_CANDIDATE_RE = /CEZ:ASK[ \t]+([\s\S]*)$/;
+/**
+ * The payload candidate of the LAST `<keyword> ` occurrence in a turn — everything from there to
+ * end-of-text — or `null` when the keyword never appears followed by whitespace.
+ *
+ * The LAST occurrence, deliberately. A model narrates: "as CEZ:ASK requires, here is my
+ * question:" and then emits the real marker line. Anchoring on the first mention (what a
+ * non-global `.exec()` does) captured that prose as the payload and refused a well-formed marker
+ * as invalid JSON — observed on live unit runs, where the refusal was fatal. The candidate is
+ * looser than the strict `*_MARKER_RE` shapes on purpose, so diagnostics can still distinguish a
+ * malformed trailing marker from ordinary prose.
+ */
+function lastMarkerCandidate(turnText: string, keyword: string): string | null {
+  const re = new RegExp(`${keyword}[ \\t]+`, 'g');
+  let last: RegExpExecArray | null = null;
+  for (const match of turnText.matchAll(re)) last = match;
+  if (!last) return null;
+  return turnText.slice(last.index + last[0].length);
+}
+
+/**
+ * Drop the control-marker lines a role prompt tells an agent to append AFTER its payload
+ * (`CEZ:MONITORING` after a dispatch, `CEZ:DONE` after a report). They are protocol, not JSON, and
+ * a candidate that runs to end-of-text would otherwise carry them into `JSON.parse` — a failure
+ * `closeUnbalancedJson` cannot repair, because nothing is unbalanced.
+ *
+ * Peeled line by line rather than with one anchored regex: the old
+ * `/(?:\s*\n\s*CEZ:(?:MONITORING|DONE)\s*)+$/` let three `\s*` runs fight over the same newlines,
+ * so a turn ending in a few thousand blank lines backtracked cubically — 8,000 newlines held the
+ * server's event loop for 85 s (CodeQL js/redos, alert #10). Only a marker on its OWN line is
+ * dropped, as before.
+ */
+function trimTrailingControlMarkers(candidate: string): string {
+  let text = candidate.trimEnd();
+  for (;;) {
+    const newline = text.lastIndexOf('\n');
+    if (newline < 0) return text;
+    const line = text.slice(newline + 1).trim();
+    if (line !== 'CEZ:MONITORING' && line !== 'CEZ:DONE') return text;
+    text = text.slice(0, newline).trimEnd();
+  }
+}
+
+/**
+ * Remove the LAST `<keyword> …` marker from a text, from the keyword to end-of-text (a repaired
+ * payload, #936, may end short of the closers this module appended). The twin of
+ * `lastMarkerCandidate`: an earlier prose mention of the keyword survives the strip.
+ */
+function stripLastMarker(text: string, keyword: string): string {
+  const re = new RegExp(`${keyword}[ \\t]+`, 'g');
+  let last: RegExpExecArray | null = null;
+  for (const match of text.matchAll(re)) last = match;
+  if (!last) return text;
+  return text.slice(0, last.index).replace(/\s+$/, '');
+}
 
 function clamp(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 1).trimEnd()}…`;
@@ -259,14 +310,15 @@ function issuesOf(error: z.ZodError): AskParseIssue[] {
  * rejected so the raw fallback stays readable.
  */
 export function parseAskMarkerResult(turnText: string): AskMarkerParseResult {
-  const match = ASK_MARKER_CANDIDATE_RE.exec(turnText.trimEnd());
-  if (!match || match[1] === undefined) return { kind: 'none' };
+  const candidate = lastMarkerCandidate(turnText.trimEnd(), 'CEZ:ASK');
+  if (candidate === null) return { kind: 'none' };
+  const payload = trimTrailingControlMarkers(candidate);
   let raw: unknown;
   let repaired = false;
   try {
-    raw = JSON.parse(match[1]);
+    raw = JSON.parse(payload);
   } catch (error) {
-    const closed = closeUnbalancedJson(match[1]);
+    const closed = closeUnbalancedJson(payload);
     try {
       if (closed === null) throw error;
       raw = JSON.parse(closed);
@@ -315,15 +367,18 @@ export function parseAskMarker(turnText: string): AskRequest | null {
  * as the `CEZ:DONE` / `CEZ:MONITORING` strippers).
  */
 export function stripAskMarker(text: string): string {
-  if (parseAskMarker(text) !== null) return text.replace(/\s*CEZ:ASK[ \t]+[\s\S]*$/, '');
-  const match = ASK_MARKER_RE.exec(text.trimEnd());
-  if (!match || match[1] === undefined) return text;
+  if (parseAskMarker(text) !== null) return stripLastMarker(text, 'CEZ:ASK');
+  let last: RegExpExecArray | null = null;
+  for (const match of text.matchAll(/CEZ:ASK[ \t]+/g)) last = match;
+  if (!last) return text;
+  const candidate = text.slice(last.index + last[0].length).trimEnd();
+  if (!candidate.startsWith('{') || !candidate.endsWith('}')) return text;
   let raw: unknown;
   try {
-    raw = JSON.parse(match[1]);
+    raw = JSON.parse(candidate);
   } catch {
     return text;
   }
   const prose = formatAskAsProse(raw);
-  return prose === null ? text : text.replace(/CEZ:ASK[ \t]+\{[\s\S]*\}\s*$/, prose);
+  return prose === null ? text : text.slice(0, last.index) + prose;
 }

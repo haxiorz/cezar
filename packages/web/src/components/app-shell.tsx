@@ -1,3 +1,4 @@
+import { LayoutDashboardIcon } from 'lucide-react'
 import {
   FolderIcon,
   FolderOpenIcon,
@@ -10,8 +11,9 @@ import {
 } from 'lucide-react'
 import * as React from 'react'
 import type { ReactNode } from 'react'
-import { Link as RouterLink, matchPath, useLocation } from 'react-router'
+import { Link as RouterLink, NavLink, matchPath, useLocation } from 'react-router'
 
+import { TRACKER_PROVIDERS } from '@/lib/tracker-providers'
 import { AddProjectDialog } from '@/components/add-project-dialog'
 import { CloneProjectDialog } from '@/components/clone-project-dialog'
 import { openCommandPalette } from '@/components/command-palette'
@@ -30,6 +32,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Sheet, SheetClose, SheetContent, SheetTitle, SheetTrigger } from '@/components/ui/sheet'
 import { activeNavItem, activeNavPath, visibleNavItems, type NavItem } from '@/components/nav-items'
+import type { TrackerKind } from '@open-mercato/cezar-api-client'
 import {
   DEFAULT_SIDEBAR_WIDTH,
   MAX_SIDEBAR_WIDTH,
@@ -41,11 +44,11 @@ import {
 } from '@/lib/sidebar-width'
 import { cn } from '@/lib/utils'
 // The Open Mercato brand mark. A `public/` asset, not a bundled import: the service serves the
-// same file at this exact path (`GET /open-mercato.svg` — the favicon index.html points at), so
+// same file at this exact path (`GET /icon.svg` — the favicon index.html points at), so
 // a second, hashed URL for the same picture would be one cache entry too many. Vite serves
 // `public/` at the root in dev and copies it into the build, so the path holds in both.
-// Its own gradient + rounded corners ARE the tile.
-const brandLogoUrl = '/open-mercato.svg'
+// Its own solid purple tile + rounded corners ARE the tile.
+const brandLogoUrl = '/icon.svg'
 
 /** Tailwind's `md`. The drawer is the `<md` affordance, so this must stay in step with the
  *  `md:hidden` / `md:flex` classes below — they are the same breakpoint expressed twice, once
@@ -77,6 +80,11 @@ export type AppShellProps = {
   latestVersion?: string | null
   /** Step 3.3's grouped task quick-list. */
   taskQuickList?: ReactNode
+  /** The sidebar's machine glance (spec `.ai/specs/2026-09-20-host-telemetry-sidebar-widget.md`):
+   *  effective CPU, its sparkline and compact RAM, rendered as the footer's first row. It is a
+   *  SLOT because `AppShell` stays presentational and QueryClient-free - the container supplies a
+   *  node whose own viewport/transport gate decides whether anything mounts at all. */
+  hostWidget?: ReactNode
   /** Step 4.2's Tools dropdown trigger. */
   toolsMenu?: ReactNode
   /** Forge gating (R6 Step 1.1): `false` drops the GitHub nav item — see `visibleNavItems`.
@@ -90,6 +98,7 @@ export type AppShellProps = {
    *  opt-in via `CEZ_AUTOMATIONS=1`. Defaults to shown for the same reason as `forgeAvailable`;
    *  the container passes the health payload's truth. */
   automationsAvailable?: boolean
+  tracker?: TrackerKind
   /** Single-project capability gating: hides workspace-expansion affordances. Defaults off so
    *  standalone and older callers preserve the multi-project shell. */
   singleProject?: boolean
@@ -113,6 +122,24 @@ export type AppShellProps = {
  * on desktop, where there is nothing to close.
  */
 const SidebarNavigateContext = React.createContext<(() => void) | undefined>(undefined)
+
+const AppShellMain = React.memo(function AppShellMain({
+  children,
+  mainRef,
+}: {
+  children: ReactNode
+  mainRef: React.RefObject<HTMLElement | null>
+}) {
+  return (
+    <main
+      ref={mainRef}
+      data-slot="main"
+      className="row-start-3 min-h-0 overflow-y-auto overscroll-contain"
+    >
+      {children}
+    </main>
+  )
+})
 
 export function useSidebarNavigate(): (() => void) | undefined {
   return React.useContext(SidebarNavigateContext)
@@ -144,7 +171,7 @@ export function routeOwnsScrollArrival(pathname: string): boolean {
  *  - Below `md` the sidebar is gone and its content moves, unchanged, into an overlay drawer
  *    (`MobileNavDrawer`). Same components, only the framing changes.
  */
-export function AppShell({
+export const AppShell = React.memo(function AppShell({
   children,
   repo = null,
   inboxCount = null,
@@ -153,10 +180,12 @@ export function AppShell({
   version = null,
   latestVersion = null,
   taskQuickList,
+  hostWidget,
   toolsMenu,
   forgeAvailable = true,
   inboxAvailable = true,
   automationsAvailable = true,
+  tracker,
   singleProject = false,
   banner,
   projectGroups,
@@ -166,8 +195,12 @@ export function AppShell({
   // (multi-project spec, step 3.2) so `/p/cezar/git/commits` still lights Git.
   const areaPathname = stripProjectPrefix(pathname)
   const activeTo = activeNavPath(areaPathname)
-  const current = activeNavItem(areaPathname)
+  const currentBase = activeNavItem(areaPathname)
+  const current = currentBase?.to === '/tracker' && tracker
+    ? { ...currentBase, label: TRACKER_PROVIDERS[tracker].label }
+    : currentBase
   const [menuOpen, setMenuOpen] = React.useState(false)
+  const closeMenu = React.useCallback(() => setMenuOpen(false), [])
   const mainRef = React.useRef<HTMLElement>(null)
   const routeOwnsArrival = routeOwnsScrollArrival(pathname)
   // The desktop column's width (#788). Read once, lazily, from `localStorage` — it is a
@@ -214,9 +247,14 @@ export function AppShell({
     return () => query.removeEventListener('change', onChange)
   }, [])
 
+  const items = React.useMemo(
+    () => visibleNavItems({ forge: forgeAvailable, inbox: inboxAvailable, automations: automationsAvailable, tracker }),
+    [forgeAvailable, inboxAvailable, automationsAvailable, tracker],
+  )
+
   const nav = {
     activeTo,
-    items: visibleNavItems({ forge: forgeAvailable, inbox: inboxAvailable, automations: automationsAvailable }),
+    items,
     repo,
     // The badge belongs to the Inbox item — with the item gone there is nothing to badge.
     inboxCount: inboxAvailable ? inboxCount : null,
@@ -225,52 +263,46 @@ export function AppShell({
     version,
     latestVersion,
     taskQuickList,
+    hostWidget,
     toolsMenu,
     projectGroups,
     singleProject,
   }
 
   return (
-    // The Sheet root renders no DOM of its own — it is the context that lets the top bar's menu
-    // button be a real SheetTrigger while the open state stays ours to close on navigation.
-    <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
-      <div
-        data-slot="app-shell"
-        className="flex h-dvh overflow-hidden bg-background text-foreground pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]"
-      >
-        <Sidebar {...nav} width={sidebarWidth} onWidthChange={changeSidebarWidth} />
-        {/* The drawer keeps its fixed 264px: it is a full-height overlay on a phone, where
-            there is no second column to trade width with and no pointer to drag a border. */}
-        <MobileNavDrawer {...nav} onNavigate={() => setMenuOpen(false)} />
-
-        <div className="grid min-w-0 flex-1 grid-rows-[auto_auto_1fr_auto] overflow-hidden">
+    <div
+      data-slot="app-shell"
+      className="flex h-dvh overflow-hidden bg-background text-foreground pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]"
+    >
+      <Sidebar {...nav} width={sidebarWidth} onWidthChange={changeSidebarWidth} />
+      <div className="grid min-w-0 flex-1 grid-rows-[auto_auto_1fr_auto] overflow-hidden">
+        {/* The Sheet root renders no DOM of its own. Keep only the mobile controls inside its
+            context so a sidebar update cannot propagate through the routed view. */}
+        <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
           <MobileTopBar title={current?.label ?? 'cezar'} />
+          {/* The drawer keeps its fixed 264px: it is a full-height overlay on a phone, where
+              there is no second column to trade width with and no pointer to drag a border. */}
+          <MobileNavDrawer {...nav} onNavigate={closeMenu} />
+        </Sheet>
 
-          {banner ? (
-            <div data-slot="banner-slot" className="row-start-2">
-              {banner}
-            </div>
-          ) : null}
+        {banner ? (
+          <div data-slot="banner-slot" className="row-start-2">
+            {banner}
+          </div>
+        ) : null}
 
-          <main
-            ref={mainRef}
-            data-slot="main"
-            className="row-start-3 min-h-0 overflow-y-auto overscroll-contain"
-          >
-            {children}
-          </main>
+        <AppShellMain mainRef={mainRef}>{children}</AppShellMain>
 
-          {/* Row 4: the composer dock (thread reply, Step R3). Empty today, but it still carries
-              the bottom safe-area gutter so the scroller never runs under the home indicator. */}
-          <div
-            data-slot="composer"
-            className="row-start-4 pb-[env(safe-area-inset-bottom)]"
-          />
-        </div>
+        {/* Row 4: the composer dock (thread reply, Step R3). Empty today, but it still carries
+            the bottom safe-area gutter so the scroller never runs under the home indicator. */}
+        <div
+          data-slot="composer"
+          className="row-start-4 pb-[env(safe-area-inset-bottom)]"
+        />
       </div>
-    </Sheet>
+    </div>
   )
-}
+})
 
 type NavProps = {
   activeTo: string | null
@@ -282,6 +314,7 @@ type NavProps = {
   version: string | null
   latestVersion: string | null
   taskQuickList?: ReactNode
+  hostWidget?: ReactNode
   toolsMenu?: ReactNode
   projectGroups?: ReactNode
   singleProject: boolean
@@ -299,7 +332,7 @@ type NavProps = {
  * the class is left off entirely below `md`, where `hidden` takes the element out of flow and the
  * drawer (a fixed 264px) is the sidebar instead.
  */
-function Sidebar({ width, onWidthChange, ...props }: NavProps & SidebarResize) {
+const Sidebar = React.memo(function Sidebar({ width, onWidthChange, ...props }: NavProps & SidebarResize) {
   return (
     <aside
       data-slot="sidebar"
@@ -310,7 +343,7 @@ function Sidebar({ width, onWidthChange, ...props }: NavProps & SidebarResize) {
       <SidebarResizeHandle width={width} onWidthChange={onWidthChange} />
     </aside>
   )
-}
+})
 
 type SidebarResize = {
   width: number
@@ -417,7 +450,7 @@ function SidebarResizeHandle({ width, onWidthChange }: SidebarResize) {
  * dismiss-on-tap, and `aria-hidden` on everything outside the portal — which is how it delivers
  * modality (it does not set `aria-modal`; `hideOthers` is the stronger guarantee).
  */
-function MobileNavDrawer({ onNavigate, ...props }: NavProps & { onNavigate: () => void }) {
+const MobileNavDrawer = React.memo(function MobileNavDrawer({ onNavigate, ...props }: NavProps & { onNavigate: () => void }) {
   return (
     <SheetContent
       side="left"
@@ -445,7 +478,7 @@ function MobileNavDrawer({ onNavigate, ...props }: NavProps & { onNavigate: () =
       />
     </SheetContent>
   )
-}
+})
 
 /**
  * Everything inside the sidebar: brand lockup, New task CTA, nav, quick-list, footer. Framed by
@@ -465,6 +498,7 @@ function SidebarContent({
   version,
   latestVersion,
   taskQuickList,
+  hostWidget,
   toolsMenu,
   projectGroups,
   singleProject,
@@ -528,6 +562,7 @@ function SidebarContent({
         {singleProject ? null : <AddProjectMenu />}
       </div>
 
+      <div className="shrink-0 px-1.5"><NavLink to="/dashboard" onClick={onNavigate} className={({ isActive }) => cn('flex min-h-11 items-center gap-2 rounded-md px-3 text-sm font-semibold transition-colors hover:bg-muted', isActive && 'bg-muted text-foreground')}><LayoutDashboardIcon className="size-4 shrink-0" aria-hidden="true" />Dashboard</NavLink></div>
       {projectGroups ? (
         <>
           {/* PINNED above the scroller, not the first row inside it. It is about every group
@@ -618,14 +653,17 @@ function SidebarContent({
         </>
       )}
 
-      {/* Two deliberate rows, never a wrap (#702): the search bar owns line 1, the chrome controls
-       *  line 2. `flex-col` rather than `flex-wrap` on purpose — the previous single wrapping row
-       *  overflowed the 264px column and silently stranded the theme toggle on a line of its own,
-       *  and a column cannot regress into that no matter what a future control's width is. */}
+      {/* Deliberate rows, never a wrap (#702): the machine glance (when one is mounted), then the
+       *  search bar, then the chrome controls. `flex-col` rather than `flex-wrap` on purpose — the
+       *  previous single wrapping row overflowed the 264px column and silently stranded the theme
+       *  toggle on a line of its own, and a column cannot regress into that no matter what a future
+       *  control's width is. The slot renders nothing at all when its own gate says no (below `md`
+       *  and in remote), so the count of rows is a property of the viewport, not of the markup. */}
       <div
         data-slot="sidebar-footer"
         className="flex flex-col gap-1.5 border-t border-border px-3.5 py-2.5"
       >
+        {hostWidget}
         <CommandPaletteHint />
         <div data-slot="sidebar-footer-controls" className="flex items-center gap-2">
           {/* SLOT — Step 4.2 mounts the Tools dropdown (aggregate status dot + tool versions) here. */}
@@ -824,7 +862,7 @@ function VersionChip({ version, latestVersion }: { version: string; latestVersio
   )
 }
 
-/** The Open Mercato brand mark. The SVG carries its own gradient and rounded corners, so it is
+/** The Open Mercato brand mark. The SVG carries its own purple tile and rounded corners, so it is
  *  the tile — no wrapper background. */
 function BrandTile() {
   return (

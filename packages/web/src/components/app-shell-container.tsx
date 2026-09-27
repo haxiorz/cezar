@@ -1,11 +1,12 @@
-import type { ReactNode } from 'react'
+import { memo, useMemo, type ReactNode } from 'react'
 import { useLocation } from 'react-router'
 
-import { useHealth, useProjectRuns, useProjects, useRuns, useSkillsUpdate, useTodos } from '@/api/queries'
+import { useHealth, useProjectRuns, useProjects, useRunsForProject, useSkillsUpdate, useTodos } from '@/api/queries'
 import type { HealthResponse, SkillsUpdateState } from '@open-mercato/cezar-api-client'
 import { AppShell, type RepoChip } from '@/components/app-shell'
 import { CommandPalette } from '@/components/command-palette'
 import { ListViewProvider } from '@/components/list-view'
+import { HostUsageWidget } from '@/components/host-usage-widget'
 import { ProviderBannerContainer } from '@/components/provider-banner-container'
 import { ProjectGroups } from '@/components/project-groups'
 import { TaskQuickListContainer } from '@/components/task-quick-list'
@@ -53,7 +54,7 @@ export function skillsUpdateMarkerOf(state: SkillsUpdateState | undefined): bool
  * so keeping them live is `useHealth`'s job — its poll plus Step 3.2's reconnect/visibility
  * reconcile — not a change here.
  */
-export function AppShellContainer({ children }: { children: ReactNode }) {
+export const AppShellContainer = memo(function AppShellContainer({ children }: { children: ReactNode }) {
   const { pathname } = useLocation()
   const projectId = useActiveProjectId()
   const health = useHealth()
@@ -68,21 +69,32 @@ export function AppShellContainer({ children }: { children: ReactNode }) {
   // mobile drawer, and grouped sidebar). Routes reuse this TanStack Query cache entry.
   const skillsUpdate = useSkillsUpdate(projectId ?? '', projectId !== null)
   const skillsUpdateAvailable = skillsUpdateMarkerOf(skillsUpdate.data)
-  // Unread done items (#unread-done-items) for the Tasks badge. Reads the same active-scope run
-  // list the sidebar quick-list and Tasks table already hold — one cache entry, no extra fetch.
-  const runs = useRuns()
   const registry = useProjects().data
   const titleContext = pageTitleContext(pathname)
   const bootProjectId = registry?.bootProject ?? health.data?.bootProject ?? null
+  // Unread done items (#unread-done-items) for the Tasks badge. This shell sits ABOVE the routed
+  // project provider, so name the URL project explicitly instead of reading the module scope.
+  const unreadDoneCountSelector = useMemo(() => unreadDoneCount, [])
+  const runs = useRunsForProject(projectId, bootProjectId, unreadDoneCountSelector)
   const isBootProject = projectId !== null && projectId === bootProjectId
   const activeProject = registry?.projects.find((project) => project.id === projectId)
-  const titleRuns = useProjectRuns(
+  const bootProject = registry?.projects.find((project) => project.id === bootProjectId)
+  const tracker = projectId === null ? bootProject?.tracker : activeProject?.tracker
+  const titleRunId = titleContext.taskId
+  const titleLabel = useProjectRuns(
     projectId ?? '',
     // Wait for the registry to identify the project before choosing the boot/non-boot cache
     // key. Health can arrive first; fetching then would briefly populate a project-scoped key
     // for the boot project before switching to the authoritative `default` key.
-    activeProject !== undefined && titleContext.taskId !== null,
+    activeProject !== undefined && titleRunId !== null,
     registry?.bootProject === projectId,
+    useMemo(
+      () => (list) => {
+        const run = titleRunId ? list.find((item) => item.id === titleRunId) : undefined
+        return run ? runTitle(run) : undefined
+      },
+      [titleRunId],
+    ),
   ).data
 
   // Global settings intentionally has no selected project. Everywhere else the URL id selects
@@ -93,10 +105,7 @@ export function AppShellContainer({ children }: { children: ReactNode }) {
     ? null
     : (activeProject?.name ??
       (isBootProject ? (repoChipOf(health.data)?.name ?? null) : null))
-  const titleRun = titleContext.taskId
-    ? titleRuns?.find((run) => run.id === titleContext.taskId)
-    : undefined
-  const pageLabel = titleRun ? runTitle(titleRun) : titleContext.pageLabel
+  const pageLabel = titleLabel ?? titleContext.pageLabel
 
   useDocumentTitle({ projectName, pageLabel })
 
@@ -106,6 +115,41 @@ export function AppShellContainer({ children }: { children: ReactNode }) {
   // flat nav + single quick-list it has always had. That degenerate case is the upgrade path:
   // an existing user boots the new version in their usual repo and sees no difference.
   const projects = registry && registry.projects.length > 1 ? registry : null
+  const repo = useMemo(
+    () => repoChipOf(health.data),
+    [health.data?.repo?.root, health.data?.repo?.branch],
+  )
+  const banner = useMemo(() => <ProviderBannerContainer />, [])
+  const taskQuickList = useMemo(() => <TaskQuickListContainer />, [])
+  // The sidebar glance. Created here, not inside `AppShell`, because the shell stays presentational
+  // and QueryClient-free: the widget's own wrapper evaluates the viewport and transport gates and
+  // mounts nothing below `md` or in remote, so neither the CSS-hidden column nor a hosted cockpit
+  // ever pays for a sample it cannot show.
+  const hostWidget = useMemo(() => <HostUsageWidget />, [])
+  const projectGroups = useMemo(
+    () =>
+      projects ? (
+        <ProjectGroups
+          projects={projects.projects}
+          bootProjectId={projects.bootProject}
+          // No forge prop: each group gates its own GitHub tab on its registry entry's
+          // `forge` field (#698) — the boot folder's health-level answer says nothing about
+          // the other projects in the workspace.
+          inboxAvailable={inboxAvailable}
+          automationsAvailable={automationsAvailable}
+          inboxCount={todos.data?.length ?? null}
+          skillsUpdateAvailable={skillsUpdateAvailable}
+        />
+      ) : undefined,
+    [
+      projects,
+      inboxAvailable,
+      automationsAvailable,
+      todos.data?.length,
+      skillsUpdateAvailable,
+    ],
+  )
+  const toolsMenu = useMemo(() => <ToolsMenu health={health.data} />, [health.data])
 
   return (
     // The Active/Archived filter is shared by the quick-list below and the Tasks table (Step 3.4),
@@ -113,7 +157,7 @@ export function AppShellContainer({ children }: { children: ReactNode }) {
     // both of them under it — the spec requires the two sets of tabs to be one filter.
     <ListViewProvider>
       <AppShell
-        repo={repoChipOf(health.data)}
+        repo={repo}
         version={health.data?.version ?? null}
         latestVersion={health.data?.latestVersion ?? null}
         // `?? null` rather than `?? 0`: no badge while the inbox is unknown, and no badge when it
@@ -121,7 +165,7 @@ export function AppShellContainer({ children }: { children: ReactNode }) {
         inboxCount={todos.data?.length ?? null}
         // Same `?? null` honesty: no badge while the list is unknown; a loaded list with none
         // unread is 0, which AppShell also renders as no badge.
-        unreadCount={runs.data ? unreadDoneCount(runs.data) : null}
+        unreadCount={runs.data ?? null}
         skillsUpdateAvailable={skillsUpdateAvailable}
         // Hidden until health confirms the forge driver (R6 Step 1.1) — same honesty rule as
         // the chips: the nav must not claim a GitHub tab it cannot back. The Tools menu's
@@ -132,27 +176,15 @@ export function AppShellContainer({ children }: { children: ReactNode }) {
         inboxAvailable={inboxAvailable}
         // Hidden unless health reports the opt-in automations capability (#801).
         automationsAvailable={automationsAvailable}
-        banner={<ProviderBannerContainer />}
+        tracker={tracker}
+        banner={banner}
         singleProject={health.data?.capabilities.singleProject === true}
-        taskQuickList={<TaskQuickListContainer />}
+        taskQuickList={taskQuickList}
+        hostWidget={hostWidget}
         // Present only in a multi-project workspace; `AppShell` renders the flat nav and the
         // quick-list above whenever this slot is absent.
-        projectGroups={
-          projects ? (
-            <ProjectGroups
-              projects={projects.projects}
-              bootProjectId={projects.bootProject}
-              // No forge prop: each group gates its own GitHub tab on its registry entry's
-              // `forge` field (#698) — the boot folder's health-level answer says nothing
-              // about the other projects in the workspace.
-              inboxAvailable={inboxAvailable}
-              automationsAvailable={automationsAvailable}
-              inboxCount={todos.data?.length ?? null}
-              skillsUpdateAvailable={skillsUpdateAvailable}
-            />
-          ) : undefined
-        }
-        toolsMenu={<ToolsMenu health={health.data} />}
+        projectGroups={projectGroups}
+        toolsMenu={toolsMenu}
       >
         {children}
       </AppShell>
@@ -161,4 +193,4 @@ export function AppShellContainer({ children }: { children: ReactNode }) {
       <CommandPalette />
     </ListViewProvider>
   )
-}
+})

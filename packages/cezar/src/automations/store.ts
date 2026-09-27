@@ -10,6 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import lockfile from 'proper-lockfile';
 import { collectSecretValues, redactDeep } from '../core/secret-redaction.ts';
 import { join } from 'node:path';
 import {
@@ -24,12 +25,17 @@ import {
   type AutomationRuntimeState,
 } from './types.ts';
 import type { GithubCandidate } from './github-poller.ts';
+import type { TrackerAutomationCandidate } from './tracker-poller.ts';
 
 const DEFINITIONS = 'automations.json';
 const STATE = 'automation-state.json';
 const RECEIPTS = 'automation-receipts.ndjson';
 const LOG = 'automation-log.ndjson';
 const POLL_LOCK = 'automation-poll.lock';
+const MUTATION_LOCK = 'automation-mutation.lock';
+const GUARD_SUFFIX = '.guard';
+/** proper-lockfile enforces a 2s minimum; this bounds crash recovery without stealing live owners. */
+const GUARD_STALE_MS = 2_000;
 const RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
 
 type DefinitionsFile = ReturnType<typeof automationDefinitionsFileSchema.parse>;
@@ -38,6 +44,10 @@ type StateFile = ReturnType<typeof automationStateFileSchema.parse>;
 export interface AutomationStoreOptions {
   warn?: (message: string) => void;
   now?: () => Date;
+  /** Liveness probe for the pid recorded in the poll lock. Injected by tests only. */
+  processAlive?: (pid: number) => boolean;
+  /** Test-only hook for exercising a replacement between metadata validation and creation. */
+  beforeLeaseMetadataWrite?: (path: string) => void;
 }
 
 export class AutomationStore {
@@ -63,71 +73,117 @@ export class AutomationStore {
   }
 
   list(): AutomationDefinition[] {
+    this.loadDefinitions();
     return [...this.definitions.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
 
   get(id: string): AutomationDefinition | undefined {
+    this.loadDefinitions();
     return this.definitions.get(id);
   }
 
   create(
     input: Omit<AutomationDefinition, 'id' | 'revision' | 'createdAt' | 'updatedAt'>,
     id: string = randomUUID(),
+    initializeState?: (definition: AutomationDefinition) => void,
   ): AutomationDefinition {
-    if (this.definitions.has(id) || this.isTombstoned(id)) throw new Error('automation id unavailable');
-    const now = this.now().toISOString();
-    const definition = automationDefinitionSchema.parse({
-      ...input,
-      id,
-      revision: 1,
-      createdAt: now,
-      updatedAt: now,
-    });
-    this.definitions.set(id, definition);
-    this.persistDefinitions();
-    return definition;
+    const mutation = this.acquireMutationLease();
+    if (!mutation) throw new Error('automation mutation conflict: a launch is in progress');
+    try {
+      this.loadDefinitions();
+      if (this.definitions.has(id) || this.isTombstoned(id)) throw new Error('automation id unavailable');
+      const now = this.now().toISOString();
+      const definition = automationDefinitionSchema.parse({
+        ...input,
+        id,
+        revision: 1,
+        createdAt: now,
+        updatedAt: now,
+      });
+      this.definitions.set(id, definition);
+      // Baseline and definition publish under one lease; readers snapshot under that lease too.
+      initializeState?.(definition);
+      this.persistDefinitions();
+      return definition;
+    } finally { mutation.release(); }
   }
 
   update(
     id: string,
     expectedRevision: number,
     input: Omit<AutomationDefinition, 'id' | 'revision' | 'createdAt' | 'updatedAt'>,
+    initializeState?: (definition: AutomationDefinition) => void,
   ): AutomationDefinition {
-    const current = this.definitions.get(id);
-    if (!current) throw new Error('automation not found');
-    if (current.revision !== expectedRevision) throw new Error('automation revision conflict');
-    const definition = automationDefinitionSchema.parse({
-      ...current,
-      ...input,
-      id,
-      revision: current.revision + 1,
-      createdAt: current.createdAt,
-      updatedAt: this.now().toISOString(),
-    });
-    this.definitions.set(id, definition);
-    const state = this.state(id);
-    if (state) this.setState(id, { ...state, revision: definition.revision });
-    this.persistDefinitions();
-    return definition;
+    const mutation = this.acquireMutationLease();
+    if (!mutation) throw new Error('automation mutation conflict: a launch is in progress');
+    try {
+      this.loadDefinitions();
+      const current = this.definitions.get(id);
+      if (!current) throw new Error('automation not found');
+      if (current.revision !== expectedRevision) throw new Error('automation revision conflict');
+      const definition = automationDefinitionSchema.parse({
+        ...current,
+        ...input,
+        id,
+        revision: current.revision + 1,
+        createdAt: current.createdAt,
+        updatedAt: this.now().toISOString(),
+      });
+      this.definitions.set(id, definition);
+      // `pinnedCursor` records that a cursor was unescapable *under the previous definition*, and the
+      // pinned poll log tells the operator to narrow the filter to escape it. Carrying the marker across
+      // an edit would skip the widening re-poll that makes the narrowed filter take effect, so the very
+      // remediation the log prescribes would silently do nothing (#982).
+      if (this.state(id)) {
+        this.setState(id, (current) => ({ ...current, revision: definition.revision, pinnedCursor: undefined }));
+      }
+      // Baseline and definition publish under one lease; readers snapshot under that lease too.
+      initializeState?.(definition);
+      this.persistDefinitions();
+      return definition;
+    } finally { mutation.release(); }
   }
 
   delete(id: string): boolean {
-    if (!this.definitions.delete(id)) return false;
-    this.definitionsFile.tombstones = {
-      ...this.definitionsFile.tombstones,
-      [id]: this.now().toISOString(),
-    };
-    this.persistDefinitions();
-    return true;
+    const mutation = this.acquireMutationLease();
+    if (!mutation) throw new Error('automation mutation conflict: a launch is in progress');
+    try {
+      this.loadDefinitions();
+      if (!this.definitions.delete(id)) return false;
+      this.definitionsFile.tombstones = {
+        ...this.definitionsFile.tombstones,
+        [id]: this.now().toISOString(),
+      };
+      this.persistDefinitions();
+      return true;
+    } finally { mutation.release(); }
   }
 
   state(id: string): AutomationRuntimeState | undefined {
+    this.stateFile = this.readJson(STATE, automationStateFileSchema, { version: 1, states: {} });
     return this.stateFile.states[id];
   }
 
-  setState(id: string, state: AutomationRuntimeState): void {
-    this.stateFile.states = { ...this.stateFile.states, [id]: state };
+  /**
+   * Read-modify-write (spec 2026-09-14 § Edge cases): two cockpits on one project each hold their
+   * own in-memory copy of the state file, and a write from memory alone would clobber the other's
+   * cursor or `nextRunAt`. Re-reading first merges this ONE id over whatever is on disk, so the
+   * two converge — the `mergeWriteWorkspaceConfig` pattern.
+   *
+   * The convergence promise only holds if the write for THIS id is also computed from a fresh
+   * disk read, not from the caller's own possibly-stale in-memory snapshot — two processes racing
+   * on the SAME automation id (e.g. one holds the poll/schedule lease and launches while the
+   * other, having failed to acquire it, still advances its own `nextRunAt`) would otherwise have
+   * the loser's write silently revert the winner's `lastRunAt`/`consecutiveFailures`. `update`
+   * therefore takes the CURRENT on-disk record (or `{}` when none exists yet) and must return the
+   * full next record from it — never close over an outer `state` read from before this call.
+   */
+  setState(id: string, update: (current: AutomationRuntimeState) => AutomationRuntimeState): AutomationRuntimeState {
+    const onDisk = this.readJson(STATE, automationStateFileSchema, { version: 1, states: {} });
+    const next = update(onDisk.states[id] ?? {});
+    this.stateFile = { ...onDisk, states: { ...onDisk.states, [id]: next } };
     this.atomicJson(STATE, this.stateFile);
+    return next;
   }
 
   receipts(): AutomationReceipt[] {
@@ -149,6 +205,9 @@ export class AutomationStore {
     revision: number;
     eventId: string;
     candidate?: GithubCandidate;
+    trackerCandidate?: TrackerAutomationCandidate;
+    /** schedule kind: the occurrence being reserved. */
+    occurrenceAt?: string;
   }): AutomationReceipt | undefined {
     const receiptKey = `${input.automationId}:${input.eventId}`;
     if (this.latestReceipts().has(receiptKey)) return undefined;
@@ -163,6 +222,15 @@ export class AutomationStore {
     });
     this.appendReceipt(receipt);
     return receipt;
+  }
+
+  /** Called under both polling and mutation leases, after run reconciliation. */
+  reserveRetry(receiptId: string): AutomationReceipt | undefined {
+    const current = [...this.latestReceipts().values()].find(row => row.receiptId === receiptId);
+    if (!current || current.status !== 'launch-error' || current.runId) return undefined;
+    const reserved: AutomationReceipt = { ...current, status: 'reserved', error: undefined, updatedAt: this.now().toISOString() };
+    this.appendReceipt(reserved);
+    return reserved;
   }
 
   appendLog(
@@ -192,7 +260,7 @@ export class AutomationStore {
   compact(): void {
     const cutoff = this.now().getTime() - RETENTION_MS;
     const latest = [...this.latestReceipts().values()].filter(
-      (row) => Date.parse(row.updatedAt) >= cutoff,
+      (row) => Date.parse(row.updatedAt) >= cutoff || (this.get(row.automationId)?.kind === 'tracker'),
     );
     this.rewriteNdjson(RECEIPTS, latest);
     const logs = this.readNdjson(LOG, automationLogRecordSchema);
@@ -205,23 +273,66 @@ export class AutomationStore {
     }
   }
 
-  acquireLease(staleAfterMs = 10 * 60_000): AutomationLease | undefined {
+  acquireMutationLease(): AutomationLease | undefined {
+    return this.acquireLease(10 * 60_000, MUTATION_LOCK);
+  }
+
+  /**
+   * Take the project's poll lock, reclaiming one nobody is holding any more (#983). A cockpit
+   * killed mid-poll leaves the lock behind with its own pid inside; consulting that pid makes the
+   * crash case instant instead of a ten-minute, workspace-wide outage. `staleAfterMs` stays as the
+   * fallback for a lock whose pid we cannot read or trust.
+   */
+  acquireLease(staleAfterMs = 10 * 60_000, filename = POLL_LOCK): AutomationLease | undefined {
     mkdirSync(this.dataDir, { recursive: true });
-    const path = join(this.dataDir, POLL_LOCK);
+    return this.tryAcquireLease(join(this.dataDir, filename), staleAfterMs);
+  }
+
+  private tryAcquireLease(path: string, staleAfterMs: number): AutomationLease | undefined {
     try {
-      const fd = openSync(path, 'wx', 0o600);
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: this.now().toISOString() }));
-      return new AutomationLease(path, fd);
+      return this.createLease(path, staleAfterMs);
     } catch {
-      try {
-        if (this.now().getTime() - statSync(path).mtimeMs > staleAfterMs) {
-          unlinkSync(path);
-          return this.acquireLease(staleAfterMs);
-        }
-      } catch {
-        // A contender removed the lock or the directory is read-only.
-      }
+      // A held, live, malformed, or unrecoverable guard reports busy. The lock primitive owns
+      // stale recovery and performs it under its cross-platform atomic mkdir protocol (#998).
       return undefined;
+    }
+  }
+
+  private createLease(path: string, staleAfterMs: number): AutomationLease {
+    let compromised = false;
+    const releaseGuard = lockfile.lockSync(path, {
+      lockfilePath: `${path}${GUARD_SUFFIX}`,
+      realpath: false,
+      stale: GUARD_STALE_MS,
+      // proper-lockfile's default throws from its heartbeat timer. Never take the
+      // cockpit down for a lost guard; callers check validity before launching or
+      // publishing after an asynchronous compromise notification.
+      onCompromised: () => { compromised = true; },
+    });
+    try {
+      const existed = existsSync(path);
+      const previous = existed ? readLeaseMetadata(path) : undefined;
+      const ageMs = existed ? Math.max(0, this.now().getTime() - statSync(path).mtimeMs) : 0;
+      if (previous?.pid === process.pid || (previous?.pid && (this.options.processAlive ?? isProcessAlive)(previous.pid))) {
+        throw new Error('lease is held by a live process');
+      }
+      if (existed && !previous?.pid && ageMs < staleAfterMs) {
+        throw new Error('lease metadata is not stale');
+      }
+      const token = randomUUID();
+      if (existed) {
+        try {
+          unlinkSync(path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+      }
+      this.options.beforeLeaseMetadataWrite?.(path);
+      writeLeaseMetadataExclusive(path, JSON.stringify({ pid: process.pid, token, startedAt: this.now().toISOString() }));
+      return new AutomationLease(path, token, releaseGuard, () => !compromised);
+    } catch (error) {
+      try { releaseGuard(); } catch { /* guard was already recovered */ }
+      throw error;
     }
   }
 
@@ -237,6 +348,7 @@ export class AutomationStore {
   }
 
   private loadDefinitions(): void {
+    this.definitions.clear();
     this.definitionsFile = this.readJson(DEFINITIONS, automationDefinitionsFileSchema, {
       version: 1,
       automations: [],
@@ -340,22 +452,69 @@ export class AutomationStore {
   }
 }
 
+/**
+ * Create metadata without ever truncating a pathname that appeared after the
+ * stale check. EEXIST is deliberately surfaced as busy to the lease caller.
+ */
+function writeLeaseMetadataExclusive(path: string, contents: string): void {
+  const fd = openSync(path, 'wx', 0o600);
+  try {
+    writeFileSync(fd, contents);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Metadata written by `acquireLease`, or an empty object for malformed state. */
+function readLeaseMetadata(path: string): { pid?: number; token?: string } | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { pid?: unknown; token?: unknown } | null;
+    return {
+      pid: typeof parsed?.pid === 'number' && Number.isInteger(parsed.pid) && parsed.pid > 0 ? parsed.pid : undefined,
+      token: typeof parsed?.token === 'string' ? parsed.token : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Signal 0 probes a pid without touching the process. `EPERM` means it exists and belongs to
+ * somebody else — alive, as far as the lock is concerned. A recycled pid, or a pid from a
+ * namespace we do not share, reads as alive and degrades to the age rule: never worse than not
+ * looking at all.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 export class AutomationLease {
   private released = false;
 
   constructor(
     private readonly path: string,
-    private readonly fd: number,
+    private readonly token: string,
+    private readonly releaseGuard: () => void,
+    private readonly guardIsHealthy: () => boolean = () => true,
   ) {}
+
+  /** False after the lock primitive reports that another owner replaced this guard. */
+  isValid(): boolean { return !this.released && this.guardIsHealthy(); }
 
   release(): void {
     if (this.released) return;
     this.released = true;
-    closeSync(this.fd);
     try {
-      unlinkSync(this.path);
+      const owner = JSON.parse(readFileSync(this.path, 'utf8')) as { token?: unknown };
+      if (owner.token === this.token) unlinkSync(this.path);
     } catch {
-      // Already removed during shutdown cleanup.
+      // Already removed, malformed, or replaced during shutdown cleanup.
     }
+    try { this.releaseGuard(); } catch { /* already released or recovered during shutdown */ }
   }
 }

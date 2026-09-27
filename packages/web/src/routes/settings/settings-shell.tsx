@@ -61,7 +61,7 @@ function navComponents(scope: SettingsScope) {
  */
 function useNavCapabilities(
   scope: SettingsScope,
-  capabilities?: Pick<Capabilities, 'singleProject'>,
+  capabilities?: Partial<Pick<Capabilities, 'singleProject'>>,
 ): Parameters<typeof visibleSettingsSections>[1] {
   const config = useConfig(scope !== 'global')
   if (scope === 'global') return capabilities
@@ -75,7 +75,7 @@ function SectionNav({
 }: {
   scope: SettingsScope
   activeId: SettingsSection['id'] | null
-  capabilities?: Pick<Capabilities, 'singleProject'>
+  capabilities?: Partial<Pick<Capabilities, 'singleProject'>>
 }) {
   const { NavLink } = navComponents(scope)
   const navCapabilities = useNavCapabilities(scope, capabilities)
@@ -138,7 +138,7 @@ function SectionPills({
 }: {
   scope: SettingsScope
   activeId: SettingsSection['id']
-  capabilities?: Pick<Capabilities, 'singleProject'>
+  capabilities?: Partial<Pick<Capabilities, 'singleProject'>>
 }) {
   const { NavLink } = navComponents(scope)
   const navCapabilities = useNavCapabilities(scope, capabilities)
@@ -186,7 +186,7 @@ export function SettingsSectionRoute({
 }: {
   section: SettingsSection
   scope: SettingsScope
-  capabilities?: Pick<Capabilities, 'singleProject'>
+  capabilities?: Partial<Pick<Capabilities, 'singleProject'>>
 }) {
   const Body = section.component
   return (
@@ -220,7 +220,7 @@ export function SettingsSectionRoute({
  *  page; on desktop it sits beside the nav as a plain directory). */
 export function SettingsIndexRoute({ scope, capabilities }: {
   scope: SettingsScope
-  capabilities?: Pick<Capabilities, 'singleProject'>
+  capabilities?: Partial<Pick<Capabilities, 'singleProject'>>
 }) {
   const { Link } = navComponents(scope)
   const navCapabilities = useNavCapabilities(scope, capabilities)

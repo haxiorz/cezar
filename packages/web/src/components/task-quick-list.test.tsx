@@ -5,12 +5,32 @@ import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createQueryClient } from '@/api/query-client'
-import type { RunRecord } from '@open-mercato/cezar-api-client'
+import type { HealthResponse, RunRecord } from '@open-mercato/cezar-api-client'
 import { ListViewProvider } from '@/components/list-view'
 import { TaskQuickList, TaskQuickListContainer } from '@/components/task-quick-list'
 
 const NOW = Date.parse('2026-07-14T12:00:00.000Z')
 const ago = (ms: number) => new Date(NOW - ms).toISOString()
+const HEALTH: HealthResponse = {
+  version: '0.0.0-test',
+  repoRoot: '/home/u/cezar',
+  repo: null,
+  checks: [],
+  defaultRunner: 'claude',
+  forge: null,
+  capabilities: {
+    localHandoff: true,
+    followups: true,
+    singleProject: false,
+    automations: false,
+    dispatch: false,
+    tokenMetrics: true,
+    tokenUsageMetrics: true,
+    costMetrics: true,
+  },
+  projects: [{ id: 'boot', name: 'cezar' }],
+  bootProject: 'boot',
+}
 
 let seq = 0
 
@@ -646,7 +666,11 @@ describe('TaskQuickListContainer', () => {
   })
 
   function renderContainer(runs: RunRecord[], route = '/') {
-    fetchMock.mockImplementation(async () => new Response(JSON.stringify(runs), { status: 200 }))
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      const body = path === '/api/v1/health' ? HEALTH : runs
+      return new Response(JSON.stringify(body), { status: 200 })
+    })
     const wrapper = ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={createQueryClient()}>
         <MemoryRouter initialEntries={[route]}>
@@ -667,7 +691,15 @@ describe('TaskQuickListContainer', () => {
   it('renders the live run list', async () => {
     renderContainer([run({ id: 'live', title: 'A real run', status: 'running' })])
     expect(await screen.findByText('A real run')).not.toBeNull()
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/v1/runs')
+    expect(fetchMock.mock.calls.map((call) => String(call[0]))).toContain('/api/v1/runs')
+  })
+
+  it('reads a URL-scoped project list without a provider above it', async () => {
+    renderContainer([run({ id: 'scoped', title: 'Scoped run', status: 'running' })], '/p/other/')
+    expect(await screen.findByText('Scoped run')).not.toBeNull()
+    const paths = fetchMock.mock.calls.map((call) => String(call[0]))
+    expect(paths).toContain('/api/v1/p/other/runs')
+    expect(paths).not.toContain('/api/v1/runs')
   })
 
   it('lights the row for the task open at /tasks/:id, including its child routes', async () => {
@@ -713,5 +745,73 @@ describe('TaskQuickListContainer', () => {
 
     await waitFor(() => expect(row('b')).not.toBeNull())
     expect(row('a')).toBeNull()
+  })
+})
+
+/**
+ * Task dispatch in the sidebar (spec `.ai/specs/2026-09-10-dispatch.md`): a dispatched child sits
+ * under the task that ordered it, indented, rather than as a second top-level row. Nesting is per
+ * BUCKET — a child asking for you in `Needs you` while its parent is still `Working` stays where
+ * someone is looking for it.
+ */
+describe('dispatched subtasks in the quick-list', () => {
+  const idsIn = (label: string) =>
+    [...bucket(label).querySelectorAll('[data-slot="task-row"]')].map((el) =>
+      el.getAttribute('data-run-id'),
+    )
+
+  it('nests a child under its parent, indented, in the parent’s own position', () => {
+    renderList({
+      runs: [
+        run({ id: 'newer', status: 'done', createdAt: ago(1_000) }),
+        run({ id: 'parent', status: 'done', createdAt: ago(50_000) }),
+        run({
+          id: 'child',
+          status: 'done',
+          createdAt: ago(10_000),
+          dispatch: { rootRunId: 'parent', parentRunId: 'parent' },
+        }),
+      ],
+    })
+    expect(idsIn('Recent')).toEqual(['newer', 'parent', 'child'])
+    expect(row('child')?.getAttribute('data-depth')).toBe('1')
+    expect(row('parent')?.getAttribute('data-depth')).toBe('0')
+    expect(row('parent')?.querySelector('[data-slot="subtask-count"]')?.textContent).toBe('1')
+  })
+
+  // Buckets are the unit the sidebar renders: a child that needs you must not be filed under a
+  // parent sitting in a bucket nobody is watching.
+  it('keeps a child in its own bucket when the parent is in another one', () => {
+    renderList({
+      runs: [
+        run({ id: 'p', status: 'running' }),
+        run({ id: 'c', status: 'waiting', dispatch: { rootRunId: 'p', parentRunId: 'p' } }),
+      ],
+    })
+    expect(idsIn('Working')).toEqual(['p'])
+    expect(idsIn('Needs you')).toEqual(['c'])
+    expect(row('c')?.getAttribute('data-depth')).toBe('0')
+  })
+
+  it('shows a child whose parent is not in the list at all as a top-level row', () => {
+    renderList({ runs: [run({ id: 'orphan', dispatch: { rootRunId: 'gone', parentRunId: 'gone' } })] })
+    expect(idsIn('Recent')).toEqual(['orphan'])
+    expect(row('orphan')?.getAttribute('data-depth')).toBe('0')
+  })
+
+  // The kind chip tells a dispatched row from a typed one at a glance, and it is the one piece
+  // of metadata the sidebar keeps at every width. Never on the root.
+  it('labels a child with its kind, an absent kind as implement, and a root with nothing', () => {
+    renderList({
+      runs: [
+        run({ id: 'p', status: 'done' }),
+        run({ id: 'rev', status: 'done', dispatch: { rootRunId: 'p', parentRunId: 'p', kind: 'review' } }),
+        run({ id: 'imp', status: 'done', dispatch: { rootRunId: 'p', parentRunId: 'p' } }),
+      ],
+    })
+    const kindOf = (id: string) => row(id)?.querySelector('[data-slot="dispatch-kind"]')?.textContent ?? null
+    expect(kindOf('rev')).toBe('review')
+    expect(kindOf('imp')).toBe('implement')
+    expect(kindOf('p')).toBeNull()
   })
 })

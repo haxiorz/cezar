@@ -343,7 +343,8 @@ export function sealHarnessRuntime(
 
 export interface HarnessRuntimeInfo {
   installed: boolean;
-  source: Skill['source'] | null;
+  /** `builtin` is cezar's own in-memory automation skill — never a harness collection. */
+  source: Exclude<Skill['source'], 'builtin'> | null;
   commit: string | null;
 }
 
@@ -360,7 +361,7 @@ export async function resolveHarnessRuntimeInfo(
 ): Promise<HarnessRuntimeInfo> {
   const catalog = await discoverSkills(repoRoot, opts).catch(() => [] as Skill[]);
   const skill = catalog.find((s) => s.name === 'cez-harness');
-  if (!skill) return { installed: false, source: null, commit: null };
+  if (!skill || skill.source === 'builtin') return { installed: false, source: null, commit: null };
   if (skill.source === 'team') {
     return { installed: true, source: 'team', commit: skill.team?.commit ?? null };
   }

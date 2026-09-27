@@ -14,7 +14,6 @@ import {
   useRunHarness,
   useProjectRepoBase,
   useRuns,
-  useSendMessage,
 } from '@/api/queries'
 import { useRunHistory, type RunHistoryState } from '@/api/run-history'
 import type { ApiRun } from '@open-mercato/cezar-api-client'
@@ -28,7 +27,9 @@ import { taskIssueUrl, taskPrUrl } from '@/lib/tasks-table'
 import { cn, isHttpUrl } from '@/lib/utils'
 
 import { AutoResumeHint } from './auto-resume-hint'
+import { useDraft } from './thread-draft'
 import { WorkingIndicator } from './thread-items'
+import { useDeliverPrompt } from './deliver-prompt'
 import { useContinueAction } from './follow-up-engine'
 import { AgentsDock } from './agents-dock'
 import { PlanDock, planCounts } from './plan-dock'
@@ -73,7 +74,8 @@ import { mergeHarnessLedger, orderStepsByLedger } from '../task-harness/harness-
  * Data doctrine: `useRun` is authoritative for the record; `useRunHistory` hydrates a bounded
  * visible transcript plus compact current-state context and falls back to `useRunEvents` when
  * the optimized route is unavailable. The rendered rows go through the threshold-switched scroller
- * (thread-scroller.tsx — flat + content-visibility below ~300 rows, virtua above).
+ * (thread-scroller.tsx — flat, with content-visibility where scroll anchoring is available,
+ * below ~300 rows; virtua above).
  */
 export function TaskThreadRoute() {
   const { id } = useParams<{ id: string }>()
@@ -215,6 +217,7 @@ export function ThreadView({
   onMarkedUnread?: (runId: string) => void
 }) {
   const footer = threadFooter(run.status, run.error)
+  const markedUnread = useCallback(() => onMarkedUnread?.(run.id), [onMarkedUnread, run.id])
   // The dock's data: the latest plan snapshot across turns (full replacement — an emptied
   // plan hides the dock and the header mirror alike).
   const plan = latestPlanEntries(currentThread)
@@ -279,7 +282,13 @@ export function ThreadView({
     () => (openAgentId === undefined ? [] : subagentChildren(thread.turns, openAgentId)),
     [thread.turns, openAgentId],
   )
-  const sendMessage = useSendMessage(run.id)
+  // One delivery path for both modes, because the record that picks between them can be stale:
+  // a 409 refetches it and, when the truth names the other endpoint, delivers there instead
+  // (deliver-prompt.ts). Without that, a lost record update meant every send bounced until the
+  // page was reloaded.
+  const deliverPrompt = useDeliverPrompt(run, continueAction)
+  // The reply composer's unsent content (#939) — server-side, per run, restored on return.
+  const draft = useDraft(run.id, 'composer')
   const activeProvider = useActiveProviderAvailability(run)
   // A queued send only amends the persisted prompt; it invokes no provider and therefore
   // remains available even when provider discovery cannot authorize a live session. Once the
@@ -318,12 +327,17 @@ export function ThreadView({
   const messageActions = useMemo<Readonly<Record<string, TranscriptMessageActions>> | undefined>(() => {
     if (edit === undefined) return undefined
     const actions: Record<string, TranscriptMessageActions> = {
-      task: { onEdit: edit.onEditTask, editLabel: 'Edit the prompt' },
+      // `draftSurface` (#939) is what makes an unsaved edit survive leaving the task: the bubble
+      // writes it to the run's draft store and re-opens holding it on return.
+      task: { onEdit: edit.onEditTask, editLabel: 'Edit the prompt', draftSurface: 'task-prompt' },
     }
     for (const message of run.queuedMessages ?? []) {
       actions[`queued:${message.id}`] = {
         onEdit: (text) => edit.onEditMessage(message.id, text),
         onRemove: () => edit.onRemoveMessage(message.id),
+        // Per message, so editing one and switching tasks restores THAT editor and leaves its
+        // neighbours closed and empty.
+        draftSurface: `message:${message.id}`,
       }
     }
     return actions
@@ -371,22 +385,30 @@ export function ThreadView({
   // the flat mode scrolls the row's own element. The virtual jump is issued
   // twice — a far target's offset is an estimate until its neighborhood has
   // been measured, and the second call lands on the corrected position.
-  const jumpToStep = (stepId: string) => {
-    const index = stepRowIndex(rows, stepId)
+  // Stable across renders so the memoized RunHeader is not re-rendered on every streamed row.
+  const rowsRef = useRef(rows)
+  rowsRef.current = rows
+  const { virtualizerRef, scrollElRef } = scroll
+  const jumpToStep = useCallback((stepId: string) => {
+    const index = stepRowIndex(rowsRef.current, stepId)
     if (index < 0) return
-    const virtualizer = scroll.virtualizerRef.current
+    const virtualizer = virtualizerRef.current
     if (virtualizer) {
       virtualizer.scrollToIndex(index, { align: 'start' })
       window.setTimeout(() => {
-        scroll.virtualizerRef.current?.scrollToIndex(index, { align: 'start' })
+        virtualizerRef.current?.scrollToIndex(index, { align: 'start' })
       }, 120)
       return
     }
-    const row = (scroll.scrollElRef.current ?? document).querySelectorAll(
+    const row = (scrollElRef.current ?? document).querySelectorAll(
       '[data-slot="thread-row"]',
     )[index]
     row?.scrollIntoView({ block: 'start', behavior: 'smooth' })
-  }
+  }, [virtualizerRef, scrollElRef])
+  const orderedSteps = useMemo(
+    () => (harnessLedger ? orderStepsByLedger(run.steps, harnessLedger) : undefined),
+    [harnessLedger, run.steps],
+  )
 
   return (
     <div data-route="task-thread" data-run-id={run.id} className="flex min-h-full flex-col">
@@ -395,8 +417,12 @@ export function ThreadView({
         planTally={planTally}
         publishBlockedReason={harnessPublishBlocked}
         onJumpToStep={jumpToStep}
-        orderedSteps={harnessLedger ? orderStepsByLedger(run.steps, harnessLedger) : undefined}
-        onMarkedUnread={() => onMarkedUnread?.(run.id)}
+        orderedSteps={orderedSteps}
+        onMarkedUnread={markedUnread}
+        // The badge the user already opens to inspect runner/account/model now edits the SAME
+        // continuation choice as the dock. One hook owns both renderings, so a header pick is
+        // exactly what the next composer submission sends — no second, drifting engine state.
+        continuationEngine={continuable ? continueAction.pills : undefined}
       />
       {/* ONE status line, and the timeline behind it (review 2026-07-27): the
           horizontal phase rail could not be read — 18 phases, 2620px wide, inside
@@ -449,6 +475,7 @@ export function ThreadView({
           messageActions={messageActions}
           scrollControls={scroll}
           renderMode={mode}
+          rowModels={rows}
         />
 
         {thread.turns.length === 0 ? (
@@ -464,7 +491,9 @@ export function ThreadView({
         {/* Live session heartbeat: while the engine owns the turn (`running`), a spinner tails
             the thread so quiet gaps between bursts don't read as "finished". `waiting` hands
             off to the dock's reply hint, `queued` to the placeholder above — so `running` only. */}
-        {run.status === 'running' ? <WorkingIndicator /> : null}
+        {run.status === 'running' ? (
+          <WorkingIndicator since={liveTurnStart(run, currentThread)} lastActivityAt={currentThread.lastEventAt} />
+        ) : null}
 
         {/* Closed states read as the body's last line; the WAITING state lives in the dock
             (mockup `.paused-hint`), right above the composer it is asking the user to use. */}
@@ -579,8 +608,9 @@ export function ThreadView({
           ) : null}
 
           {plan !== undefined && plan.length > 0 ? (
-            // Keyed by run id: the collapse default re-derives per task (see PlanDock).
-            <PlanDock key={run.id} runId={run.id} entries={plan} />
+            // Keyed by run id: the collapse default re-derives per task (see PlanDock). Settled
+            // on the same rule as the Agents dock: a closed session never advances the plan.
+            <PlanDock key={run.id} runId={run.id} entries={plan} settled={runIsTerminal} />
           ) : null}
 
           {/* A usage-limit stop is the one `failed` state that is still going somewhere — the
@@ -618,11 +648,20 @@ export function ThreadView({
           ) : null}
 
           <Composer
-            onSubmit={
-              continuable
-                ? (text, images) => continueAction.continueWith(text, images)
-                : (text, images) => sendMessage.mutateAsync({ text, images })
-            }
+            // The draft store's first host (#939). The composer is controlled on BOTH seams here
+            // — text and attachments — so leaving the task mid-sentence and coming back restores
+            // the message exactly as it was left, screenshots included. `draft.submit` wraps the
+            // real send: the optimistic clear only becomes a cleared draft once the message has
+            // actually landed, and a rejection leaves the draft (and its blobs) intact.
+            value={draft.text}
+            onValueChange={draft.setText}
+            images={draft.images}
+            onImagesChange={draft.setImages}
+            // The send itself is `deliverPrompt`, not a branch on `continuable`: the record that
+            // would pick the endpoint can be stale, so the re-route on a 409 decides it from the
+            // truth instead. The two compose exactly as they read — the draft stays open until
+            // the message has actually landed, wherever it turned out to land.
+            onSubmit={(text, images) => draft.submit<unknown>(() => deliverPrompt(text, images))}
             disabled={providerBlocked || (!sessionOpen && !queued && !continuable)}
             // Only reachable now by a closed run with NO session to resume — which is exactly
             // the one case where Continue is not on offer either. Left honest rather than
@@ -717,6 +756,16 @@ function HistoryBoundary({
       </span>
     </div>
   )
+}
+
+/** Where the Working… counter starts: the open turn's start; between turns (a turn completed but
+ *  the run is still `running` — the next step spinning up), the moment that turn closed; with no
+ *  turn at all yet, the run's own start. */
+export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefined {
+  const last = thread.turns.at(-1)
+  if (last === undefined) return run.startedAt
+  if (last.completed === undefined) return last.startedAt ?? run.startedAt
+  return last.completed.ts ?? run.startedAt
 }
 
 /** The queued run's honest empty state (legacy #351): a queued run has emitted nothing, so

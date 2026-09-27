@@ -1,5 +1,5 @@
-import { useMutation, useQueries, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect, useMemo } from 'react'
+import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 
 import { mergeProviderStatusResponse } from '@/lib/provider-status'
 
@@ -47,6 +47,7 @@ import {
   getRunCommit,
   getRunCommits,
   getRunDiff,
+  getRunDrafts,
   getRunFile,
   getRunHandoff,
   getRunnerModels,
@@ -55,6 +56,10 @@ import {
   getSkills,
   getSkillsWhenReady,
   getTodos,
+  getTrackerAssociation, getTrackerConnection,
+  getTrackerCandidates,
+  getTrackerItem,
+  getTrackerItems,
   getUiState,
   getWorkflows,
   getWorkspaceConfig,
@@ -81,6 +86,7 @@ import {
   sendProjectRunMessage,
   updateProject,
   retryProviderAuth,
+  searchTrackerItems,
 } from './client'
 import { queryScope, REFERENCE_STATUS_MAX, runnerDiscoversModels } from '@open-mercato/cezar-api-client'
 import { useProjectScope } from './project-scope-context'
@@ -93,6 +99,7 @@ import type {
   CreateAgentProfileInput,
   HarnessProfile,
   HarnessRoles,
+  ApiRun,
   HealthResponse,
   MessageInput,
   Runner,
@@ -109,6 +116,9 @@ import type {
   SetAgentConfigInput,
   UpdateAgentProfileInput,
   UpdateProjectInput,
+  TrackerAssociation,
+  TrackerItemsResponse,
+  TrackerKind,
 } from '@open-mercato/cezar-api-client'
 import { subscribeTopic } from './ws'
 
@@ -129,6 +139,25 @@ import { subscribeTopic } from './ws'
  * ever reach A's data. Call sites are unchanged — they keep writing `queryKeys.runs.list()`.
  */
 export const queryKeys = {
+  tracker: {
+    allFor: (projectId: string) => ['tracker', projectId] as const,
+    all: () => ['tracker', queryScope()] as const,
+    associationFor: (projectId: string) => ['tracker', projectId, 'association'] as const,
+    association: () => ['tracker', queryScope(), 'association'] as const,
+    candidates: (kind: TrackerKind, query = '') => ['tracker', queryScope(), 'candidates', kind, query] as const,
+    connection: () => ['tracker', queryScope(), 'connection'] as const,
+    items: (
+      association: TrackerAssociation,
+      params: { state: 'active' | 'all'; labels: readonly string[]; query?: string },
+    ) => [
+      'tracker', queryScope(), 'items', association.kind, association.source.id,
+      association.source.webUrl, association.externalId, association.connectionId ?? null, params.state, [...params.labels], params.query ?? '',
+    ] as const,
+    detail: (association: TrackerAssociation, id: string) => [
+      'tracker', queryScope(), 'detail', association.kind, association.source.id,
+      association.source.webUrl, association.externalId, association.connectionId ?? null, id,
+    ] as const,
+  },
   get health() {
     return [queryScope(), 'health'] as const
   },
@@ -142,6 +171,9 @@ export const queryKeys = {
     changes: (id: string) => [queryScope(), 'runs', 'changes', id] as const,
     file: (id: string, path: string) => [queryScope(), 'runs', 'files', id, path] as const,
     handoff: (id: string) => [queryScope(), 'runs', 'handoff', id] as const,
+    /** Unsent drafts for one task (#939). Read once per visit and never refetched in the
+     *  background — see `useRunDrafts`. */
+    drafts: (id: string) => [queryScope(), 'runs', 'drafts', id] as const,
     commits: (id: string) => [queryScope(), 'runs', 'commits', id] as const,
     commit: (id: string, sha: string) => [queryScope(), 'runs', 'commit', id, sha] as const,
     harness: (id: string) => [queryScope(), 'runs', 'harness', id] as const,
@@ -230,6 +262,108 @@ export const queryKeys = {
   },
 }
 
+export const TRACKER_STALE_TIME = 60_000
+
+export function useTrackerConnection() {
+  return useQuery({ queryKey: queryKeys.tracker.connection(), queryFn: ({ signal }) => getTrackerConnection({ signal }) })
+}
+
+export function useTrackerAssociation() {
+  return useQuery({
+    queryKey: queryKeys.tracker.association(),
+    queryFn: ({ signal }) => getTrackerAssociation({ signal }),
+  })
+}
+
+export function useTrackerCandidates(kind: TrackerKind, query: string, enabled: boolean) {
+  return useInfiniteQuery({
+    queryKey: queryKeys.tracker.candidates(kind, query),
+    staleTime: TRACKER_STALE_TIME,
+    queryFn: ({ pageParam, signal }) =>
+      getTrackerCandidates(kind, {
+        q: query.trim() || undefined,
+        cursor: pageParam,
+        limit: 50,
+      }, { signal }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (page) => page.available && page.truncated ? page.nextCursor : undefined,
+    enabled,
+  })
+}
+
+/** Keep tracker failure metadata when a refresh rejects without replacing cached pages. */
+export class TrackerRefreshError extends Error {
+  constructor(readonly failure: Extract<TrackerItemsResponse, { available: false }>) {
+    super(failure.reason)
+    this.name = 'TrackerRefreshError'
+  }
+}
+
+export function useTrackerItems(
+  association: TrackerAssociation | null | undefined,
+  params: { state: 'active' | 'all'; labels: readonly string[]; query: string },
+  enabled = true,
+) {
+  const query = params.query.trim()
+  const queryClient = useQueryClient()
+  const queryKey = association
+    ? queryKeys.tracker.items(association, { ...params, query })
+    : ['tracker', queryScope(), 'items', 'unassociated']
+  const result = useInfiniteQuery({
+    queryKey,
+    // Watch owns automatic updates and preserves loaded pages until Show changes.
+    // Infinity still allows explicit invalidation when the connection or scope changes.
+    staleTime: Infinity,
+    queryFn: ({ pageParam, signal }) => query
+      ? searchTrackerItems(query, { association: association ?? undefined, cursor: pageParam, limit: 50, state: params.state, labels: params.labels, refresh: true }, { signal })
+      : getTrackerItems({ association: association ?? undefined, cursor: pageParam, limit: 50, state: params.state, labels: params.labels, refresh: false }, { signal }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (page) => page.available && page.truncated ? page.nextCursor : undefined,
+    enabled: association != null && enabled,
+  })
+  return {
+    ...result,
+    queryKey,
+    // Fetch page one without resetting the infinite-query cache: failed refreshes must
+    // retain loaded pages and cursors. The shared query owns cancellation and loading/error
+    // state, and publishes the replacement pages only after a successful response.
+    restart: async () => {
+      await queryClient.cancelQueries({ queryKey, exact: true })
+      try {
+        await queryClient.fetchInfiniteQuery({
+          queryKey,
+          initialPageParam: undefined as string | undefined,
+          pages: 1,
+          getNextPageParam: (page: TrackerItemsResponse) => page.available && page.truncated ? page.nextCursor : undefined,
+          staleTime: 0,
+          retry: false,
+          queryFn: async ({ signal }) => {
+            const browse = { association: association ?? undefined, limit: 50, state: params.state, labels: params.labels, refresh: true }
+            const page = query
+              ? await searchTrackerItems(query, browse, { signal })
+              : await getTrackerItems(browse, { signal })
+            if (!page.available) throw new TrackerRefreshError(page)
+            return page
+          },
+        })
+      } catch {
+        // Query state exposes failures to the existing retry UI; cancellation is silent.
+      }
+    },
+  }
+}
+
+export function useTrackerItem(association: TrackerAssociation | null | undefined, id: string | undefined) {
+  return useQuery({
+    staleTime: TRACKER_STALE_TIME,
+    queryKey: association && id
+      ? queryKeys.tracker.detail(association, id)
+      : ['tracker', queryScope(), 'detail', 'disabled'],
+    queryFn: ({ signal }) => getTrackerItem(id as string, { signal, association: association ?? undefined }),
+    enabled: association != null && id != null && id !== '',
+  })
+}
+
 /**
  * Workspace-level keys — deliberately NOT scope-led: there is one project registry no matter
  * which project is active, and the `/p/:projectId` route gate reads it while the scope is
@@ -237,6 +371,7 @@ export const queryKeys = {
  * scope changes → key changes → data gone → provider unmounts).
  */
 export const workspaceQueryKeys = {
+  dashboard: ['workspace', 'dashboard'] as const,
   models: (runner: string) => ['workspace', 'models', runner] as const,
   providerStatus: ['workspace', 'providers', 'status'] as const,
   projects: ['workspace', 'projects'] as const,
@@ -250,6 +385,11 @@ export const workspaceQueryKeys = {
   /** `~/.cezar/config.json`'s settings slice via `GET/PUT /api/workspace/config` (step 2.7):
    *  the global Resources knobs and the checkout root. */
   config: ['workspace', 'config'] as const,
+  /** Live host totals (spec `.ai/specs/2026-09-20-host-resource-telemetry.md`). One cache for
+   *  both transports: local cockpits fold pushed `host` frames into it, remote ones refetch it
+   *  on mount and on the visibility/reconnect reconcile. Workspace-led because the machine is
+   *  the machine, whichever project is on screen. */
+  hostUsage: ['workspace', 'host-usage'] as const,
   /** Agent accounts via `GET /api/v1/workspace/agent-profiles` (spec 2026-07-29-agent-profiles).
    *  Workspace-led like the registry: an account describes the machine, not a repo. */
   agentProfiles: ['workspace', 'agent-profiles'] as const,
@@ -779,10 +919,11 @@ export function useOpenTargets() {
 }
 
 /** The authoritative run list. */
-export function useRuns() {
+export function useRuns<TData = ApiRun[]>(select?: (runs: ApiRun[]) => TData) {
   return useQuery({
     queryKey: queryKeys.runs.list(),
     queryFn: ({ signal }) => getRuns({ signal }),
+    select,
   })
 }
 
@@ -838,19 +979,53 @@ export function useRunsIndex(enabled = true, refetchIntervalMs?: number) {
  * still goes to `/api/p/<bootId>/runs`, which the server answers byte-identically (the
  * route-parity contract).
  */
-export function useProjectRuns(projectId: string, enabled = true, boot = false) {
+export function useProjectRuns<TData = ApiRun[]>(
+  projectId: string,
+  enabled = true,
+  boot = false,
+  select?: (runs: ApiRun[]) => TData,
+) {
   return useQuery({
     queryKey: [boot ? 'default' : projectId, 'runs', 'list'] as const,
     queryFn: ({ signal }) => getProjectRuns(projectId, { signal }),
     enabled,
+    select,
   })
+}
+
+/**
+ * A run list for a project chosen OUTSIDE `ProjectScopeProvider` (the app shell and command
+ * palette live above the routed provider). Do not use `useRuns()` there: its key is read during
+ * the shell render, while its fetch runs after the route provider has written the module scope,
+ * which can cache project B's response under project A's key.
+ */
+export function useRunsForProject<TData = ApiRun[]>(
+  projectId: string | null,
+  bootProjectId: string | null | undefined,
+  select?: (runs: ApiRun[]) => TData,
+) {
+  const selected = projectId === 'default' ? null : projectId
+  const boot = selected === null || (bootProjectId != null && selected === bootProjectId)
+  return useProjectRuns(boot ? 'default' : selected ?? 'default', true, boot, select)
+}
+
+/**
+ * The authoritative single-run read, as options rather than a hook — so a caller that needs the
+ * record RIGHT NOW (`queryClient.fetchQuery`, with its own `staleTime: 0`) asks the same question
+ * at the same cache key as the thread's own `useRun`, and the answer lands in the cache every
+ * mounted view already reads. Spelling it twice would mean a refetch that heals nothing.
+ */
+export function runQueryOptions(id: string) {
+  return {
+    queryKey: queryKeys.runs.detail(id),
+    queryFn: ({ signal }: { signal: AbortSignal }) => getRun(id, { signal }),
+  }
 }
 
 /** One run, authoritative. `id` may be absent while a route param is still unresolved. */
 export function useRun(id: string | undefined) {
   return useQuery({
-    queryKey: queryKeys.runs.detail(id ?? ''),
-    queryFn: ({ signal }) => getRun(id as string, { signal }),
+    ...runQueryOptions(id ?? ''),
     enabled: Boolean(id),
   })
 }
@@ -1034,6 +1209,28 @@ export function useRunHandoff(id: string | undefined, enabled = true) {
     queryKey: queryKeys.runs.handoff(id ?? ''),
     queryFn: ({ signal }) => getRunHandoff(id as string, { signal }),
     enabled: Boolean(id) && enabled,
+  })
+}
+
+/**
+ * The unsent drafts of one task's editable inputs (#939).
+ *
+ * `staleTime: Infinity` and no focus refetch, and both are load-bearing rather than tuning: this
+ * query seeds inputs the user is typing into, so a background refetch landing mid-sentence would
+ * overwrite live text with what the server last heard. The cockpit's own writes update the cache
+ * in place (`useDraft`), which is the only thing that ever changes it while a task is open.
+ */
+export function useRunDrafts(id: string | undefined) {
+  return useQuery({
+    queryKey: queryKeys.runs.drafts(id ?? ''),
+    queryFn: ({ signal }) => getRunDrafts(id as string, { signal }),
+    enabled: Boolean(id),
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    // A draft is a convenience, not the page: a task whose drafts cannot be read still opens,
+    // with an empty composer, exactly as it did before this feature existed.
+    retry: false,
   })
 }
 

@@ -156,9 +156,10 @@ describe('the General page', () => {
   it('carries the per-project concurrency ceiling, named against the workspace cap', async () => {
     renderAt('/p/demo/settings')
     const select = await screen.findByLabelText('Max parallel tasks for demo-project')
-    expect(select.textContent).toContain('Inherit workspace (4)')
+    expect((select as HTMLInputElement).placeholder).toBe('Inherit (4)')
 
     fireEvent.change(select, { target: { value: '3' } })
+    fireEvent.keyDown(select, { key: 'Enter' })
 
     await waitFor(() => {
       const patch = requests.find((r) => r.method === 'PATCH')
@@ -195,7 +196,38 @@ describe('the General page', () => {
     const remove = await screen.findByRole('button', { name: /^Remove cezar from the workspace/ })
     expect(remove.hasAttribute('disabled')).toBe(true)
     expect(document.querySelector('[data-slot="project-general-remove-boot"]')?.textContent).toContain(
-      're-registers itself',
+      'cezar is serving this project',
+    )
+  })
+
+  it('offers to add — not manage — the folder cezar is serving but has not saved', async () => {
+    // The ordinary state since boot registration became seed-once: the server lists the folder
+    // it is serving so the cockpit can reach it, flagged because there is no registry row behind
+    // it. Max parallel is stored ON that row and Remove would 404, so neither is offered.
+    const unregistered: ProjectListEntry = {
+      id: 'boot',
+      name: 'cezar',
+      root: BOOT_ROOT,
+      addedAt: '',
+      lastOpenedAt: '',
+      source: 'local',
+      status: 'ok',
+      unregistered: true,
+    }
+    renderAt('/p/boot/settings', { registry: [unregistered, project('demo')] })
+
+    await waitFor(() => expect(general()).not.toBeNull())
+    expect(document.querySelector('[data-slot="project-general-unregistered"]')?.textContent).toContain(
+      'served because cezar was started here',
+    )
+    expect(document.querySelector('[data-action="project-general-remove"]')).toBeNull()
+    expect(document.querySelector('[data-slot="project-max-parallel"]')).toBeNull()
+
+    fireEvent.click(await screen.findByRole('button', { name: /^Add cezar to your projects/ }))
+    await waitFor(() =>
+      expect(requests.filter((r) => r.method === 'POST')).toEqual([
+        { method: 'POST', url: '/api/v1/projects', body: { root: BOOT_ROOT } },
+      ]),
     )
   })
 

@@ -349,16 +349,16 @@ describe('the global settings area (/settings/global)', () => {
     })
   }
 
-  // #801: a bookmarked deep link into any of the four `/automations*` routes still resolves — the
-  // route map is unchanged — but the view says the feature is off instead of rendering an editor
-  // whose every request would 409.
+  // A bookmarked deep link into any of the four `/automations*` routes still resolves — the route
+  // map is unchanged — but on a cockpit started with CEZ_AUTOMATIONS=0 the view says the feature
+  // is off instead of rendering an editor whose every request would 409.
   for (const path of ['automations', 'automations/new', 'automations/a-1', 'automations/a-1/log']) {
     it(`/${path} renders the disabled state while the capability is off`, async () => {
       renderAt(`/p/${BOOT}/${path}`)
       expect(currentPathname()).toBe(`/p/${BOOT}/${path}`)
       expect(routeName()).toBe('automations')
-      expect(await screen.findByText('GitHub automations are off')).not.toBeNull()
-      expect(screen.getByText(/CEZ_AUTOMATIONS=1/)).not.toBeNull()
+      expect(await screen.findByText('Automations are off')).not.toBeNull()
+      expect(screen.getByText(/CEZ_AUTOMATIONS=0/)).not.toBeNull()
     })
   }
 
@@ -370,7 +370,7 @@ describe('the global settings area (/settings/global)', () => {
     expect(routeName()).toBe('automations')
     expect(screen.getByText('Loading automations…')).not.toBeNull()
     expect(document.querySelector('#automation-name')).toBeNull()
-    expect(screen.queryByText('GitHub automations are off')).toBeNull()
+    expect(screen.queryByText('Automations are off')).toBeNull()
   })
 
   it('omits the Projects route when single-project mode is active', () => {
@@ -515,6 +515,47 @@ describe('legacy flat URLs redirect to the boot project', () => {
     renderAt('/', { registry: null })
 
     await waitFor(() => expect(currentPathname()).toBe(expected), { timeout: 4_000 })
+  })
+
+  /** The launch folder stopped being a project once the user has some (#774 follow-up):
+   *  `/api/v1/projects` no longer lists `bootProject`, so a bare launch must open a project the
+   *  sidebar actually shows — while every explicit URL still reaches the served folder. */
+  describe('with the boot folder served but not listed', () => {
+    const UNLISTED: ProjectsResponse = {
+      ...REGISTRY,
+      projects: [
+        {
+          ...REGISTRY.projects[1]!,
+          id: 'older',
+          name: 'older',
+          root: '/home/u/older',
+          lastOpenedAt: '2026-01-01T00:00:00.000Z',
+        },
+        { ...REGISTRY.projects[1]!, lastOpenedAt: '2026-02-01T00:00:00.000Z' },
+      ],
+    }
+
+    it('opens the most recently opened registered project from the bare root', () => {
+      renderAt('/', { registry: UNLISTED })
+
+      expect(currentPathname()).toBe('/p/other/')
+      expect(routeName()).toBe('tasks')
+    })
+
+    it('still restores a remembered location', () => {
+      rememberLocation({ projectId: 'older', pathname: '/p/older/tasks/run-1' })
+      renderAt('/', { registry: UNLISTED })
+
+      expect(currentPathname()).toBe('/p/older/tasks/run-1')
+    })
+
+    it('still resolves an explicit legacy deep link to the served folder', () => {
+      renderAt('/tasks/run-2?file=y#L3', { registry: UNLISTED })
+
+      expect(currentPathname()).toBe('/p/boot/tasks/run-2')
+      expect(currentSearch()).toBe('?file=y')
+      expect(currentHash()).toBe('#L3')
+    })
   })
 
   it('keeps the quiet resolving surface while bare-root inputs are pending', () => {

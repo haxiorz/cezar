@@ -19,6 +19,8 @@ describe('activeNavPath', () => {
     ['/github', '/github'],
     ['/github/issues/42', '/github'],
     ['/github/prs/7', '/github'],
+    ['/tracker', '/tracker'],
+    ['/tracker/OPS-7', '/tracker'],
     ['/workflows', '/workflows'],
     ['/workflows/ship-it', '/workflows'],
 
@@ -69,6 +71,7 @@ describe('NAV_ITEMS', () => {
       'Inbox',
       'Git',
       'GitHub',
+      'Tracker',
       'Automations',
       'Skills',
       'Workflows',
@@ -88,20 +91,30 @@ describe('NAV_ITEMS', () => {
 /** The gates: the GitHub item exists exactly while health reports the forge driver (R6 Step 1.1),
  *  the Inbox item exactly while it reports the opt-in `capabilities.followups` (#471), and the
  *  Automations item exactly while it reports a forge AND the opt-in `capabilities.automations`
- *  (#801). Each gate owns ONLY its own item, and all default to absent while health is unknown. */
+ *  (#801). Each gate owns ONLY its own items, and all default to absent while health is
+ *  unknown. */
 describe('visibleNavItems', () => {
   const labelsOf = (opts?: Parameters<typeof visibleNavItems>[0]) =>
     visibleNavItems(opts).map((item) => item.label)
 
   it('with everything available, the full nav renders', () => {
-    expect(visibleNavItems({ forge: true, inbox: true, automations: true })).toEqual(NAV_ITEMS)
+    expect(labelsOf({ forge: true, inbox: true, automations: true, tracker: 'jira' })).toEqual([
+      'Tasks', 'Inbox', 'Git', 'GitHub', 'Jira', 'Automations', 'Skills', 'Workflows', 'Settings',
+    ])
   })
 
-  it('without a forge, the GitHub AND Automations items drop out', () => {
+  it('shows the saved provider label and hides an unassociated tracker', () => {
+    expect(labelsOf({ tracker: 'jira' })).toContain('Jira')
+    expect(labelsOf({ tracker: 'linear' })).toContain('Linear')
+    expect(labelsOf()).not.toContain('Tracker')
+  })
+
+  it('without a forge, only the GitHub item drops out — a schedule needs no remote', () => {
     expect(labelsOf({ forge: false, inbox: true, automations: true })).toEqual([
       'Tasks',
       'Inbox',
       'Git',
+      'Automations',
       'Skills',
       'Workflows',
       'Settings',
@@ -120,7 +133,7 @@ describe('visibleNavItems', () => {
     ])
   })
 
-  it('without the automations opt-in, exactly the Automations item drops out (#801)', () => {
+  it('opted out of automations, exactly the Automations item drops out', () => {
     expect(labelsOf({ forge: true, inbox: true, automations: false })).toEqual([
       'Tasks',
       'Inbox',

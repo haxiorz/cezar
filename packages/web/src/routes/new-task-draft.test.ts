@@ -1,15 +1,47 @@
 import { afterEach, describe, expect, it } from 'vitest'
 
+import type { PendingAttachment } from '@/components/composer/composer-attachments'
+
 import {
   clearStartedDraft,
   composerRunModeNote,
+  handOffComposition,
+  normalizeDispatchIntent,
+  readAttachments,
   readDraft,
   resetDraft,
   resolveComposerRunMode,
+  writeAttachments,
   writeDraft,
 } from './new-task-draft'
 
 afterEach(resetDraft)
+
+const EMPTY_DRAFT = {
+  text: '',
+  source: null,
+  runner: null,
+  agentProfile: null,
+  model: null,
+  variants: 1,
+  planFirst: false,
+  worktree: null,
+  autonomous: null,
+  generateFollowups: null,
+  dispatch: null,
+  composerMode: null,
+  harnessMode: null,
+  harnessSkillProfile: null,
+  harnessRoles: null,
+} as const
+
+const shot = (name = 'pasted image'): PendingAttachment => ({
+  mediaType: 'image/png',
+  data: 'iVBORw0KGgo=',
+  preview: 'data:image/png;base64,iVBORw0KGgo=',
+  name,
+  isImage: true,
+})
 
 describe('resolveComposerRunMode', () => {
   const base = {
@@ -59,6 +91,38 @@ describe('resolveComposerRunMode', () => {
   })
 })
 
+describe('resolveComposerRunMode with dispatch (spec 2026-09-10-dispatch)', () => {
+  const base = {
+    hasGit: true,
+    variants: 1,
+    planFirst: false,
+    explicitAutonomous: null,
+    explicitWorktree: null,
+    configuredAutonomous: 'source-dependent' as const,
+    configuredWorktree: true,
+    source: 'workflow' as const,
+    dispatch: true,
+  }
+
+  it('forces the worktree on and defaults autonomous on', () => {
+    expect(resolveComposerRunMode(base)).toEqual({ autonomous: true, worktree: true })
+    // An explicit worktree opt-out and a workspace policy are both overruled — subtasks fork
+    // off the parent's commits, which needs a tree of its own.
+    expect(resolveComposerRunMode({ ...base, explicitWorktree: false, configuredWorktree: false }))
+      .toEqual({ autonomous: true, worktree: true })
+    // An interactive skill's recommendation is about the parent pausing for the user; a
+    // dispatching parent keeps going while its children work.
+    expect(resolveComposerRunMode({ ...base, interactive: true, source: 'skill' }).autonomous).toBe(true)
+  })
+
+  it('yields to an explicit Autonomous off, to plan-first, and to a missing repo', () => {
+    expect(resolveComposerRunMode({ ...base, explicitAutonomous: false }))
+      .toEqual({ autonomous: false, worktree: true })
+    expect(resolveComposerRunMode({ ...base, planFirst: true }).autonomous).toBe(false)
+    expect(resolveComposerRunMode({ ...base, hasGit: false }).worktree).toBe(false)
+  })
+})
+
 describe('the new-task draft store', () => {
   it('starts empty with the never-chosen sentinels', () => {
     expect(readDraft()).toEqual({
@@ -76,6 +140,7 @@ describe('the new-task draft store', () => {
       harnessMode: null,
       harnessSkillProfile: null,
       harnessRoles: null,
+      dispatch: null,
     })
   })
 
@@ -95,6 +160,7 @@ describe('the new-task draft store', () => {
       harnessMode: null,
       harnessSkillProfile: null,
       harnessRoles: null,
+      dispatch: null,
     })
     const first = readDraft()
     expect(first.text).toBe('fix it')
@@ -120,6 +186,7 @@ describe('the new-task draft store', () => {
       harnessMode: null,
       harnessSkillProfile: null,
       harnessRoles: null,
+      dispatch: null,
     })
     clearStartedDraft()
     expect(readDraft()).toEqual({
@@ -139,6 +206,7 @@ describe('the new-task draft store', () => {
       harnessMode: null,
       harnessSkillProfile: null,
       harnessRoles: null,
+      dispatch: null,
     })
   })
 
@@ -158,6 +226,7 @@ describe('the new-task draft store', () => {
       harnessMode: null,
       harnessSkillProfile: null,
       harnessRoles: null,
+      dispatch: null,
     })
     // A fresh page has no in-memory cache but keeps localStorage: resetDraft removes storage, so
     // instead drop only the cache by round-tripping through a raw storage read.
@@ -168,6 +237,7 @@ describe('the new-task draft store', () => {
       worktree: false,
       autonomous: null,
       generateFollowups: false,
+      dispatch: null,
       planFirst: true,
     })
   })
@@ -191,6 +261,7 @@ describe('the new-task draft store', () => {
       harnessMode: null,
       harnessSkillProfile: null,
       harnessRoles: null,
+      dispatch: null,
     })
 
     resetDraft()
@@ -210,9 +281,138 @@ describe('the new-task draft store', () => {
       harnessMode: null,
       harnessSkillProfile: null,
       harnessRoles: null,
+      dispatch: null,
     })
   })
 })
+
+/**
+ * #1018 — switching project while composing takes the composition with you.
+ *
+ * The per-project keys are right, and stay: a half-typed task for the shop frontend must not
+ * surface in the cezar composer. What they were wrong ABOUT is the explicit switch — the user
+ * changing their mind mid-sentence about where this task belongs, with a screenshot already
+ * pasted. That is a move, and the rules below are what keep it one.
+ */
+describe('the new-task attachment store', () => {
+  it('keeps attachments per project and hands out copies, not the stored array', () => {
+    writeAttachments([shot('a.png')], null)
+    writeAttachments([shot('b.png'), shot('c.png')], 'shop')
+
+    expect(readAttachments(null).map((a) => a.name)).toEqual(['a.png'])
+    expect(readAttachments('shop').map((a) => a.name)).toEqual(['b.png', 'c.png'])
+    // A project nobody has touched has nothing attached.
+    expect(readAttachments('blog')).toEqual([])
+
+    const held = readAttachments('shop')
+    held.pop()
+    expect(readAttachments('shop')).toHaveLength(2)
+  })
+
+  it('never reaches localStorage — four 5 MB images would not fit', () => {
+    writeAttachments([shot()], 'shop')
+    expect(
+      Object.keys(localStorage).filter((key) => key.startsWith('cez-new-task-draft')),
+    ).toEqual([])
+  })
+})
+
+describe('handOffComposition', () => {
+  it('moves the text and the attachments to the arriving project', () => {
+    writeDraft({ ...EMPTY_DRAFT, text: 'fix the flake', runner: 'codex' }, null)
+    writeAttachments([shot('screenshot.png')], null)
+
+    expect(handOffComposition(null, 'shop')).toEqual({ moved: true })
+
+    expect(readDraft('shop').text).toBe('fix the flake')
+    expect(readAttachments('shop').map((a) => a.name)).toEqual(['screenshot.png'])
+    // A MOVE: the composition now exists in exactly one project, which is what keeps the
+    // per-project isolation the storage keys are for actually true.
+    expect(readDraft(null).text).toBe('')
+    expect(readAttachments(null)).toEqual([])
+  })
+
+  it('leaves the pickers behind — a skill ref is resolved against a project’s own catalog', () => {
+    writeDraft(
+      { ...EMPTY_DRAFT, text: 'ship it', source: { source: 'skill', ref: 'om-fix' }, model: 'opus' },
+      null,
+    )
+
+    handOffComposition(null, 'shop')
+
+    expect(readDraft('shop').source).toBeNull()
+    expect(readDraft('shop').model).toBeNull()
+    // …and the departing project keeps its own way of working, minus the spent text.
+    expect(readDraft(null).source).toEqual({ source: 'skill', ref: 'om-fix' })
+  })
+
+  it('refuses to clobber an unsent draft already waiting in the arriving project', () => {
+    writeDraft({ ...EMPTY_DRAFT, text: 'from cezar' }, null)
+    writeAttachments([shot('cezar.png')], null)
+    writeDraft({ ...EMPTY_DRAFT, text: 'already writing this' }, 'shop')
+
+    expect(handOffComposition(null, 'shop')).toEqual({ moved: false, reason: 'destination-busy' })
+
+    // Nothing lost on either side: the arriving project's work in progress wins, and the
+    // departing one still holds what was typed there — switching back restores it.
+    expect(readDraft('shop').text).toBe('already writing this')
+    expect(readAttachments('shop')).toEqual([])
+    expect(readDraft(null).text).toBe('from cezar')
+    expect(readAttachments(null).map((a) => a.name)).toEqual(['cezar.png'])
+  })
+
+  it('carries an attachment pasted before a word was typed', () => {
+    writeAttachments([shot()], null)
+
+    expect(handOffComposition(null, 'shop')).toEqual({ moved: true })
+    expect(readAttachments('shop')).toHaveLength(1)
+    expect(readAttachments(null)).toEqual([])
+  })
+
+  it('does nothing when there is nothing to move, or nowhere to move it', () => {
+    expect(handOffComposition(null, 'shop')).toEqual({ moved: false, reason: 'nothing-to-move' })
+
+    writeDraft({ ...EMPTY_DRAFT, text: 'typed' }, 'shop')
+    expect(handOffComposition('shop', 'shop')).toEqual({ moved: false, reason: 'same-project' })
+    expect(readDraft('shop').text).toBe('typed')
+  })
+})
+
+describe('normalizeDispatchIntent', () => {
+  it('keeps only the contract keys, within the contract ranges', () => {
+    expect(normalizeDispatchIntent({
+      maxSubtasks: 10, inFlight: 9, runner: 'nope', model: '', budgetUsd: -1, extra: 1,
+    })).toEqual({ maxSubtasks: 10 })
+    expect(normalizeDispatchIntent({
+      maxSubtasks: 51, inFlight: 2, runner: 'codex', model: 'gpt-future', budgetUsd: 2.5,
+    })).toEqual({ inFlight: 2, runner: 'codex', model: 'gpt-future', budgetUsd: 2.5 })
+    expect(normalizeDispatchIntent({ maxSubtasks: 1.5, budgetUsd: 10_001 })).toEqual({})
+  })
+
+  it('answers null for anything but a plain object — the toggle is off', () => {
+    for (const raw of [null, undefined, 'on', true, 1, [], [1]]) {
+      expect(normalizeDispatchIntent(raw)).toBeNull()
+    }
+    // The bare toggle: on, engine defaults.
+    expect(normalizeDispatchIntent({})).toEqual({})
+  })
+
+  it('round-trips through the store', () => {
+    writeDraft({ ...readDraft(), dispatch: { maxSubtasks: 10, inFlight: 2 } })
+    resetDraftCacheOnly()
+    expect(readDraft().dispatch).toEqual({ maxSubtasks: 10, inFlight: 2 })
+    localStorage.setItem('cez-new-task-draft', '{"dispatch":"yes please"}')
+    resetDraftCacheOnly()
+    expect(readDraft().dispatch).toBeNull()
+  })
+})
+
+/** Drop the in-memory cache but keep localStorage — a reload, not a reset. */
+function resetDraftCacheOnly() {
+  const stored = localStorage.getItem('cez-new-task-draft')
+  resetDraft()
+  if (stored !== null) localStorage.setItem('cez-new-task-draft', stored)
+}
 
 describe('composerRunModeNote (#793)', () => {
   // One line per place the run can land. The header used to print the first one unconditionally,
@@ -240,6 +440,16 @@ describe('composerRunModeNote (#793)', () => {
       expect(composerRunModeNote({ worktree, hasGit })).toBe(expected)
     })
   }
+
+  it('names the fan-out when dispatch is on, in both autonomy states', () => {
+    expect(composerRunModeNote({ worktree: true, hasGit: true, dispatch: true, autonomous: true }))
+      .toBe('Runs on its own and fans work out to subtasks — it will not pause for you.')
+    expect(composerRunModeNote({ worktree: true, hasGit: true, dispatch: true, autonomous: false }))
+      .toBe('Fans work out to subtasks in isolated worktrees.')
+    // Off, the existing three states are untouched.
+    expect(composerRunModeNote({ worktree: true, hasGit: true, dispatch: false }))
+      .toBe('Runs in an isolated worktree — review everything before it lands.')
+  })
 
   it('never promises isolation without a worktree', () => {
     // The invariant the header actually owes the user, independent of the exact copy: the word

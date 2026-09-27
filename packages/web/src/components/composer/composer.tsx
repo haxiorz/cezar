@@ -33,6 +33,8 @@ import {
   fileToPendingAttachment,
   MAX_ATTACHMENTS,
   screenFiles,
+  toAttachmentInput,
+  type AttachmentsChangeReason,
   type PendingAttachment,
 } from './composer-attachments'
 import { applyCompletion, detectTrigger, type TriggerState } from './composer-text'
@@ -60,6 +62,17 @@ export interface ComposerProps {
    */
   value?: string
   onValueChange?: (text: string) => void
+  /**
+   * Controlled attachments (pass BOTH or neither) — the exact mirror of the text seam above, and
+   * it must stay that way: both hosts need the images to survive navigation with the text — the
+   * thread host since #939, `/new` since #1018, where swapping the project pill remounts the route
+   * and used to drop the pasted screenshot with the prompt. What `/new` still does NOT do is
+   * persist them: its store is per-project and in-memory, because multi-MB base64 has no business
+   * in localStorage. Every internal change — paste, drop, the paperclip, a thumbnail click, the
+   * optimistic clear, the on-error restore — flows through `onImagesChange`.
+   */
+  images?: PendingAttachment[]
+  onImagesChange?: (images: PendingAttachment[], reason: AttachmentsChangeReason) => void
   /** Focus the textarea on mount — the /new hero, where typing is the whole point of arriving. */
   autoFocus?: boolean
   /** Rendered in the footer bar after the paperclip — the /new picker pill row. */
@@ -122,6 +135,8 @@ export function Composer({
   onSubmit,
   value,
   onValueChange,
+  images: controlledImages,
+  onImagesChange,
   autoFocus = false,
   footerStart,
   footerEnd,
@@ -150,11 +165,30 @@ export function Composer({
     setInternalText(resolved)
     onValueChangeRef.current?.(resolved)
   }, [])
-  const [images, setImages] = useState<PendingAttachment[]>([])
+  // Optionally controlled, on the same terms as the text above: `controlledImages` (when given)
+  // shadows the internal state and every write is mirrored to both.
+  const [internalImages, setInternalImages] = useState<PendingAttachment[]>([])
+  const images = controlledImages ?? internalImages
   // Mirrors `images` for reads inside event handlers that must not run through a setState updater
-  // (StrictMode double-invokes those in dev — see addFiles / #double-paste).
+  // (StrictMode double-invokes those in dev — see addFiles / #double-paste). Updated INSIDE
+  // `setImages` as well as on render, so two async appends in one tick compose instead of the
+  // second clobbering the first — that is what the functional-setState form used to buy.
   const imagesRef = useRef(images)
   imagesRef.current = images
+  const onImagesChangeRef = useRef(onImagesChange)
+  onImagesChangeRef.current = onImagesChange
+  const setImages = useCallback(
+    (
+      next: PendingAttachment[] | ((current: PendingAttachment[]) => PendingAttachment[]),
+      reason: AttachmentsChangeReason = 'edit',
+    ) => {
+      const resolved = typeof next === 'function' ? next(imagesRef.current) : next
+      imagesRef.current = resolved
+      setInternalImages(resolved)
+      onImagesChangeRef.current?.(resolved, reason)
+    },
+    [],
+  )
   const [busy, setBusy] = useState(false)
   const [trigger, setTrigger] = useState<TriggerState | null>(null)
   const [menuValue, setMenuValue] = useState('')
@@ -163,6 +197,7 @@ export function Composer({
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const rootRef = useRef<HTMLDivElement>(null)
   const pendingCaretRef = useRef<number | null>(null)
+  const menuItemRefs = useRef<Map<string, HTMLElement>>(new Map())
 
   const skills = useSkills(autocompleteSkills && skillsWanted)
   // The `/` list orders most-used first (#519) and a pick bumps `skillUsage`, so this — the
@@ -262,6 +297,14 @@ export function Composer({
     el.focus()
   }
 
+  // cmdk's built-in scrollIntoView never fires here: the controlled value path
+  // writes to the store but doesn't schedule a scroll. useEffect (not
+  // useLayoutEffect) so the browser has painted and layout is settled.
+  useEffect(() => {
+    if (!menuOpen || activeValue == null) return
+    menuItemRefs.current.get(activeValue)?.scrollIntoView({ block: 'nearest' })
+  }, [activeValue, menuOpen])
+
   // Restore the caret after a completion replaced the token mid-draft.
   useLayoutEffect(() => {
     const caret = pendingCaretRef.current
@@ -284,7 +327,7 @@ export function Composer({
   // ---- attachments ---------------------------------------------------------------------------
 
   const addFiles = useCallback(
-    (files: readonly File[]) => {
+    (files: readonly File[], source: 'file' | 'clipboard' = 'file') => {
       if (disabled) return
       // Side effects (screening toasts + async encode) run OUTSIDE any setState updater: React
       // StrictMode double-invokes updater functions in dev, so screening here would encode and
@@ -293,7 +336,7 @@ export function Composer({
       const intake = screenFiles(files, imagesRef.current.length)
       for (const reason of intake.rejected) toast(reason, { tone: 'danger' })
       for (const file of intake.accepted) {
-        void fileToPendingAttachment(file).then((attachment) =>
+        void fileToPendingAttachment(file, source).then((attachment) =>
           setImages((prev) => (prev.length >= MAX_ATTACHMENTS ? prev : [...prev, attachment])),
         )
       }
@@ -311,7 +354,7 @@ export function Composer({
       .filter((file): file is File => file !== null)
     if (files.length === 0) return
     event.preventDefault()
-    addFiles(files)
+    addFiles(files, 'clipboard')
   }
 
   const onDrop = (event: DragEvent) => {
@@ -330,10 +373,7 @@ export function Composer({
       if (body === '' && messageImages.length === 0 && !allowEmptySubmit) return
       setBusy(true)
       try {
-        await onSubmit(
-          body,
-          messageImages.map(({ mediaType, data }) => ({ mediaType, data })),
-        )
+        await onSubmit(body, messageImages.map(toAttachmentInput))
       } catch (error) {
         toast(error instanceof Error ? error.message : String(error), { tone: 'danger' })
         if (restoreOnError) {
@@ -353,9 +393,10 @@ export function Composer({
     if (text.trim() === '' && images.length === 0 && !allowEmptySubmit) return
     const draftText = text
     const draftImages = images
-    // Optimistic clear — the reply feels instant; a rejection restores it above.
+    // Optimistic clear — the reply feels instant; a rejection restores it above. Tagged `submit`
+    // so a controlled host does not mistake it for the user emptying the composer by hand.
     setText('')
-    setImages([])
+    setImages([], 'submit')
     setTrigger(null)
     void send(draftText, draftImages, true)
   }, [allowEmptySubmit, images, send, text])
@@ -434,7 +475,7 @@ export function Composer({
     const merged = text.trim() === '' ? transcript : `${text.replace(/\s*$/, '')} ${transcript}`
     if (alsoSend) {
       setText('')
-      setImages([])
+      setImages([], 'submit')
       void send(merged, images, true)
       return
     }
@@ -612,6 +653,10 @@ export function Composer({
               candidates.map((candidate) => (
                 <CommandItem
                   key={candidate.value}
+                  ref={(el) => {
+                    if (el) menuItemRefs.current.set(candidate.value, el)
+                    else menuItemRefs.current.delete(candidate.value)
+                  }}
                   value={candidate.value}
                   data-slot="composer-menu-item"
                   data-emphasized={candidate.emphasized || undefined}

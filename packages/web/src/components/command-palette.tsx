@@ -1,7 +1,7 @@
 import { CheckIcon, FolderOpenIcon, LayersIcon, MoonIcon, PlusIcon } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate as useRouterNavigate } from 'react-router'
-import { useHealth, useProjects, useRuns, useRunsIndex, useSkills, useUiState } from '@/api/queries'
+import { useHealth, useProjects, useRunsForProject, useRunsIndex, useSkills, useUiState } from '@/api/queries'
 import { scopeTo, useActiveProjectId, useNavigate } from '@/lib/project-router'
 import type { ProjectListEntry, RunIndexEntry, RunRecord } from '@open-mercato/cezar-api-client'
 import { visibleNavItems } from '@/components/nav-items'
@@ -19,10 +19,12 @@ import {
 } from '@/components/ui/command'
 import { deriveAttention } from '@/lib/attention'
 import { shortAge } from '@/lib/format'
+import { orderProjects as orderRegistry } from '@/lib/project-order'
 import { isUnread } from '@/lib/read-state'
 import { orderSkillsByUsage } from '@/lib/skills'
 import { runTitle } from '@/lib/task-groups'
 import { useCommandShortcut, useKeyShortcut } from '@/lib/use-command-shortcut'
+import { useProjectOrder } from '@/lib/use-project-order'
 
 /**
  * The ⌘K command palette (spec, "Cross-cutting"): projects, tasks, views, actions, skills —
@@ -88,28 +90,25 @@ export function paletteScore(value: string, search: string, keywords?: string[])
 /**
  * One palette task row, whichever project it came from.
  *
- * `RunIndexEntry` with a nullable project: the active project's rows come from `useRuns()`, which
- * knows nothing about ids — and in an unscoped cockpit (the boot project's legacy mount) there is
- * no id to know. `null` therefore means "wherever we already are", which is exactly how the
- * scope-wrapping navigate reads an unprefixed target.
+ * `RunIndexEntry` with a nullable project: the active project's live rows are already standing
+ * in their project, and an unprefixed target keeps them there. `null` therefore means "wherever
+ * we already are", which is exactly how the scope-wrapping navigate reads it.
  */
 export type PaletteTask = Omit<RunIndexEntry, 'projectId'> & { projectId: string | null }
 
 /**
- * The runs `useRuns()` answered for, plus every other project's from the cross-project index.
+ * The live runs for one project, plus every other project's from the cross-project index.
  *
- * `runsProjectId` is WHICH PROJECT `activeRuns` belongs to, and it is not always the active one.
- * `useRuns()` follows the API scope, which is null both for the boot project (`routes.tsx` mounts
- * it unscoped) and on global settings (no scope route at all) — in either case it answers for the
- * BOOT project. Passing the URL's active id here instead would, on global settings, fail to match
- * the index's boot rows and list every boot task twice. The caller resolves it: active id, else
- * the registry's boot slug.
+ * `runsProjectId` is WHICH PROJECT `activeRuns` belongs to, and it is not always the active one:
+ * global settings and other global pages use the boot project's live list. Passing the URL's
+ * active id here instead would, on global settings, fail to match the index's boot rows and list
+ * every boot task twice. The caller resolves it: active id, else the registry's boot slug.
  *
  * Dedup is per RUN, not per project: an index row is dropped only when the live list already has
  * that exact task. The live row wins — it is the one the SSE stream patches, and preferring a
  * snapshot for the project you are looking at would make the palette lag the sidebar beside it.
  * Dropping the whole project instead would be smaller code and a worse failure mode: the moment
- * `runsProjectId` disagreed with what `useRuns()` actually returned, every task in that project
+ * `runsProjectId` disagreed with what the live list actually returned, every task in that project
  * would vanish from the palette rather than merely arrive a few seconds stale.
  *
  * Ordering is locality-first, like `orderProjects`: the active project's tasks (newest first),
@@ -177,22 +176,27 @@ export function partitionTasks(tasks: readonly PaletteTask[]): {
 }
 
 /**
- * Most-recently-opened first, then the ACTIVE project dropped to the end.
+ * The sidebar's order, then the ACTIVE project dropped to the end.
  *
- * The recency sort is the sidebar's, byte for byte (`project-groups.tsx`) — the palette must not
- * invent a third order for the same registry. The active project moves last because this group
- * exists to LEAVE the current project: selecting the one you are already in is the only row that
- * can do nothing, so it must never be the row an empty query pre-selects. It stays listed rather
- * than filtered out, so typing your own project's name is not a dead end.
+ * The order itself is not computed here: it is `lib/project-order.ts`, the same module the
+ * sidebar's groups use, so the user's hand-picked order (#952) reaches the palette and the
+ * palette cannot invent a second order for the same registry. Only the active-project rule is the
+ * palette's own — this group exists to LEAVE the current project, so selecting the one you are
+ * already in is the single row that can do nothing and must never be what an empty query
+ * pre-selects. It stays listed rather than filtered out, so typing your own project's name is not
+ * a dead end.
  */
 export function orderProjects(
   projects: readonly ProjectListEntry[],
   activeProjectId: string | null,
+  storedOrder: readonly string[] = [],
 ): ProjectListEntry[] {
-  return [...projects].sort((a, b) => {
-    const activeRank = Number(a.id === activeProjectId) - Number(b.id === activeProjectId)
-    return activeRank || b.lastOpenedAt.localeCompare(a.lastOpenedAt)
-  })
+  const ordered = orderRegistry(projects, storedOrder)
+  // A stable partition rather than a sort: the picked order must survive being split.
+  return [
+    ...ordered.filter((project) => project.id !== activeProjectId),
+    ...ordered.filter((project) => project.id === activeProjectId),
+  ]
 }
 
 export function CommandPalette() {
@@ -303,39 +307,44 @@ function PaletteContent({ close }: { close: () => void }) {
   const searching = search.trim() !== ''
   const activeProjectId = useActiveProjectId()
   const { theme, setTheme } = useTheme()
-  // Runs are already cached by the sidebar's quick-list; skills fetch here, on first open.
-  const runs = useRuns()
-  const skills = useSkills()
   // The registry is workspace-scoped (not project-scoped), so this is the ONE list the palette
   // can offer everywhere — including global settings, which has no active project at all. The
   // shell already holds this cache entry; opening the palette costs no extra request.
   const projects = useProjects()
-  // Skills list most-used → project → global (#519) — the same order every picker renders.
-  const uiState = useUiState()
   // Health is cached by the shell's chips; here it gates the forge-gated Views row (R6 1.1) —
   // the palette must not offer a GitHub view the sidebar honestly hides.
   const health = useHealth()
+  const registry = projects.data
+  const bootProjectId = registry?.bootProject ?? health.data?.bootProject ?? null
+  // Runs are already cached by the sidebar/shell. The palette also sits above the project route
+  // provider, so ask for the URL project explicitly rather than trusting the module scope.
+  const runs = useRunsForProject(activeProjectId, bootProjectId)
+  const skills = useSkills()
+  // Skills list most-used → project → global (#519) — the same order every picker renders.
+  const uiState = useUiState()
   const now = Date.now()
 
   // Same threshold as the sidebar's grouped nav (`app-shell-container.tsx`): with one registered
   // project there is nowhere to switch TO, and a one-row group would be pure noise.
-  const registry = projects.data
   const multiProject = registry !== undefined && registry.projects.length > 1
   // The cross-project index answers "which project is this task in", so it is only worth asking
   // when that question has more than one answer. A single-project cockpit issues no request.
   const runsIndex = useRunsIndex(multiProject)
 
+  // The sidebar's hand-picked order (#952), read from the same cached workspace ui-state the
+  // sidebar writes — so a project dragged to the top of the drawer is also the top of this list.
+  const { order: projectOrder } = useProjectOrder()
   const orderedProjects = React.useMemo(
-    () => (multiProject ? orderProjects(registry.projects, activeProjectId) : []),
-    [multiProject, registry, activeProjectId],
+    () => (multiProject ? orderProjects(registry.projects, activeProjectId, projectOrder) : []),
+    [multiProject, registry, activeProjectId, projectOrder],
   )
   const projectNames = React.useMemo(
     () => new Map((registry?.projects ?? []).map((project) => [project.id, project.name])),
     [registry],
   )
-  // Which project `useRuns()` just answered for — see `mergeTasks`. The active id when there is
+  // Which project the live run list answered for — see `mergeTasks`. The active id when there is
   // one, else the boot project, which is what an unscoped API client always reaches.
-  const runsProjectId = activeProjectId ?? registry?.bootProject ?? null
+  const runsProjectId = (activeProjectId === 'default' ? null : activeProjectId) ?? bootProjectId
   const tasks = React.useMemo(
     () => mergeTasks(runs.data ?? [], runsProjectId, runsIndex.data?.runs),
     [runs.data, runsProjectId, runsIndex.data],
@@ -446,6 +455,7 @@ function PaletteContent({ close }: { close: () => void }) {
             forge: health.data?.forge?.available === true,
             inbox: health.data?.capabilities.followups === true,
             automations: health.data?.capabilities.automations === true,
+            tracker: registry?.projects.find((project) => project.id === (activeProjectId ?? registry.bootProject))?.tracker,
           }).map((item) => {
             const Icon = item.icon
             return (

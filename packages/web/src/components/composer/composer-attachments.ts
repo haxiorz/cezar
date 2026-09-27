@@ -47,15 +47,40 @@ export function attachmentMediaType(file: File): string | null {
 
 /** A pending attachment: the wire shape, plus what the composer's row needs to show it. */
 export interface PendingAttachment extends AttachmentInput {
+  /** Server-minted id when this attachment is backed by the in-task draft store. */
+  id?: string
   /** Data-URL for the thumbnail — images only; a file has nothing to preview. */
   preview?: string
-  /** The user's own filename, shown on the chip. Never sent: the server names the file itself. */
+  /** What the chip shows. Always present, because a chip with no label is worse than a generic
+   *  one — so for an upload that carried no name of its own this is a FALLBACK (`pasted image`,
+   *  `pasted.md`), not something the user chose. Never sent; `originalName` is. */
   name: string
+  /** The name the upload itself carried, absent when it had none — a clipboard paste, typically.
+   *  This is the only one that goes on the wire (#929), because it is the only one the attachment
+   *  library should file a copy under: a library of `pasted.md`, `pasted-2.md`, `pasted-3.md` is
+   *  the numbered clutter the library exists to replace. The run folder names its own copy either
+   *  way. */
+  originalName?: string
   isImage: boolean
 }
 
+/** Distinguishes a user's removal from the composer's optimistic clear before submit. */
+export type AttachmentsChangeReason = 'edit' | 'submit'
+
+/**
+ * The chip label for an upload that carried no name of its own — `pasted image`, `pasted.md`.
+ *
+ * Exported because it is also the only way to tell, later, whether a name IS one: an attachment
+ * that comes back from the draft store (#939) is rebuilt from a stored label with no record of
+ * where that label came from, and a generated one must not be mistaken for a name the user chose
+ * and filed in the library under (`toAttachmentInput`). One function so the two cannot drift.
+ */
+export function fallbackAttachmentName(mediaType: string, isImage: boolean): string {
+  return isImage ? 'pasted image' : `pasted.${attachmentExtension(mediaType)}`
+}
+
 /** File → base64 (chunked — `String.fromCharCode(...5MB)` would blow the arg limit). */
-export async function fileToPendingAttachment(file: File): Promise<PendingAttachment> {
+export async function fileToPendingAttachment(file: File, source: 'file' | 'clipboard' = 'file'): Promise<PendingAttachment> {
   const bytes = new Uint8Array(await file.arrayBuffer())
   let binary = ''
   for (let i = 0; i < bytes.length; i += 0x8000) {
@@ -64,13 +89,28 @@ export async function fileToPendingAttachment(file: File): Promise<PendingAttach
   const data = btoa(binary)
   const mediaType = attachmentMediaType(file) ?? 'application/octet-stream'
   const isImage = isImageMediaType(mediaType)
+  // Clipboard image names may be synthesized by the browser (for example image.png).
+  const originalName = source === 'clipboard' && isImage ? undefined : file.name
   return {
     mediaType,
     data,
     ...(isImage ? { preview: `data:${mediaType};base64,${data}` } : {}),
-    name: file.name || (isImage ? 'pasted image' : `pasted.${attachmentExtension(mediaType)}`),
+    name: originalName || fallbackAttachmentName(mediaType, isImage),
+    ...(originalName ? { originalName } : {}),
     isImage,
   }
+}
+
+/**
+ * Strip a pending attachment down to what goes on the wire — the single place that decides it, so
+ * a second composer surface cannot start sending `preview` (a whole second copy of the bytes).
+ *
+ * Picked and dropped files carry their original filename, including images (#960).
+ * Clipboard images carry only a fallback display label, even when the browser supplied a
+ * filename. Sending that label would clutter the library with numbered pasted images.
+ */
+export function toAttachmentInput({ mediaType, data, originalName }: PendingAttachment): AttachmentInput {
+  return { mediaType, data, ...(originalName ? { name: originalName } : {}) }
 }
 
 export interface AttachmentIntake {

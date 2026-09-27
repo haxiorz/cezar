@@ -37,6 +37,7 @@ import { PinToggle } from '@/components/pin-toggle'
 import { TaskReferenceChip } from '@/components/reference-conflict-action'
 import { ReferenceStatusProvider } from '@/components/reference-status'
 import { StatusDot } from '@/components/status-dot'
+import { SubtaskToggle } from '@/components/subtask-toggle'
 import { Button } from '@/components/ui/button'
 import { toast } from '@/components/ui/toaster'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
@@ -53,6 +54,7 @@ import {
   type TaskColumnId,
 } from '@/lib/task-columns'
 import { listCounts, queuePositions, runTitle, sortRuns, type ListView } from '@/lib/task-groups'
+import { dispatchKindLabel, subtaskLabel, taskTreeRows } from '@/lib/task-tree'
 import {
   compareGroups,
   filterRuns,
@@ -123,9 +125,29 @@ export function TasksOverview({
   columnsPending?: boolean
 }) {
   const [query, setQuery] = React.useState('')
+  // The subtask accordion (#1110): ids of the parents whose dispatched rows are unfolded.
+  // Empty on arrival — collapsed is the default, and the chip on the parent row is the handle.
+  // Session-local on purpose: "collapsed by default" is the contract, so a fresh visit folds
+  // everything back.
+  const [expandedSubtasks, setExpandedSubtasks] = React.useState<ReadonlySet<string>>(new Set())
+  const toggleSubtasks = (id: string) =>
+    setExpandedSubtasks((current) => {
+      const next = new Set(current)
+      if (!next.delete(id)) next.add(id)
+      return next
+    })
   const all = runs ?? []
   const counts = listCounts(all)
   const visible = sortRuns(filterRuns(all, query), view)
+  // A live search overrides the fold wholesale: `filterRuns` keeps a child whose parent also
+  // matched NESTED under it, and a match the accordion then hid would read as a search miss.
+  const searching = query.trim() !== ''
+  // Dispatched children nest under the task that ordered them, in that task's own place in the
+  // sort above (spec `.ai/specs/2026-09-10-dispatch.md`). One derivation, both layouts: the table
+  // and the cards are the same rows at two widths, and a tree that disagreed between them would
+  // be two trees — which is also why the accordion state feeds the derivation here rather than
+  // either layout hiding rows on its own.
+  const rows = taskTreeRows(visible, (id) => searching || expandedSubtasks.has(id))
   // Positions come from the full list, never the filtered one: a search must not renumber the
   // queue the engine is actually going to drain.
   const positions = queuePositions(all)
@@ -238,11 +260,17 @@ export function TasksOverview({
                     </tr>
                   </thead>
                   <tbody className="[&>tr:last-child>td]:border-b-0">
-                    {visible.map((run) => (
+                    {rows.map((node) => (
                       <TableRow
-                        key={run.id}
-                        run={run}
-                        queuePosition={run.status === 'queued' ? (positions.get(run.id) ?? null) : null}
+                        key={node.run.id}
+                        run={node.run}
+                        depth={node.depth}
+                        childCount={node.childCount}
+                        subtasksExpanded={searching || expandedSubtasks.has(node.run.id)}
+                        onToggleSubtasks={toggleSubtasks}
+                        queuePosition={
+                          node.run.status === 'queued' ? (positions.get(node.run.id) ?? null) : null
+                        }
                         onRename={onRename}
                         onTogglePin={pinToggle}
                         now={now}
@@ -257,11 +285,17 @@ export function TasksOverview({
 
             {/* <md: the same runs as stacked cards. */}
             <div data-slot="task-cards" className="flex flex-col gap-2.5 md:hidden">
-              {visible.map((run) => (
+              {rows.map((node) => (
                 <TaskCard
-                  key={run.id}
-                  run={run}
-                  queuePosition={run.status === 'queued' ? (positions.get(run.id) ?? null) : null}
+                  key={node.run.id}
+                  run={node.run}
+                  depth={node.depth}
+                  childCount={node.childCount}
+                  subtasksExpanded={searching || expandedSubtasks.has(node.run.id)}
+                  onToggleSubtasks={toggleSubtasks}
+                  queuePosition={
+                    node.run.status === 'queued' ? (positions.get(node.run.id) ?? null) : null
+                  }
                   now={now}
                   showTokens={showTokens}
                   showCost={showCost}
@@ -508,6 +542,10 @@ const TD_BASE = 'h-11 border-b border-border px-2.5 whitespace-nowrap first:pl-4
  */
 function TableRow({
   run,
+  depth,
+  childCount,
+  subtasksExpanded,
+  onToggleSubtasks,
   queuePosition,
   onRename,
   onTogglePin,
@@ -516,6 +554,13 @@ function TableRow({
   expandedColumns,
 }: {
   run: RunRecord
+  /** Nesting level under the task that dispatched this one; 0 for a top-level row. */
+  depth: number
+  /** How many tasks THIS one dispatched — the row's "N subtasks" note. */
+  childCount: number
+  /** Whether this row's dispatched children are unfolded beneath it (#1110). */
+  subtasksExpanded: boolean
+  onToggleSubtasks: (id: string) => void
   queuePosition: number | null
   onRename: (id: string, title: string) => void
   onTogglePin?: (run: RunRecord, pinned: boolean) => void
@@ -534,6 +579,9 @@ function TableRow({
     <tr
       data-slot="task-table-row"
       data-run-id={run.id}
+      // The nesting is carried on the ROW, not only in the Task cell's padding: a test (and a
+      // stylesheet) should be able to ask how deep a row sits without parsing an indent.
+      data-depth={depth}
       onClick={(event) => {
         if ((event.target as Element).closest('a, button, input')) return
         navigate(to)
@@ -543,7 +591,12 @@ function TableRow({
       {columns.map((column) => {
         if (column.id === 'memory') return null
         if (column.id === 'cpu') {
-          return queuePosition !== null ? (
+          const cpuExpanded = isColumnExpanded('cpu', expandedColumns)
+          const memoryExpanded = isColumnExpanded('memory', expandedColumns)
+          // The queue note borrows the CPU/Mem pair, but only while there is room to borrow: the
+          // table is auto-layout, so `#N in queue` under `whitespace-nowrap` would push both folded
+          // columns back open (#821). Fold beats the note; one expanded column is enough to carry it.
+          return queuePosition !== null && (cpuExpanded || memoryExpanded) ? (
             <td
               key={column.id}
               data-slot="queue-note"
@@ -557,8 +610,8 @@ function TableRow({
             <UsageTds
               key={column.id}
               run={run}
-              cpuExpanded={isColumnExpanded('cpu', expandedColumns)}
-              memoryExpanded={isColumnExpanded('memory', expandedColumns)}
+              cpuExpanded={cpuExpanded}
+              memoryExpanded={memoryExpanded}
             />
           )
         }
@@ -568,6 +621,10 @@ function TableRow({
             column={column}
             expanded={isColumnExpanded(column.id, expandedColumns)}
             run={run}
+            depth={depth}
+            childCount={childCount}
+            subtasksExpanded={subtasksExpanded}
+            onToggleSubtasks={onToggleSubtasks}
             attention={attention}
             scheduled={scheduled}
             reference={reference}
@@ -587,6 +644,10 @@ function TaskTableCell({
   column,
   expanded,
   run,
+  depth,
+  childCount,
+  subtasksExpanded,
+  onToggleSubtasks,
   attention,
   scheduled,
   reference,
@@ -599,6 +660,10 @@ function TaskTableCell({
   column: TaskColumnDefinition
   expanded: boolean
   run: RunRecord
+  depth: number
+  childCount: number
+  subtasksExpanded: boolean
+  onToggleSubtasks: (id: string) => void
   attention: ReturnType<typeof deriveAttention>
   scheduled: ReturnType<typeof scheduledResume>
   reference: ReturnType<typeof taskReference>
@@ -625,7 +690,16 @@ function TaskTableCell({
     case 'task':
       return (
         <td data-column-id={column.id} className={cn(TD_BASE, 'min-w-[220px] max-w-0')}>
-          <TitleCell run={run} to={to} onRename={onRename} onTogglePin={onTogglePin} />
+          <TitleCell
+            run={run}
+            depth={depth}
+            childCount={childCount}
+            subtasksExpanded={subtasksExpanded}
+            onToggleSubtasks={onToggleSubtasks}
+            to={to}
+            onRename={onRename}
+            onTogglePin={onTogglePin}
+          />
         </td>
       )
     case 'workflow':
@@ -704,11 +778,19 @@ function FoldedTd({ column }: { column: TaskColumnId }) {
  */
 function TitleCell({
   run,
+  depth,
+  childCount,
+  subtasksExpanded,
+  onToggleSubtasks,
   to,
   onRename,
   onTogglePin,
 }: {
   run: RunRecord
+  depth: number
+  childCount: number
+  subtasksExpanded: boolean
+  onToggleSubtasks: (id: string) => void
   to: string
   onRename: (id: string, title: string) => void
   onTogglePin?: (run: RunRecord, pinned: boolean) => void
@@ -720,12 +802,33 @@ function TitleCell({
   const unread = isUnread(run)
   const readDone = isReadDoneItem(run)
 
+  const subtasks = subtaskLabel(childCount)
+  // The indent, as inline style rather than a class: depth is unbounded (a task may dispatch a
+  // task that dispatches a task), and Tailwind cannot generate a class per level. 14px a level is
+  // the sidebar's own nesting step, so the two lists read as one grammar.
+  const indent = depth > 0 ? { paddingLeft: `${depth * 14}px` } : undefined
+
   if (editor.editing) {
-    return <TitleEditInput editor={editor} className="text-[13px] font-medium" />
+    return (
+      <span className="flex min-w-0 items-center" style={indent}>
+        <TitleEditInput editor={editor} className="text-[13px] font-medium" />
+      </span>
+    )
   }
 
   return (
-    <span className="flex min-w-0 items-center gap-1.5">
+    <span className="flex min-w-0 items-center gap-1.5" style={indent}>
+      {/* The one mark that says this row was ORDERED by the row above it rather than by a
+          person. Padding alone reads as an accident at 13px; the tick reads as a branch. */}
+      {depth > 0 ? (
+        <span
+          aria-hidden="true"
+          data-slot="subtask-tick"
+          className="shrink-0 font-mono text-[11px] leading-none text-soft-foreground"
+        >
+          &#9492;
+        </span>
+      ) : null}
       <Link
         to={to}
         title={title}
@@ -736,6 +839,25 @@ function TitleCell({
       >
         {title}
       </Link>
+      {/* What a DISPATCHED row is for — `review` or `implement` — so a tester can tell a child
+          from a task a person typed without opening it. Null on every root. */}
+      {dispatchKindLabel(run) ? (
+        <span
+          data-slot="dispatch-kind"
+          className="shrink-0 rounded-full bg-muted px-1.5 py-px text-[10.5px] font-medium text-muted-foreground"
+        >
+          {dispatchKindLabel(run)}
+        </span>
+      ) : null}
+      {/* What this task dispatched, counted rather than listed — and, since #1110, the accordion
+          handle for the rows the count stands for: collapsed by default, this click unfolds them. */}
+      {subtasks ? (
+        <SubtaskToggle
+          label={subtasks}
+          expanded={subtasksExpanded}
+          onToggle={() => onToggleSubtasks(run.id)}
+        />
+      ) : null}
       {/* The unread marker — same trailing violet dot as the sidebar row. */}
       {unread ? (
         <StatusDot
@@ -820,6 +942,10 @@ function UsageTd({ column, cell }: { column: 'cpu' | 'memory'; cell: UsageCell }
 /** One run, one card — the `<md` framing of the same row. */
 function TaskCard({
   run,
+  depth,
+  childCount,
+  subtasksExpanded,
+  onToggleSubtasks,
   queuePosition,
   now,
   showTokens,
@@ -827,6 +953,12 @@ function TaskCard({
   onTogglePin,
 }: {
   run: RunRecord
+  /** Nesting level under the task that dispatched this one; 0 for a top-level card. */
+  depth: number
+  childCount: number
+  /** Whether this card's dispatched children are unfolded beneath it (#1110). */
+  subtasksExpanded: boolean
+  onToggleSubtasks: (id: string) => void
   queuePosition: number | null
   now: number
   showTokens: boolean
@@ -842,12 +974,18 @@ function TaskCard({
   const unread = isUnread(run)
   const readDone = isReadDoneItem(run)
   const cost = formatCost(run.costUsd)
+  const subtasks = subtaskLabel(childCount)
   const hasDirectionalUsage = run.inputTokens !== undefined || run.outputTokens !== undefined
 
   return (
     <div
       data-slot="task-card"
       data-run-id={run.id}
+      data-depth={depth}
+      // The card stack's nesting: the child card is inset from the left edge and keeps the whole
+      // card width it had, rather than being squeezed — at phone width a shrinking card would
+      // cost the title the room the indent was supposed to explain.
+      style={depth > 0 ? { marginLeft: `${depth * 14}px` } : undefined}
       onClick={(event) => {
         // `button` as well as `a` since the card grew the pin (#935): a control inside the card
         // owns its own click, exactly as the desktop row has always had it.
@@ -870,6 +1008,25 @@ function TaskCard({
         >
           {runTitle(run)}
         </Link>
+        {/* Same kind chip as the table's Task cell — what this dispatched card is for. */}
+        {dispatchKindLabel(run) ? (
+          <span
+            data-slot="dispatch-kind"
+            className="mt-px shrink-0 rounded-full bg-muted px-1.5 py-px text-[10.5px] font-medium text-muted-foreground"
+          >
+            {dispatchKindLabel(run)}
+          </span>
+        ) : null}
+        {/* Same handle as the table's Task cell (#1110) — the dispatched children are the cards
+            this unfolds below. The card's own click already steps around `a, button`. */}
+        {subtasks ? (
+          <SubtaskToggle
+            label={subtasks}
+            expanded={subtasksExpanded}
+            onToggle={() => onToggleSubtasks(run.id)}
+            className="mt-px"
+          />
+        ) : null}
         {/* The unread marker — trailing violet dot, as on the desktop row. */}
         {unread ? (
           <StatusDot

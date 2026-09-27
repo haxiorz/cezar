@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { gatedSkillsRepos } from './config.ts';
 import { getTeamSkillsCached } from './skills-remote.ts';
 import { readWorkspaceUiState } from './workspace/ui-state.ts';
+import { builtinSkills } from './automations/builtin-skill.ts';
 
 /**
  * A skill is a Markdown file with optional YAML-ish frontmatter (`name`,
@@ -21,7 +22,9 @@ export interface Skill {
   interactive?: true;
   body: string;
   path: string;
-  source: 'ai' | 'cezar' | 'agents' | 'global' | 'team' | 'bundled';
+  /** `builtin` is the one skill cezar ships itself (`create-cezar-automation`, spec
+   *  2026-09-13-automations-from-prompt) — listed last, and only while automations are reachable. */
+  source: 'ai' | 'cezar' | 'agents' | 'global' | 'team' | 'bundled' | 'builtin';
   /** Sibling skills a host must materialize on disk alongside this one
    *  (frontmatter `requires:` — the vendored-collection contract, spec
    *  2026-07-24-vendored-cez-skills). */
@@ -85,7 +88,9 @@ export function bundledSkillsDir(): string {
  * ("the user's repo is the source of truth"). Missing directories are fine —
  * an empty catalog is fully supported (steps fall back to their plain
  * prompt). Team skills come from the in-process cache; the first call starts
- * a background load so nothing here ever waits on the network.
+ * a background load so nothing here ever waits on the network. The built-in skill (the one
+ * cezar ships, `automations/builtin-skill.ts`) comes LAST, so every user-authored skill of the
+ * same name shadows it.
  *
  * Opt-out gate: skills from a *default* (vendor) skills repo — `open-mercato/skills`
  * for the zero-config majority, see `gatedSkillsRepos` — appear unless the user has
@@ -160,7 +165,7 @@ async function discoverSkillLayers(
     gatedRepos,
     readImportedSkills(uiState),
   );
-  return [...lists, teamSkills, bundledSkills];
+  return [...lists, teamSkills, bundledSkills, builtinSkills()];
 }
 
 /**
