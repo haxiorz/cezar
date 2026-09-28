@@ -24,3 +24,4 @@ export * from './dashboard-costs.ts';
 export * from './dashboard-overview.ts';
 export * from './host.ts';
 export * from './tracker.ts';
+export * from './self-update.ts';
