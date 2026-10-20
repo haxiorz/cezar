@@ -16,31 +16,37 @@ import {
   useRuns,
 } from '@/api/queries'
 import { useRunHistory, type RunHistoryState } from '@/api/run-history'
-import type { ApiRun } from '@open-mercato/cezar-api-client'
+import type { ApiRun, HarnessLedgerResponse, RunEvent } from '@open-mercato/cezar-api-client'
 import { CenteredState } from '@/components/centered-state'
-import { Composer } from '@/components/composer/composer'
+import { TaskLifecycleCard } from '@/components/worktree-lifecycle-operation'
 import { StatusDot } from '@/components/status-dot'
 import { Button } from '@/components/ui/button'
+import { toast } from '@/components/ui/toaster'
 import { useKeyboardInsetVar } from '@/lib/keyboard-inset'
+import { budgetStop, isAwaitingAnswer } from '@/lib/attention'
 import { isUnread } from '@/lib/read-state'
 import { taskIssueUrl, taskPrUrl } from '@/lib/tasks-table'
 import { cn, isHttpUrl } from '@/lib/utils'
 
 import { AutoResumeHint } from './auto-resume-hint'
+import { useFinishRun } from './use-finish-run'
+import { E2eSetupVerdict } from './e2e-setup-verdict'
 import { useDraft } from './thread-draft'
+import { useDiffComments } from './diff-comments'
+import { TaskComposer, TaskDock } from './task-composer'
 import { WorkingIndicator } from './thread-items'
-import { useDeliverPrompt } from './deliver-prompt'
 import { useContinueAction } from './follow-up-engine'
+import { useDeliverPrompt } from './deliver-prompt'
 import { AgentsDock } from './agents-dock'
 import { PlanDock, planCounts } from './plan-dock'
-import { collectSubagents, findSubagent, subagentChildren } from './subagent-dock'
+import { SkillsDock } from './skills-dock'
+import { collectSkills, collectSubagents, findSubagent, subagentChildren } from './subagent-dock'
 import { SubagentSheet } from './subagent-sheet'
 import { AcceptCelebration, ReviewPanel } from './review-panel'
 import { queuePosition } from './run-actions'
 import { RunHeader } from './run-header'
 import { AskCard } from './ask-card'
 import { useRunRecordReconcile } from './run-reconcile'
-import { useActiveProviderAvailability } from './active-provider'
 import { ThreadLoading } from './thread-loading'
 import { threadRenderMode } from './thread-scroll'
 import { JumpToLatestPill, useThreadScroll } from './thread-scroller'
@@ -63,7 +69,7 @@ import { HarnessRail } from '../task-harness/harness-rail'
 import { HarnessStatusBar, HarnessTimelineDialog } from '../task-harness/harness-status-bar'
 import { ReviewerModal } from '../task-harness/reviewer-modal'
 import { RUN_RAIL_GRID, runShellClass } from './run-shell'
-import { mergeHarnessLedger, orderStepsByLedger } from '../task-harness/harness-state'
+import { harnessPublishBlockedReason, mergeHarnessLedger, orderStepsByLedger } from '../task-harness/harness-state'
 
 /**
  * `/tasks/:id` — the Session tab (spec, "Task thread"): the run header (title/meta/tabs/
@@ -80,28 +86,15 @@ import { mergeHarnessLedger, orderStepsByLedger } from '../task-harness/harness-
 export function TaskThreadRoute() {
   const { id } = useParams<{ id: string }>()
   const run = useRun(id)
-  const harness = useRunHarness(id, Boolean(run.data?.harness))
   const history = useRunHistory(id)
-  const events = history.visibleEvents
-  const lastHarnessSeq = events.reduce(
-    (max, event) => (event.type.startsWith('harness.') ? Math.max(max, event.seq) : max),
-    0,
-  )
-  useEffect(() => {
-    if (lastHarnessSeq > 0 && harness.isError) void harness.refetch()
-  }, [lastHarnessSeq, harness.isError, harness.refetch])
   const runStatus = run.data?.status
   const thread = useMemo(
-    () => reduceThread(history.visibleEvents, { activeTurn: runStatus === 'running' }),
-    [history.visibleEvents, runStatus],
+    () => reduceThread(history.visibleEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner }),
+    [history.visibleEvents, runStatus, run.data?.runner],
   )
   const currentThread = useMemo(
-    () => reduceThread(history.currentEvents, { activeTurn: runStatus === 'running' }),
-    [history.currentEvents, runStatus],
-  )
-  const harnessLedger = useMemo(
-    () => mergeHarnessLedger(harness.data, events),
-    [harness.data, events],
+    () => reduceThread(history.currentEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner }),
+    [history.currentEvents, runStatus, run.data?.runner],
   )
 
   // Read receipt (#unread-done-items): opening a finished task's thread marks it read — the same
@@ -113,11 +106,18 @@ export function TaskThreadRoute() {
   // The one exception is "Mark unread" from this very thread (#775): clearing the receipt makes
   // `isUnread` true again, which without a guard this effect would immediately undo — the action
   // would look broken in exactly the place a user reaches for it. `suppressAutoRead` is that
-  // guard, and it holds the run id rather than a bare boolean so the reset is implicit: it only
-  // suppresses the run it was set for, and the FIRST render of a later visit (a fresh mount, or
-  // navigating to another task and back) starts from an empty ref and auto-reads normally. That
-  // is the email grammar this is modelled on — reopening the mail marks it read again.
+  // guard, and it holds the run id rather than a bare boolean: it only suppresses the run it was
+  // set for, for as long as that run stays on screen. Leaving it ends the visit — and that has to
+  // be cleared EXPLICITLY, because /tasks/A → /tasks/B → /tasks/A reuses this route element
+  // (React reconciles it, it does not remount), so a ref that only reset on mount survived the
+  // round trip and the task stayed unread however often it was reopened. That is the email
+  // grammar this is modelled on — reopening the mail marks it read again.
   const suppressAutoRead = useRef<string | undefined>(undefined)
+  // Declared BEFORE the receipt effect below on purpose: effects run in order, so arriving on a
+  // run clears another run's suppression before the receipt decides whether to fire.
+  useEffect(() => {
+    if (suppressAutoRead.current !== id) suppressAutoRead.current = undefined
+  }, [id])
   const suppressAutoReadFor = useCallback((runId: string) => {
     suppressAutoRead.current = runId
   }, [])
@@ -135,6 +135,9 @@ export function TaskThreadRoute() {
     // `isUnread` reads `archived` too, so it belongs here: un-archiving an open thread makes the
     // run unread again, and without this dep the effect would never fire to clear it.
     run.data?.archived,
+    // The route's id, not just the record's: coming back to a run whose cached record is
+    // unchanged must still re-run the receipt once the suppression above has been lifted.
+    id,
   ])
   // The two feeds can drift: a record update lost on the workspace stream leaves the thread
   // showing Working… over a "run finished" transcript. The transcript is live here, so it
@@ -174,7 +177,6 @@ export function TaskThreadRoute() {
       thread={thread}
       currentThread={currentThread}
       history={history}
-      harnessLedger={harnessLedger}
       onMarkedUnread={suppressAutoReadFor}
     />
   )
@@ -196,6 +198,27 @@ export function stepRowIndex(rows: readonly { key: string }[], stepId: string): 
   return rows.findIndex((row) => suffixed.test(row.key))
 }
 
+const NO_EVENTS: readonly RunEvent[] = []
+
+/** A harness run's durable ledger with its live `harness.*` events folded in (spec
+ *  2026-07-23-harness-orchestration). Off for every other run, and while `enabled` is false. */
+function useThreadHarnessLedger(
+  run: ApiRun,
+  events: readonly RunEvent[],
+  enabled: boolean,
+): HarnessLedgerResponse | undefined {
+  const harness = useRunHarness(run.id, enabled && Boolean(run.harness))
+  const lastHarnessSeq = events.reduce(
+    (max, event) => (event.type.startsWith('harness.') ? Math.max(max, event.seq) : max),
+    0,
+  )
+  const { isError, refetch } = harness
+  useEffect(() => {
+    if (lastHarnessSeq > 0 && isError) void refetch()
+  }, [lastHarnessSeq, isError, refetch])
+  return useMemo(() => mergeHarnessLedger(harness.data, events), [harness.data, events])
+}
+
 /** The loaded thread. The header owns its own data hooks (mutations, the runs list); the
  *  thread body stays presentational — tests drive it with reduced fixture states directly. */
 export function ThreadView({
@@ -203,24 +226,36 @@ export function ThreadView({
   thread,
   currentThread = thread,
   history,
-  harnessLedger,
+  harnessLedger: givenHarnessLedger,
   onMarkedUnread,
+  embedded = false,
 }: {
   run: ApiRun
   thread: ThreadState
   currentThread?: ThreadState
   history?: RunHistoryState
-  harnessLedger?: import('@open-mercato/cezar-api-client').HarnessLedgerResponse
+  /** Tests pass a fixture; otherwise the view reads the ledger itself, so the workspace's
+   *  embedded column gets the harness surfaces too. */
+  harnessLedger?: HarnessLedgerResponse
   /** Passed straight through to the header's "Mark unread" (#775) so the route can suppress its
    *  auto-mark-read effect. Optional: every test that drives this view with a fixture, and the
    *  header's other three tabs, have no such effect to suppress. */
   onMarkedUnread?: (runId: string) => void
+  /** A task-workspace column: the workspace draws the one run header above every column. */
+  embedded?: boolean
 }) {
-  const footer = threadFooter(run.status, run.error)
+  const footer = threadFooter(run.status, run.error, isAwaitingAnswer(run))
+  const ownHarnessLedger = useThreadHarnessLedger(
+    run,
+    history?.visibleEvents ?? NO_EVENTS,
+    givenHarnessLedger === undefined,
+  )
+  const harnessLedger = givenHarnessLedger ?? ownHarnessLedger
   const markedUnread = useCallback(() => onMarkedUnread?.(run.id), [onMarkedUnread, run.id])
   // The dock's data: the latest plan snapshot across turns (full replacement — an emptied
   // plan hides the dock and the header mirror alike).
   const plan = latestPlanEntries(currentThread)
+  const budget = budgetStop(run)
   const planTally = plan !== undefined && plan.length > 0 ? planCounts(plan) : undefined
   // The Agents dock's data: the current fan-out's sub-agents, or [] when there is none to
   // show (#474). Derived from the compact current-state turns — no new subscription.
@@ -241,6 +276,10 @@ export function ThreadView({
   const continueAction = useContinueAction(run)
   const hasContinuation = !sessionOpen && !queued && continueAction.available
   const continuable = hasContinuation && continueAction.canContinue
+  // The footer's one-click Continue rides the same delivery seam as the composer's (deliver-prompt):
+  // its record can be just as stale, and a `run is still active` refusal means the run is already
+  // live — refetch and drop it, never the false failure a raw `continueWith` toasted (77117b95).
+  const deliverPrompt = useDeliverPrompt(run, continueAction.continueWith, { surface: null })
   // A closed session can never settle its in-flight items — nothing in the reducer rewrites a
   // `running` item on `session.ended`, so an interrupted fan-out stays `running` in the
   // persisted stream forever. Without this, reopening it pulses `Agents · 0/1` above a dead
@@ -249,11 +288,16 @@ export function ThreadView({
   // Derived from `sessionOpen` rather than enumerated, so it cannot drift when a status is
   // added: anything that is neither live nor still queued is closed. `review` matters most —
   // it is where this pipeline's runs normally END, and `threadFooter` already calls it closed.
+  const lifecycleGate = !!run.worktreeLifecycle?.activeOperationId
   const runIsTerminal = !sessionOpen && run.status !== 'queued'
   const agents = useMemo(
     () => collectSubagents(currentThread.turns, runIsTerminal),
     [currentThread.turns, runIsTerminal],
   )
+  // The Skills dock's data (#1202): the skills governing the run. Separate from `agents` on
+  // purpose — a skill used to be collected as a sub-agent, which reported a fan-out that never
+  // happened. Not scoped to the latest turn: a skill's instructions keep governing the run.
+  const skills = useMemo(() => collectSkills(currentThread.turns), [currentThread.turns])
   // The drill-down's whole state: which agent is open. Ephemeral by design (spec Q2/Q5) —
   // sub-agents have no stable identity outside their run, so there is nothing to persist.
   const [openAgentId, setOpenAgentId] = useState<string | undefined>(undefined)
@@ -282,21 +326,10 @@ export function ThreadView({
     () => (openAgentId === undefined ? [] : subagentChildren(thread.turns, openAgentId)),
     [thread.turns, openAgentId],
   )
-  // One delivery path for both modes, because the record that picks between them can be stale:
-  // a 409 refetches it and, when the truth names the other endpoint, delivers there instead
-  // (deliver-prompt.ts). Without that, a lost record update meant every send bounced until the
-  // page was reloaded.
-  const deliverPrompt = useDeliverPrompt(run, continueAction)
   // The reply composer's unsent content (#939) — server-side, per run, restored on return.
   const draft = useDraft(run.id, 'composer')
-  const activeProvider = useActiveProviderAvailability(run)
-  // A queued send only amends the persisted prompt; it invokes no provider and therefore
-  // remains available even when provider discovery cannot authorize a live session. Once the
-  // session is open, mirror the server's active-backend gate as before.
-  const activeProviderBlocked = sessionOpen && !activeProvider.usable
-  const continuationProviderBlocked = hasContinuation && !continueAction.canContinue
-  const providerBlocked = activeProviderBlocked || continuationProviderBlocked
-  const providerReason = activeProviderBlocked ? activeProvider.reason : continueAction.reason
+  // Line comments left on the Changes tab — draft items that ride the next message (self-review).
+  const diffComments = useDiffComments(run.id)
 
   // The queued-run affordances (#472), passed only while the run is queued — so the bubbles
   // go read-only on the next `run` SSE frame once it starts. The bubbles await these promises
@@ -352,30 +385,7 @@ export function ThreadView({
     onJumpToLatest: history?.jumpToLatest,
     rowKeys: rows.map(({ key }) => key),
   })
-  const acceptedContested =
-    harnessLedger?.outcome.status === 'contested' &&
-    harnessLedger.outcome.acceptedAt !== undefined &&
-    harnessLedger.outcome.acceptedBy === 'user' &&
-    harnessLedger.outcome.acceptanceReason !== undefined &&
-    (harnessLedger.decisions ?? []).some(
-      (decision) =>
-        decision.kind === 'accept-contested' &&
-        decision.by === 'user' &&
-        decision.at === harnessLedger.outcome.acceptedAt &&
-        decision.detail === harnessLedger.outcome.acceptanceReason,
-    )
-  const harnessPublishBlocked =
-    !run.harness || !['review', 'done'].includes(run.status)
-      ? undefined
-      : !harnessLedger
-        ? 'Harness recovery snapshot is unavailable. Publishing stays blocked until it is restored.'
-        : harnessLedger.stage.status !== 'staged'
-          ? 'The harness has not produced a verified staged handoff.'
-          : harnessLedger.outcome.status === 'ready' || acceptedContested
-            ? undefined
-            : harnessLedger.outcome.status === 'contested'
-              ? 'Accept the unresolved harness risk in the Review tab before finishing or publishing.'
-              : `Harness outcome is ${harnessLedger.outcome.status}. Publishing requires a verified ready outcome.`
+  const harnessPublishBlocked = harnessPublishBlockedReason(run, harnessLedger)
   // The iOS keyboard lifts the dock via `--kb`; once it settles, a pinned reader re-pins
   // (research §7: re-run scrollToEnd after the viewport settles).
   useKeyboardInsetVar(scroll.restickIfStuck)
@@ -412,7 +422,7 @@ export function ThreadView({
 
   return (
     <div data-route="task-thread" data-run-id={run.id} className="flex min-h-full flex-col">
-      <RunHeader
+      {embedded ? null : <RunHeader
         run={run}
         planTally={planTally}
         publishBlockedReason={harnessPublishBlocked}
@@ -423,7 +433,7 @@ export function ThreadView({
         // continuation choice as the dock. One hook owns both renderings, so a header pick is
         // exactly what the next composer submission sends — no second, drifting engine state.
         continuationEngine={continuable ? continueAction.pills : undefined}
-      />
+      />}
       {/* ONE status line, and the timeline behind it (review 2026-07-27): the
           horizontal phase rail could not be read — 18 phases, 2620px wide, inside
           an 820px viewport, with the live phase always off-screen. */}
@@ -454,8 +464,11 @@ export function ThreadView({
             onOpenChange={setTimelineOpen}
           />
         ) : null}
-        <div className={harnessLedger ? RUN_RAIL_GRID : undefined}>
-          <div className="flex min-w-0 flex-col gap-2.5 md:gap-3.5">
+        {/* The transcript column beside the run rail. Without a ledger both wrappers are
+            `contents`, so an ordinary run keeps the single flex column it always had. */}
+        <div className={harnessLedger ? RUN_RAIL_GRID : 'contents'}>
+          <div className={harnessLedger ? 'flex min-w-0 flex-col gap-2.5 md:gap-3.5' : 'contents'}>
+            {run.worktreeLifecycle ? <TaskLifecycleCard worktreeId={run.worktreeLifecycle.worktreeId} operationId={run.worktreeLifecycle.activeOperationId} worktreePath={run.worktreePath} taskTitle={run.title ?? run.task} /> : null}
             {history ? (
               <HistoryBoundary
                 hasOlder={history.hasOlder}
@@ -491,9 +504,11 @@ export function ThreadView({
         {/* Live session heartbeat: while the engine owns the turn (`running`), a spinner tails
             the thread so quiet gaps between bursts don't read as "finished". `waiting` hands
             off to the dock's reply hint, `queued` to the placeholder above — so `running` only. */}
-        {run.status === 'running' ? (
+        {run.status === 'running' && !lifecycleGate ? (
           <WorkingIndicator since={liveTurnStart(run, currentThread)} lastActivityAt={currentThread.lastEventAt} />
         ) : null}
+
+        <E2eSetupVerdict run={run} />
 
         {/* Closed states read as the body's last line; the WAITING state lives in the dock
             (mockup `.paused-hint`), right above the composer it is asking the user to use. */}
@@ -506,7 +521,23 @@ export function ThreadView({
               footer.tone === 'danger' ? 'text-danger' : 'text-soft-foreground',
             )}
           >
-            {footer.label}
+            <FooterLabel
+              label={footer.label}
+              // A failure is always worth one click to retry, whatever its wording — unless it is
+              // already scheduled to resume itself (the AutoResumeHint says so in the dock).
+              offerContinue={footer.tone === 'danger' && !run.autoResumeAt}
+              // Offered whenever there is a session to reopen — not only once the provider check
+              // has passed: while it loads (or the provider is disconnected) the button is there,
+              // greyed, saying why, instead of the advice silently degrading to plain text.
+              onContinue={hasContinuation ? () => deliverPrompt('', []) : undefined}
+              blockedReason={
+                continuable
+                  ? undefined
+                  : continueAction.providerPending
+                    ? 'Checking the agent provider…'
+                    : (continueAction.reason ?? 'Connect an agent provider to continue.')
+              }
+            />
             {/* href protocol guard (#431): link only for http(s) URLs. */}
             {isHttpUrl(taskPrUrl(run)) ? (
               // The run shipped as a PR (review-gate Draft PR, or agent-opened), or worked on
@@ -539,8 +570,9 @@ export function ThreadView({
 
         {/* The review gate (spec 009): a finished run with changes parks here — nothing
             auto-merges. The panel exists exactly while the run rests at `review`. */}
-        {run.status === 'review' ? (
-          <ReviewPanel run={run} publishBlockedReason={harnessPublishBlocked} />
+        {/* Send back carries the drafted line comments, like the composer does. */}
+        {run.status === 'review' && !lifecycleGate ? (
+          <ReviewPanel run={run} diffComments={diffComments} publishBlockedReason={harnessPublishBlocked} />
         ) : null}
           </div>
 
@@ -580,124 +612,186 @@ export function ThreadView({
       {/* The dock region (mockup `.dock`): plan dock, paused hint, then the composer.
           `bottom: var(--kb)` is the iOS keyboard lift — 0 until the visualViewport watcher
           publishes an inset. */}
-      <div
-        data-slot="thread-dock"
-        className="sticky bottom-[var(--kb,0px)] z-10 bg-background px-3 pt-1 pb-2 max-md:border-t max-md:border-border md:px-6 md:pt-1.5 md:pb-4"
+      <TaskDock
+        // The jump pill floats over the thread, just above the dock, centered.
+        overlay={
+          scroll.pillVisible ? (
+            <div className="pointer-events-none absolute inset-x-0 -top-12 flex justify-center">
+              <JumpToLatestPill onJump={scroll.jumpToLatest} />
+            </div>
+          ) : null
+        }
       >
-        {/* The jump pill floats over the thread, just above the dock, centered. */}
-        {scroll.pillVisible ? (
-          <div className="pointer-events-none absolute inset-x-0 -top-12 flex justify-center">
-            <JumpToLatestPill onJump={scroll.jumpToLatest} />
+        {/* Agents above the plan: the fan-out is the more urgent "what is happening now",
+            and it is transient — the plan outlives it. Keyed by run id like the plan dock. */}
+        <AgentsDock key={`agents:${run.id}`} runId={run.id} agents={agents} onSelect={setOpenAgentId} />
+
+        {harnessLedger ? (
+          <div className="xl:hidden">
+            <HarnessModelsDock ledger={harnessLedger} />
           </div>
         ) : null}
-        <div
-          className={cn(
-            runShellClass(Boolean(harnessLedger)),
-            harnessLedger ? RUN_RAIL_GRID : 'flex flex-col gap-1.5 md:gap-2.5',
-          )}
-        >
-          <div className="flex min-w-0 flex-col gap-1.5 md:gap-2.5">
-          {/* Agents above the plan: the fan-out is the more urgent "what is happening now",
-              and it is transient — the plan outlives it. Keyed by run id like the plan dock. */}
-          <AgentsDock key={`agents:${run.id}`} runId={run.id} agents={agents} onSelect={setOpenAgentId} />
 
-          {harnessLedger ? (
-            <div className="xl:hidden">
-              <HarnessModelsDock ledger={harnessLedger} />
-            </div>
-          ) : null}
+        {/* Below the agents: a skill is standing context for the whole run, not the volatile
+            "what is happening now" the fan-out reports (#1202). */}
+        <SkillsDock skills={skills} />
 
-          {plan !== undefined && plan.length > 0 ? (
-            // Keyed by run id: the collapse default re-derives per task (see PlanDock). Settled
-            // on the same rule as the Agents dock: a closed session never advances the plan.
-            <PlanDock key={run.id} runId={run.id} entries={plan} settled={runIsTerminal} />
-          ) : null}
+        {plan !== undefined && plan.length > 0 ? (
+          // Keyed by run id: the collapse default re-derives per task (see PlanDock). Settled
+          // on the same rule as the Agents dock: a closed session never advances the plan.
+          <PlanDock key={run.id} runId={run.id} entries={plan} settled={runIsTerminal} />
+        ) : null}
 
-          {/* A usage-limit stop is the one `failed` state that is still going somewhere — the
-              dock says so before the composer offers a Continue nobody needs to press. */}
-          <AutoResumeHint run={run} />
+        {/* A usage-limit stop is the one `failed` state that is still going somewhere — the
+            dock says so before the composer offers a Continue nobody needs to press. */}
+        <AutoResumeHint run={run} />
 
-          {run.status === 'waiting' ? (
-            <div
-              data-slot="paused-hint"
-              className="flex items-center gap-2 px-1 text-xs text-muted-foreground"
-            >
-              <StatusDot tone="pending" pulse />
-              The agent is paused, waiting for your reply
-            </div>
-          ) : null}
-
-          {queued ? (
-            <div
-              data-slot="queued-hint"
-              className="flex items-center gap-2 px-1 text-xs text-muted-foreground"
-            >
-              <StatusDot tone="pending" />
-              Messages you add now are folded into the prompt before the run starts.
-            </div>
-          ) : null}
-
-          {run.harness && run.status === 'running' ? (
-            <div
-              data-slot="harness-message-hint"
-              className="flex items-center gap-2 px-1 text-xs text-muted-foreground"
-            >
-              <StatusDot tone="violet" pulse />
-              Messages are delivered to the active phase, or durably queued for the next phase boundary.
-            </div>
-          ) : null}
-
-          <Composer
-            // The draft store's first host (#939). The composer is controlled on BOTH seams here
-            // — text and attachments — so leaving the task mid-sentence and coming back restores
-            // the message exactly as it was left, screenshots included. `draft.submit` wraps the
-            // real send: the optimistic clear only becomes a cleared draft once the message has
-            // actually landed, and a rejection leaves the draft (and its blobs) intact.
-            value={draft.text}
-            onValueChange={draft.setText}
-            images={draft.images}
-            onImagesChange={draft.setImages}
-            // The send itself is `deliverPrompt`, not a branch on `continuable`: the record that
-            // would pick the endpoint can be stale, so the re-route on a 409 decides it from the
-            // truth instead. The two compose exactly as they read — the draft stays open until
-            // the message has actually landed, wherever it turned out to land.
-            onSubmit={(text, images) => draft.submit<unknown>(() => deliverPrompt(text, images))}
-            disabled={providerBlocked || (!sessionOpen && !queued && !continuable)}
-            // Only reachable now by a closed run with NO session to resume — which is exactly
-            // the one case where Continue is not on offer either. Left honest rather than
-            // rewritten: "closed" is all such a run can be told.
-            disabledReason={providerBlocked ? providerReason : 'Session closed — no session to resume.'}
-            // The engine pills ride the enabled footer, so the picked runner/model and the
-            // typed prompt reach `POST /continue` in one request.
-            footerEnd={
-              providerBlocked && !continueAction.providerPending ? (
-                <Link
-                  to="/settings/agents#providers"
-                  className="text-xs font-medium text-foreground underline underline-offset-4"
-                >
-                  Configure providers
-                </Link>
-              ) : continuable ? continueAction.pills : undefined
-            }
-            // Continuing with nothing typed is the legacy one-click Continue.
-            allowEmptySubmit={continuable}
-            sendAriaLabel={continuable ? 'Continue' : 'Send'}
-            placeholder={
-              queued ? 'Add to the prompt — sent when the run starts…'
-              : continuable ? 'Continue — add a prompt, or send to just reopen the session…'
-              : run.status === 'waiting' ? 'Reply — / for skills, @ for files…'
-              : run.harness && run.status === 'running'
-                ? 'Message the harness — queued safely between phases…'
-                : 'Message the agent — / for skills, @ for files…'
-            }
-            autocompleteSkills
-            quickReplies
-            getMentionCandidates={() => threadFilePaths(thread)}
-          />
+        {!lifecycleGate && budget ? (
+          <div
+            data-slot="budget-hint"
+            className="flex items-center gap-2 px-1 text-xs text-muted-foreground"
+          >
+            <StatusDot tone="pending" pulse />
+            Budget reached — spent ${budget.spent.toFixed(2)} of ${budget.ceiling.toFixed(2)}; send a message to continue.
+            {run.status === 'waiting' ? (
+              <>
+                <span aria-hidden="true">·</span>
+                <EndSessionButton runId={run.id} />
+              </>
+            ) : null}
           </div>
-        </div>
-      </div>
+        ) : !lifecycleGate && run.status === 'waiting' ? (
+          <div
+            data-slot="paused-hint"
+            className="flex items-center gap-2 px-1 text-xs text-muted-foreground"
+          >
+            <StatusDot tone="pending" pulse />
+            The agent is paused, waiting for your reply
+            {/* The other answer to "your turn": not replying at all. It sits beside the hint
+                because that is the moment the choice is made — reply below, or end it here. */}
+            <span aria-hidden="true">·</span>
+            <EndSessionButton runId={run.id} />
+          </div>
+        ) : null}
+
+        {queued ? (
+          <div
+            data-slot="queued-hint"
+            className="flex items-center gap-2 px-1 text-xs text-muted-foreground"
+          >
+            <StatusDot tone="pending" />
+            Messages you add now are folded into the prompt before the run starts.
+          </div>
+        ) : null}
+
+        {run.harness && run.status === 'running' ? (
+          <div
+            data-slot="harness-message-hint"
+            className="flex items-center gap-2 px-1 text-xs text-muted-foreground"
+          >
+            <StatusDot tone="violet" pulse />
+            Messages are delivered to the active phase, or durably queued for the next phase boundary.
+          </div>
+        ) : null}
+
+        {!lifecycleGate ? <TaskComposer
+          run={run}
+          draft={draft}
+          diffComments={diffComments}
+          continueAction={continueAction}
+          getMentionCandidates={() => threadFilePaths(thread)}
+        /> : <p className="px-1 text-xs text-muted-foreground">Resolve the worktree operation above before continuing this task.</p>}
+      </TaskDock>
     </div>
+  )
+}
+
+/** The server's own advice — "… — continue to resume it" — names an action, so where that
+ *  action is on offer the word IS the action: the same one-click Continue as an empty send. */
+const CONTINUE_ADVICE = /— continue to /i
+
+function FooterLabel({
+  label,
+  offerContinue = false,
+  onContinue,
+  blockedReason,
+}: {
+  label: string
+  /** Show Continue after the label even when it carries no "continue to" advice. */
+  offerContinue?: boolean
+  /** Absent when there is no session to reopen at all — the advice then stays plain text. */
+  onContinue?: () => Promise<unknown>
+  /** Why it cannot run yet (provider loading or disconnected): the button shows, disabled. */
+  blockedReason?: string
+}) {
+  const match = onContinue ? CONTINUE_ADVICE.exec(label) : null
+  if (!onContinue) return <span>{label}</span>
+  if (!match) {
+    if (!offerContinue) return <span>{label}</span>
+    return (
+      <span>
+        {label} <span aria-hidden="true">·</span>{' '}
+        <FooterContinueButton onContinue={onContinue} blockedReason={blockedReason} />
+      </span>
+    )
+  }
+  const before = label.slice(0, match.index)
+  const after = label.slice(match.index + match[0].length)
+  return (
+    <span>
+      {before}—{' '}
+      <FooterContinueButton onContinue={onContinue} blockedReason={blockedReason} /> to {after}
+    </span>
+  )
+}
+
+function FooterContinueButton({
+  onContinue,
+  blockedReason,
+}: {
+  onContinue: () => Promise<unknown>
+  blockedReason?: string
+}) {
+  const [pending, setPending] = useState(false)
+  return (
+    <button
+      type="button"
+      data-slot="footer-continue"
+      disabled={pending || blockedReason !== undefined}
+      title={blockedReason ?? 'Reopen the session and pick up where it stopped'}
+      onClick={() => {
+        setPending(true)
+        onContinue()
+          .catch((error: unknown) =>
+            toast(error instanceof Error ? error.message : String(error), { tone: 'danger' }),
+          )
+          .finally(() => setPending(false))
+      }}
+      // A text button in the message's own red: it is part of the sentence it completes, so it
+      // keeps that sentence's colour; the weight and underline are what mark it as the action.
+      className="rounded-sm font-semibold underline underline-offset-2 hover:brightness-125 focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none disabled:cursor-not-allowed disabled:no-underline disabled:opacity-60"
+    >
+      Continue
+    </button>
+  )
+}
+
+/** Ends a waiting session (`POST /finish`): the run completes as done, or parks at review when
+ *  the worktree holds changes. A text button, like the footer's Continue — part of the hint line
+ *  it answers, not a toolbar control. */
+function EndSessionButton({ runId }: { runId: string }) {
+  const finish = useFinishRun(runId)
+  return (
+    <button
+      type="button"
+      data-slot="end-session"
+      title="Close the session — the task finishes (or goes to review if it changed files)"
+      disabled={finish.isPending}
+      onClick={() => finish.mutate()}
+      className="rounded-sm font-medium text-foreground underline-offset-2 hover:underline focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none disabled:opacity-60"
+    >
+      End session
+    </button>
   )
 }
 

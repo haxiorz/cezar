@@ -258,12 +258,13 @@ describe('the real implementation still honours the contract', () => {
   });
 
   it('every session registers in liveSessions regardless of concurrency', () => {
-    expect(source).toMatch(/state\.liveSessions\.add\(session\)/);
+    expect(source).toMatch(/state\.liveSessions\.add\(started\)/);
     expect(source).toMatch(/state\.liveSessions\.delete\(session\)/);
   });
 
   it('a concurrent phase never claims the singular session slots', () => {
-    expect(source).toMatch(/if \(!concurrentPhase\) \{\s*\n\s*state\.session = session;/);
+    expect(source).toMatch(/if \(!concurrentPhase\) \{\s*\n\s*state\.session = resume \? resumeGuard\.track\(started\) : started;/);
+    expect(source).toMatch(/if \(!concurrentPhase\) \{\s*\n\s*state\.currentStepId = step\.id;\s*\n\s*state\.interrupt = \(\) => started\.interrupt\(\);/);
   });
 
   it('the phase turn-end handler targets its own session, never the shared slot', () => {

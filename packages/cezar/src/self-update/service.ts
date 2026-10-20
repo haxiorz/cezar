@@ -5,25 +5,35 @@
  * restart (re-exec, or exit for a supervisor to relaunch — see `restart.ts`).
  */
 
-import type { SelfUpdateJob, SelfUpdateStatus, UpdateChannel } from '@open-mercato/cezar-contract';
+import type { SelfUpdateDevelopment, SelfUpdateJob, SelfUpdateScheduled, SelfUpdateStatus, UpdateChannel } from '@open-mercato/cezar-contract';
 
 import { loadWorkspaceConfig, mergeWriteWorkspaceConfig } from '../workspace/config.ts';
+import type { WorkspaceSemaphore } from '../workspace/semaphore.ts';
 import { installFromLocal, installFromRegistry } from './installer.ts';
-import { activate, detectInstallKind, findInstalled, listInstalled, packageRootOf, type InstallKind } from './layout.ts';
+import { buildCheckout, discoverCheckouts } from './checkouts.ts';
+import { activate, detectInstallKind, findInstalled, linkCheckout, listInstalled, packageRootOf, type InstallKind } from './layout.ts';
+import { CEZAR_REPO, fetchOpenPulls, OpenPullsCache, type OpenPulls } from './pulls.ts';
 import { distTagFor, RegistryCache, type PackageDocument } from './registry.ts';
 import { classifyVersion, isNewer } from './semver.ts';
 
 const LOG_CAP = 200;
+/** How often a scheduled "update when idle" re-checks the workspace. */
+const IDLE_POLL_MS = 5_000;
 
 export interface SelfUpdateDeps {
   pkgName: string;
   version: string;
+  /** What the dialog shows as running (`0.15.2-dev` for a checkout); update checks keep `version`. */
+  displayVersion?: string;
   /** The running entry file (`process.argv[1]`). */
   entry: string;
   /** Exit-or-reexec policy; the service only decides WHEN. */
   restart: () => void;
-  /** Runs in flight across the workspace, for the dialog's warning. */
-  activeRuns?: () => number;
+  /** The workspace's run counters — in production the `WorkspaceSemaphore` itself, so the dialog
+   *  can never again read one project's store (#1524). Absent: nothing runs. */
+  runs?: Pick<WorkspaceSemaphore, 'activeRuns' | 'idle'>;
+  /** Test seam for the idle poll's interval. */
+  idlePollMs?: number;
   /** Hosted mode trims the absolute entry path off the wire (#431). */
   trimPaths?: () => boolean;
   supervised?: boolean;
@@ -32,6 +42,10 @@ export interface SelfUpdateDeps {
   readOnly?: boolean;
   env?: NodeJS.ProcessEnv;
   registry?: RegistryCache;
+  /** cezar's open pull requests, for the development channel. Defaults to GitHub. */
+  pulls?: () => Promise<OpenPulls>;
+  /** Builds an unbuilt or stale checkout before it is linked. Defaults to npm in the worktree. */
+  buildCheckout?: typeof buildCheckout;
 }
 
 export class SelfUpdateBusyError extends Error {
@@ -45,18 +59,28 @@ export class SelfUpdateService {
   private readonly registry: RegistryCache;
   private readonly env: NodeJS.ProcessEnv;
   private job: SelfUpdateJob | null = null;
+  private scheduled: SelfUpdateScheduled | null = null;
+  private idleTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly pulls: OpenPullsCache;
 
   constructor(private readonly deps: SelfUpdateDeps) {
     this.env = deps.env ?? process.env;
     this.installKind = detectInstallKind(deps.entry, this.env);
     this.registry = deps.registry ?? new RegistryCache(deps.pkgName);
+    this.pulls = new OpenPullsCache(deps.pulls ?? (() => fetchOpenPulls(CEZAR_REPO, { env: this.env })));
+  }
+
+  /** The raw running version — what update checks compare, never the shown `-dev` one. */
+  get runningVersion(): string {
+    return this.deps.version;
   }
 
   /** The configured channel: workspace config wins, then `CEZ_UPDATE_CHANNEL`, then stable. */
   async channel(): Promise<UpdateChannel> {
     const config = await loadWorkspaceConfig();
     if (config.updateChannel) return config.updateChannel;
-    return this.env.CEZ_UPDATE_CHANNEL === 'nightly' ? 'nightly' : 'stable';
+    const seed = this.env.CEZ_UPDATE_CHANNEL;
+    return seed === 'nightly' || seed === 'development' ? seed : 'stable';
   }
 
   async setChannel(channel: UpdateChannel): Promise<void> {
@@ -69,8 +93,10 @@ export class SelfUpdateService {
    *  `latestVersion` reports and the version chip pulses for. */
   async updateAvailable(refresh = false): Promise<string | null> {
     const doc = refresh ? await this.registry.refresh() : await this.registry.get();
-    if (!doc) return null;
-    const target = doc.distTags[distTagFor(await this.channel())];
+    const channel = await this.channel();
+    // Development runs whatever was picked by hand; nothing is ever "newer" than a worktree.
+    if (!doc || channel === 'development') return null;
+    const target = doc.distTags[distTagFor(channel)];
     return target && isNewer(target, this.deps.version) ? target : null;
   }
 
@@ -88,11 +114,11 @@ export class SelfUpdateService {
     const installedIds = new Set(installed.map((entry) => entry.id));
     const stable = doc?.distTags.latest ?? null;
     const nightly = doc?.distTags.nightly ?? null;
-    const target = channel === 'stable' ? stable : nightly;
+    const target = channel === 'stable' ? stable : channel === 'nightly' ? nightly : null;
     const { canSelfUpdate, reason } = this.capability();
     const trim = this.deps.trimPaths?.() ?? false;
     return {
-      version: this.deps.version,
+      version: this.deps.displayVersion ?? this.deps.version,
       installKind: this.installKind,
       entry: trim ? this.deps.entry.split(/[\\/]/).pop() ?? '' : this.deps.entry,
       canSelfUpdate,
@@ -108,6 +134,8 @@ export class SelfUpdateService {
         source: entry.source,
         installedAt: entry.installedAt,
         active: entry.active,
+        ...(entry.branch ? { branch: entry.branch } : {}),
+        ...(entry.checkout && !trim ? { checkout: entry.checkout } : {}),
       })),
       // Previews (`-pr123.`, `-develop.`) are noise in a picker meant for stable ↔ nightly
       // moves; the PoC lists stable releases and nightlies only.
@@ -121,7 +149,55 @@ export class SelfUpdateService {
           installed: installedIds.has(entry.version),
         })),
       job: this.job,
-      activeRuns: this.deps.activeRuns?.() ?? 0,
+      scheduled: this.scheduled,
+      activeRuns: this.deps.runs?.activeRuns() ?? 0,
+    };
+  }
+
+  /**
+   * What the development channel picks from: cezar's own worktrees and the open pull requests
+   * with a published preview build. Worktrees only on a local cockpit — linking a checkout runs
+   * whatever is in it, a local-machine gesture a hosted cockpit neither offers nor accepts (see
+   * `linkDiscovered`), and never worth a git call there.
+   */
+  async development(opts: { refresh?: boolean } = {}): Promise<SelfUpdateDevelopment> {
+    const trim = this.deps.trimPaths?.() ?? false;
+    const [checkouts, pulls, doc] = await Promise.all([
+      trim ? Promise.resolve([]) : discoverCheckouts(this.env).catch(() => []),
+      this.pulls.get(opts.refresh),
+      opts.refresh ? this.registry.refresh() : this.registry.get(),
+    ]);
+    const installedIds = new Set(listInstalled(this.env).map((entry) => entry.id));
+    const publishedAt = (version: string) => doc?.versions.find((entry) => entry.version === version)?.publishedAt ?? null;
+    const prByBranch = new Map(pulls.items.map((pull) => [pull.branch, pull.number]));
+    return {
+      checkouts: checkouts.map((checkout) => ({
+        id: checkout.id,
+        branch: checkout.branch,
+        version: checkout.version,
+        worktree: checkout.worktree,
+        built: checkout.built,
+        linked: checkout.linked,
+        commit: checkout.commit,
+        builtAt: checkout.builtAt,
+        stale: checkout.stale,
+        task: checkout.task,
+        pr: prByBranch.get(checkout.branch) ?? null,
+      })),
+      pulls: {
+        available: pulls.available,
+        ...(pulls.reason ? { reason: pulls.reason } : {}),
+        repo: CEZAR_REPO,
+        items: pulls.items.map((pull) => {
+          const version = doc?.distTags[`pr-${pull.number}`] ?? null;
+          return {
+            ...pull,
+            version,
+            publishedAt: version ? publishedAt(version) : null,
+            installed: version ? installedIds.has(version) : false,
+          };
+        }),
+      },
     };
   }
 
@@ -181,13 +257,16 @@ export class SelfUpdateService {
   }
 
   /**
-   * Install `target` (a registry version, or an already-installed id such as `0.11.1+local`),
-   * activate it and restart. Returns as soon as the job is started; progress is on `status()`.
+   * Install `target` (a registry version, an already-installed id such as `0.11.1+local`, or the
+   * id of a built cezar checkout `status()` lists — linked on the spot), activate it and restart.
+   * Returns as soon as the job is started; progress is on `status()`.
    */
   apply(target: string): SelfUpdateJob {
     if (this.job?.status === 'running' || this.job?.status === 'restarting') throw new SelfUpdateBusyError();
     const { canSelfUpdate, reason } = this.capability();
     if (!canSelfUpdate) throw new Error(reason ?? 'self-update is not available for this install');
+    // An explicit apply supersedes whatever was waiting for idle.
+    this.cancelScheduled();
     const job: SelfUpdateJob = { status: 'running', target, startedAt: new Date().toISOString(), finishedAt: null, log: [] };
     this.job = job;
     const log = (line: string) => {
@@ -197,8 +276,10 @@ export class SelfUpdateService {
     void (async () => {
       try {
         const installed = findInstalled(target, this.env);
-        const id = installed ? installed.id : (await installFromRegistry(target, { onLog: log, env: this.env })).id;
-        if (installed) log(`${id} is already installed`);
+        // A linked checkout goes through discovery too: it may need a rebuild before it runs.
+        const linked = !installed || installed.source === 'link' ? await this.linkDiscovered(target, log) : null;
+        const id = linked ?? installed?.id ?? (await installFromRegistry(target, { onLog: log, env: this.env })).id;
+        if (installed && !linked) log(`${id} is already installed`);
         activate(id, this.env);
         log(`activated ${id}`);
         job.status = 'restarting';
@@ -214,6 +295,61 @@ export class SelfUpdateService {
       }
     })();
     return job;
+  }
+
+  /**
+   * "Update when idle": apply `target` once no task is running or queued, so the user can close
+   * the dialog and keep working. Applies at once when the workspace is already idle; replaces an
+   * earlier schedule. The same refusals as `apply()` are raised up front.
+   */
+  scheduleWhenIdle(target: string): void {
+    if (this.job?.status === 'running' || this.job?.status === 'restarting') throw new SelfUpdateBusyError();
+    const { canSelfUpdate, reason } = this.capability();
+    if (!canSelfUpdate) throw new Error(reason ?? 'self-update is not available for this install');
+    this.scheduled = { target, requestedAt: new Date().toISOString() };
+    if (!this.idleTimer) {
+      this.idleTimer = setInterval(() => this.applyIfIdle(), this.deps.idlePollMs ?? IDLE_POLL_MS);
+      this.idleTimer.unref?.();
+    }
+    this.applyIfIdle();
+  }
+
+  cancelScheduled(): void {
+    this.scheduled = null;
+    if (this.idleTimer) clearInterval(this.idleTimer);
+    this.idleTimer = null;
+  }
+
+  private applyIfIdle(): void {
+    const scheduled = this.scheduled;
+    if (!scheduled) return;
+    if (this.deps.runs && !this.deps.runs.idle()) return;
+    try {
+      this.apply(scheduled.target);
+    } catch (error) {
+      // Nobody is watching a deferred apply — leave the refusal where the dialog shows a failure.
+      this.cancelScheduled();
+      const now = new Date().toISOString();
+      const message = error instanceof Error ? error.message : String(error);
+      this.job = { status: 'failed', target: scheduled.target, startedAt: now, finishedAt: now, log: [`failed: ${message}`], error: message };
+    }
+  }
+
+  /** A checkout `status()` offers under `target`: build it when it is unbuilt or older than its
+   *  last commit, link it and return its id. Null when no checkout answers to that id — the
+   *  target is then an installed entry or a registry version. A hosted cockpit never builds or
+   *  links here (`trimPaths`); at most it activates a link the host itself created, and only one
+   *  `forwardOnlyRefusal` lets through. */
+  private async linkDiscovered(target: string, log: (line: string) => void): Promise<string | null> {
+    if (this.deps.trimPaths?.()) return null;
+    const checkout = (await discoverCheckouts(this.env)).find((entry) => entry.id === target);
+    if (!checkout) return null;
+    if (!checkout.built || checkout.stale) {
+      log(`${checkout.built ? 'rebuilding' : 'building'} ${checkout.branch} first`);
+      await (this.deps.buildCheckout ?? buildCheckout)(checkout, log);
+    }
+    log(`linking ${checkout.packageRoot} (${checkout.branch})`);
+    return linkCheckout(checkout.packageRoot, checkout.branch, this.env, checkout.id).id;
   }
 
   /** `cezar install` from a checkout or the npx cache: pack the running package into the managed

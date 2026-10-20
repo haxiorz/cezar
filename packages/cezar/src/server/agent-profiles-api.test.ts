@@ -21,6 +21,15 @@ vi.mock('../core/claude-bin.ts', async (importOriginal) => ({
   resolveClaudeBin: () => process.env.CEZ_CLAUDE_BIN ?? 'claude',
 }));
 
+// Junie has no read-only auth-status command, so `ProviderAuthService` probes it through a real
+// ACP session instead of `runCommand`. Left unmocked, every status probe in this suite spawned a
+// real `junie` process — on a machine with Junie installed and logged in, that handshake is slow
+// enough to blow past `vi.waitFor`'s default timeout before the boot warm-up settles (#M3 review,
+// same bug as providers-api.test.ts / provider-auth-runtime.test.ts / provider-action-gating.test.ts).
+vi.mock('../core/junie-auth-probe.ts', () => ({
+  probeJunieAuthentication: vi.fn(async () => ({ connected: true })),
+}));
+
 /**
  * `/api/v1/workspace/agent-profiles` (spec 2026-07-29-agent-profiles): extra config dirs for a
  * second login of the same agent CLI.
@@ -94,7 +103,7 @@ describe('agent profiles API', () => {
       const body = await list();
       expect(body.editable).toBe(true);
       expect(body.profiles.every((p) => p.isDefault)).toBe(true);
-      expect(body.profiles.map((p) => p.provider)).toEqual(['claude', 'codex', 'opencode', 'pi']);
+      expect(body.profiles.map((p) => p.provider)).toEqual(['claude', 'codex', 'opencode', 'cursor', 'pi', 'junie', 'copilot']);
       expect(body.profiles.every((p) => p.id === 'default')).toBe(true);
     });
 
@@ -425,6 +434,27 @@ describe('agent profiles API', () => {
       const { status } = await select('default', 'claude', account.id);
       expect(status).toBe(200);
       expect((await loadAgentAccounts()).selections[project.root]).toEqual({ claude: account.id });
+    });
+
+    // Telemetry d81f8db7: booted into a non-empty registry, the repo is served under a fallback
+    // slug with no registry row — the scope resolver accepts it, so this route must too.
+    it('accepts the boot project\'s id when the boot repo is not in the registry', async () => {
+      const other = mkdtempSync(join(realpathSync(tmpdir()), 'cez-profiles-other-'));
+      try {
+        await registerProject(other);
+        const account = await create('work');
+        const { bootProject: bootId, projects } = await (await apiRequest(makeApp(), '/api/v1/projects')).json() as {
+          bootProject: string;
+          projects: { id: string }[];
+        };
+        expect(projects.map((p) => p.id)).not.toContain(bootId);
+
+        const { status } = await select(bootId, 'claude', account.id);
+        expect(status).toBe(200);
+        expect((await loadAgentAccounts()).selections).toEqual({ [realpathSync(repoRoot)]: { claude: account.id } });
+      } finally {
+        rmSync(other, { recursive: true, force: true });
+      }
     });
 
     it('404s an unknown project rather than storing an orphan row', async () => {

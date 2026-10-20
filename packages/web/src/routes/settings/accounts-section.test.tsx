@@ -1,6 +1,7 @@
 import { QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router'
+import type { ReactNode } from 'react'
+import { MemoryRouter, useNavigate } from 'react-router'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { queryKeys, workspaceQueryKeys } from '@/api/queries'
@@ -8,6 +9,7 @@ import { createQueryClient } from '@/api/query-client'
 import type { AgentProfile, AgentProfilesResponse } from '@open-mercato/cezar-api-client'
 import { Toaster, resetToasts } from '@/components/ui/toaster'
 import { AppRoutes } from '@/routes'
+import { ThemeProvider } from '@/components/theme-provider'
 
 /**
  * Global settings → Agent accounts (spec `.ai/specs/2026-07-29-agent-profiles.md`).
@@ -144,12 +146,26 @@ function serve(
       if (url === '/api/v1/projects' && method === 'GET') {
         return json({ projects: [], bootProject: 'boot', projectsDir: '~/cezar/projects' })
       }
+      if (String(input).startsWith('/api/v1/models?runner=')) {
+        const runner = String(input).includes('cursor') ? 'cursor' : 'codex'
+        return json({ runner, models: [], source: 'unavailable', stale: false })
+      }
       return new Promise<never>(() => {})
     }),
   )
 }
 
-function renderAccounts() {
+/** Navigates the mounted router to another `?agent=` — what back/forward does. */
+function AgentParamProbe() {
+  const navigate = useNavigate()
+  return (
+    <button type="button" onClick={() => navigate('/settings/global/accounts?agent=claude')}>
+      go claude
+    </button>
+  )
+}
+
+function renderAccounts(entry = '/settings/global/accounts', extra: ReactNode = null) {
   const client = createQueryClient()
   client.setDefaultOptions({ queries: { ...client.getDefaultOptions().queries, retry: false } })
   client.setQueryData(queryKeys.health, {
@@ -169,10 +185,13 @@ function renderAccounts() {
   })
   render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={['/settings/global/accounts']}>
-        <AppRoutes />
-        <Toaster />
-      </MemoryRouter>
+      <ThemeProvider>
+        <MemoryRouter initialEntries={[entry]}>
+          <AppRoutes />
+          {extra}
+          <Toaster />
+        </MemoryRouter>
+      </ThemeProvider>
     </QueryClientProvider>,
   )
 }
@@ -214,6 +233,38 @@ const openDetails = async (id: string) => {
 }
 
 describe('the agent accounts section', () => {
+  it('opens on the agent named by ?agent= — the Tools menu\'s "Set up" deep link', async () => {
+    serve({ editable: true, profileCapableProviders: ['claude', 'codex'], defaults: {}, selections: {}, profiles: DEFAULTS })
+    renderAccounts('/settings/global/accounts?agent=codex')
+    await waitFor(() =>
+      expect(document.querySelector('[data-slot="accounts-tabs"] [data-provider="codex"]')?.getAttribute('data-state')).toBe('active'),
+    )
+    expect(document.querySelector('[data-slot="accounts-tabs"] [data-provider="claude"]')?.getAttribute('data-state')).toBe('inactive')
+  })
+
+  it('an unknown or absent ?agent= opens the first tab, and a changed one switches the mounted pane', async () => {
+    const data: AgentProfilesResponse = { editable: true, profileCapableProviders: ['claude', 'codex'], defaults: {}, selections: {}, profiles: DEFAULTS }
+    const active = (provider: string) =>
+      document.querySelector(`[data-slot="accounts-tabs"] [data-provider="${provider}"]`)?.getAttribute('data-state')
+    serve(data)
+    renderAccounts('/settings/global/accounts?agent=bogus')
+    await waitFor(() => expect(active('claude')).toBe('active'))
+    cleanup()
+
+    serve(data)
+    renderAccounts('/settings/global/accounts')
+    await waitFor(() => expect(active('claude')).toBe('active'))
+    cleanup()
+
+    // Deep-link to codex, then (back/forward) to claude on the SAME mounted pane.
+    serve(data)
+    renderAccounts('/settings/global/accounts?agent=codex', <AgentParamProbe />)
+    await waitFor(() => expect(active('codex')).toBe('active'))
+    fireEvent.click(screen.getByRole('button', { name: 'go claude' }))
+    await waitFor(() => expect(active('claude')).toBe('active'))
+    expect(active('codex')).toBe('inactive')
+  })
+
   it('lists the discovered account with no edit controls at all', async () => {
     serve({ editable: true, profileCapableProviders: ['claude', 'codex'],
       defaults: {},
@@ -745,13 +796,13 @@ describe('the agent accounts section', () => {
     renderAccounts()
 
     await waitFor(() => expect(rows()).toHaveLength(1))
-    // OpenCode and pi get a tab too: it is where "is this agent installed?" is answered, and
-    // hiding the ones that cannot carry a second login would only move that question elsewhere.
+    // OpenCode, Cursor and pi get a tab too: it is where "is this agent installed?" is answered,
+    // and hiding the ones that cannot carry a second login would only move that question elsewhere.
     expect(
       [...document.querySelectorAll('[data-slot="accounts-tabs"] [data-provider]')].map((el) =>
         el.getAttribute('data-provider'),
       ),
-    ).toEqual(['claude', 'codex', 'opencode', 'pi'])
+    ).toEqual(['claude', 'codex', 'junie', 'opencode', 'cursor', 'pi', 'copilot'])
   })
 
   it('offers no Add on an agent that cannot carry a second account, and says why', async () => {

@@ -1,6 +1,7 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { trackChildExit } from './agent-runner.ts';
 import { buildChildEnv } from './agent-env.ts';
+import { disclaimedCommand } from './disclaim-spawn.ts';
 import { EOF_KILL_GRACE_MS, EOF_TERM_GRACE_MS, KILL_GRACE_MS } from './claude-cli-runner.ts';
 import {
   AGENT_PROCESS_DETACHED,
@@ -38,11 +39,9 @@ export function spawnCodexAppServer(
   configArgs: readonly string[] = [],
 ): ChildProcessWithoutNullStreams {
   try {
-    return nodeSpawn(bin, ['app-server', ...configArgs], {
-      cwd,
-      env: buildCodexAppServerEnv(extraEnv),
-      detached: AGENT_PROCESS_DETACHED,
-    });
+    const env = buildCodexAppServerEnv(extraEnv);
+    const [file, argv] = disclaimedCommand(bin, ['app-server', ...configArgs], env);
+    return nodeSpawn(file, argv, { cwd, env, detached: AGENT_PROCESS_DETACHED });
   } catch (error) {
     throw codexSpawnError(error, bin);
   }
@@ -54,7 +53,10 @@ export class CodexAppServerRpc {
   private readonly pending = new Map<number, PendingRequest>();
 
   constructor(readonly child: ChildProcessWithoutNullStreams) {
-    this.child.stdin.on('error', () => undefined);
+    // A write to a child that already exited reports EPIPE as an async 'error' event, not
+    // a throw, so the try/catch in `write` cannot see it. Unhandled, it crashes the host
+    // (or a test worker) mid-teardown. The read/exit path owns settlement.
+    child.stdin.on('error', () => {});
   }
 
   allocateId(): number {
@@ -79,10 +81,13 @@ export class CodexAppServerRpc {
   }
 
   dispatchResponse(message: CodexAppServerMessage): boolean {
-    if (typeof message.id !== 'number' || (message.result === undefined && message.error === undefined)) return false;
-    const pending = this.pending.get(message.id);
+    if (message.result === undefined && message.error === undefined) return false;
+    // JSON-RPC lets a server echo the id as a string; cezar only ever allocates integers.
+    const id = typeof message.id === 'string' && /^(0|[1-9]\d*)$/.test(message.id) ? Number(message.id) : message.id;
+    if (typeof id !== 'number' || !Number.isSafeInteger(id)) return false;
+    const pending = this.pending.get(id);
     if (!pending) return false;
-    this.pending.delete(message.id);
+    this.pending.delete(id);
     if (message.error) pending.reject(new Error(codexErrorText(message.error)));
     else pending.resolve((message.result as Record<string, unknown>) ?? {});
     return true;

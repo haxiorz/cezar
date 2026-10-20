@@ -10,27 +10,35 @@ import {
   IdCardIcon,
   PackageCheckIcon,
   KeyboardIcon,
-  NotebookPenIcon,
+  ListChecksIcon,
+  MessageSquareTextIcon,
   PaletteIcon,
+  KeyRoundIcon,
+  BlocksIcon,
   TicketIcon,
+  ShieldCheckIcon,
 } from 'lucide-react'
 import type { ComponentType, SVGProps } from 'react'
 
 import type { Capabilities } from '@open-mercato/cezar-api-client'
-import { CenteredState } from '@/components/centered-state'
 import { AccountsSection } from './accounts-section'
 import { AgentConfigSection } from './agent-config-section'
 import { AgentsSection } from './agents-section'
 import { AppearanceSection } from './appearance'
+import { InstructionsSection } from './instructions-section'
+import { KeyboardSection } from './keyboard-section'
 import { BookmarkletsSection } from './bookmarklets-section'
 import { HarnessSection } from './harness-section'
 import { NotificationsSection } from './notifications-section'
+import { PrivacySection } from './privacy-section'
 import { ProjectsSection } from './projects-section'
-import { PromptTemplatesSection } from './prompt-templates-section'
 import { ResourcesSection } from './resources-section'
 import { SkillsSection } from './skills-section'
+import { TasksSection } from './tasks-section'
 import { WorktreesSection } from './worktrees-section'
 import { TrackerSection } from './tracker-section'
+import { ProjectSecretsSection, WorkspaceSecretsSection } from './secrets-section'
+import { IntegrationsSection } from './integrations-section'
 
 /**
  * The Settings section registry (R6 Step 1.3, spec §"Settings"): the ONE place a section is
@@ -40,12 +48,12 @@ import { TrackerSection } from './tracker-section'
  * Since the multi-project split (step 3.5, spec §"Settings split") every entry also declares
  * its `scope`, and that single field decides everything downstream — which URL the section
  * lives at (`/p/<id>/settings/<id>` vs `/settings/global/<id>`), which nav lists it, and which
- * store it writes. The rule of thumb: does the setting describe THIS REPO (agents, worktrees,
- * bookmarklets, prompt templates) or the person/machine (appearance, notifications, host
+ * store it writes. The rule of thumb: does the setting describe THIS REPO (agents, instructions,
+ * tasks, worktrees, bookmarklets) or the person/machine (appearance, notifications, host
  * resources, the project registry)?
  *
- * `hidden` sections are declared but not routed and not listed: keyboard remains a later
- * phase; MCP now lives inside Agent config as a per-agent subsection.
+ * `hidden` sections are declared but not routed and not listed: MCP now lives inside Agent
+ * config as a per-agent subsection.
  */
 
 export type SettingsSectionId =
@@ -55,14 +63,19 @@ export type SettingsSectionId =
   | 'accounts'
   | 'agents'
   | 'agent-config'
+  | 'instructions'
+  | 'tasks'
   | 'resources'
   | 'worktrees'
   | 'projects'
   | 'notifications'
-  | 'prompt-templates'
   | 'keyboard'
   | 'skills'
   | 'tracker'
+  | 'secrets'
+  | 'integrations'
+  | 'workspace-secrets'
+  | 'privacy'
 
 /** Which settings area a section belongs to — and therefore which store it writes. */
 export type SettingsScope = 'project' | 'global'
@@ -80,21 +93,6 @@ export interface SettingsSection {
   hidden?: boolean
 }
 
-/** A registry entry whose real section arrives in a later Step — routable, honest about it. */
-function comingSoon(title: string, Icon: ComponentType<SVGProps<SVGSVGElement>>): ComponentType {
-  return function ComingSoonSection() {
-    return (
-      <CenteredState
-        icon={<Icon />}
-        tone="neutral"
-        title={title}
-        subtitle="This section arrives in a later phase of the redesign."
-        heading="h2"
-      />
-    )
-  }
-}
-
 export const SETTINGS_SECTIONS: SettingsSection[] = [
   // ---- project scope (`/p/<projectId>/settings/…`) — settings that describe THIS repo -------
   {
@@ -106,9 +104,25 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     scope: 'project',
   },
   {
+    id: 'secrets',
+    title: 'Secrets',
+    description: 'Encrypted values for this project’s check steps and cezar — never for agents.',
+    icon: KeyRoundIcon,
+    component: ProjectSecretsSection,
+    scope: 'project',
+  },
+  {
+    id: 'integrations',
+    title: 'External integrations',
+    description: 'Third-party tools cezar installs and wires into this project — test frameworks first.',
+    icon: BlocksIcon,
+    component: IntegrationsSection,
+    scope: 'project',
+  },
+  {
     id: 'agents',
     title: 'Agents',
-    description: 'Default runner, models and system prompt.',
+    description: 'Providers, default runner and models.',
     icon: BotIcon,
     component: AgentsSection,
     scope: 'project',
@@ -119,6 +133,22 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     description: 'Multi-model runs: profiles, model access, staged-only pipeline.',
     icon: NetworkIcon,
     component: HarnessSection,
+    scope: 'project',
+  },
+  {
+    id: 'instructions',
+    title: 'Instructions',
+    description: 'What you write for the models: system prompt, branch naming, prompt templates.',
+    icon: MessageSquareTextIcon,
+    component: InstructionsSection,
+    scope: 'project',
+  },
+  {
+    id: 'tasks',
+    title: 'Tasks',
+    description: 'Base branch, review before finishing, live titles.',
+    icon: ListChecksIcon,
+    component: TasksSection,
     scope: 'project',
   },
   {
@@ -145,14 +175,6 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     component: BookmarkletsSection,
     scope: 'project',
   },
-  {
-    id: 'prompt-templates',
-    title: 'Prompt templates',
-    description: 'Reusable snippets for follow-up instructions.',
-    icon: NotebookPenIcon,
-    component: PromptTemplatesSection,
-    scope: 'project',
-  },
   // ---- global scope (`/settings/global/…`) — the user and the machine, in mockup order -----
   {
     id: 'appearance',
@@ -168,6 +190,14 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     description: 'Browser notifications when an agent needs you.',
     icon: BellIcon,
     component: NotificationsSection,
+    scope: 'global',
+  },
+  {
+    id: 'keyboard',
+    title: 'Keyboard',
+    description: 'Shortcuts for task commands.',
+    icon: KeyboardIcon,
+    component: KeyboardSection,
     scope: 'global',
   },
   {
@@ -187,6 +217,14 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     scope: 'global',
   },
   {
+    id: 'workspace-secrets',
+    title: 'Secrets',
+    description: 'Encrypted values shared by every project on this machine — never for agents.',
+    icon: KeyRoundIcon,
+    component: WorkspaceSecretsSection,
+    scope: 'global',
+  },
+  {
     id: 'accounts',
     title: 'Agent accounts',
     description: 'Second logins, and the agent and models a project uses when it has chosen none.',
@@ -203,13 +241,12 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     scope: 'global',
   },
   {
-    id: 'keyboard',
-    title: 'Keyboard',
-    description: 'Shortcuts.',
-    icon: KeyboardIcon,
-    component: comingSoon('Keyboard', KeyboardIcon),
+    id: 'privacy',
+    title: 'Privacy',
+    description: 'Whether cezar shares usage data with its maintainers. Off unless you turn it on.',
+    icon: ShieldCheckIcon,
+    component: PrivacySection,
     scope: 'global',
-    hidden: true,
   },
 ]
 
@@ -218,15 +255,15 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
  * entirely, and so does everything belonging to the OTHER scope. The two areas are rendered by
  * the same shell, so this filter is the only thing keeping them apart.
  */
+/** What decides whether a section is listed: the health capabilities, plus the project's
+ *  `multiModel` config flag. `false` hides the Harness section (feature off); absent keeps it —
+ *  route registration happens above the project scope, where the config is unknowable, and the
+ *  section component itself explains the gate on a direct URL. */
+export type SectionVisibility = Partial<Pick<Capabilities, 'singleProject'>> & { multiModel?: boolean }
+
 export function visibleSettingsSections(
   scope: SettingsScope,
-  capabilities?: Partial<Pick<Capabilities, 'singleProject'>> & {
-    /** The per-project `multiModel` config flag. `false` hides the Harness section
-     *  (feature off); absent keeps it — route registration happens above the
-     *  project scope, where the config is unknowable, and the section component
-     *  itself explains the gate on a direct URL. */
-    multiModel?: boolean
-  },
+  capabilities?: SectionVisibility,
 ): SettingsSection[] {
   return SETTINGS_SECTIONS.filter(
     (section) =>
@@ -235,4 +272,15 @@ export function visibleSettingsSections(
       !(capabilities?.singleProject === true && section.id === 'projects') &&
       !(capabilities?.multiModel === false && section.id === 'harness'),
   )
+}
+
+/** Both areas at once — what the unified nav (spec 2026-10-13-unified-settings) renders: the
+ *  global sections as flat rows, the project sections under every project in the tree. */
+export function settingsSectionsByScope(
+  capabilities?: SectionVisibility,
+): Record<SettingsScope, SettingsSection[]> {
+  return {
+    global: visibleSettingsSections('global', capabilities),
+    project: visibleSettingsSections('project', capabilities),
+  }
 }

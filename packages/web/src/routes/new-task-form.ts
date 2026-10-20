@@ -14,7 +14,7 @@ import type {
   HarnessRoles,
   HarnessSkillProfile,
   HarnessStatusResponse,
-  AttachmentInput,
+  AttachmentEntry,
   DispatchIntent,
   ModelDiscoveryRunner,
   Runner,
@@ -59,8 +59,11 @@ export interface RunnerOption {
 export const RUNNERS: readonly RunnerOption[] = [
   { id: 'claude', label: 'claude', desc: 'Claude Code CLI' },
   { id: 'codex', label: 'codex', desc: 'OpenAI Codex (app-server)' },
+  { id: 'junie', label: 'junie', desc: 'JetBrains Junie CLI' },
   { id: 'opencode', label: 'opencode', desc: 'OpenCode (serve)' },
+  { id: 'cursor', label: 'cursor', desc: 'Cursor Agent CLI' },
   { id: 'pi', label: 'pi', desc: 'pi CLI (provider/model)' },
+  { id: 'copilot', label: 'copilot', desc: 'GitHub Copilot CLI (ACP)' },
 ]
 
 export interface ModelPreset {
@@ -72,12 +75,12 @@ export interface ModelPreset {
 /**
  * Static model presets per runner. `id: ''` is always "auto" — no model flag, the runner decides.
  *
- * For a runner that discovers (`MODEL_DISCOVERY_RUNNERS` — claude, codex, opencode) this list is
+ * For a runner that discovers (`MODEL_DISCOVERY_RUNNERS` — claude, codex, opencode, cursor) this list is
  * only the FALLBACK, used when the host catalog has nothing to offer; a live catalog replaces it.
  * Nothing dated may be listed for those — pinned ids (`claude-opus-4-8`, `gpt-5.1-codex`) are
  * exactly the drift discovery exists to end (#794 for OpenCode, #784 for Claude). Claude
  * therefore keeps only its tier aliases, which stay true across every rollout because the CLI
- * resolves them itself; Codex and OpenCode list `auto` alone. pi has no host catalog yet, so its
+ * resolves them itself; Codex, OpenCode and Cursor list `auto` alone. pi has no host catalog yet, so its
  * entries are the real picker contents rather than a fallback.
  */
 export const MODELS_BY_RUNNER: Record<Runner, readonly ModelPreset[]> = {
@@ -93,12 +96,25 @@ export const MODELS_BY_RUNNER: Record<Runner, readonly ModelPreset[]> = {
   opencode: [
     { id: '', label: 'auto', desc: 'Use your OpenCode default model' },
   ],
+  junie: [
+    { id: '', label: 'auto', desc: 'Use your Junie default model' },
+  ],
+  cursor: [
+    { id: '', label: 'auto', desc: 'Use your Cursor default model' },
+  ],
   // pi selects a model with the same `provider/model` convention as opencode.
   pi: [
     { id: '', label: 'auto', desc: 'Use your pi default model' },
     { id: 'anthropic/claude-opus-4-8', label: 'claude-opus-4.8', desc: 'via Anthropic' },
     { id: 'anthropic/claude-sonnet-5', label: 'claude-sonnet-5', desc: 'via Anthropic' },
     { id: 'openai/gpt-5.1', label: 'gpt-5.1', desc: 'via OpenAI' },
+  ],
+  // Copilot has no host catalog here (it stays out of `MODEL_DISCOVERY_RUNNERS`), and its own
+  // catalog is fetched from GitHub per account, so nothing dated can be listed truthfully. `auto`
+  // is Copilot's own documented value for "let Copilot pick" (`copilot --help`), and the field
+  // stays free text for anything the account is entitled to.
+  copilot: [
+    { id: '', label: 'auto', desc: 'Let Copilot pick the model' },
   ],
 }
 
@@ -191,11 +207,13 @@ const DISCOVERY_RUNNER_LABEL: Record<ModelDiscoveryRunner, string> = {
   claude: 'Claude',
   codex: 'Codex',
   opencode: 'OpenCode',
+  junie: 'Junie',
+  cursor: 'Cursor',
 }
 
 export function modelCatalogStatus(
   runner: Runner,
-  catalog: RunnerModelCatalogResponse | undefined,
+  catalog?: RunnerModelCatalogResponse,
   failed = false,
 ): string | undefined {
   if (!runnerDiscoversModels(runner)) return undefined
@@ -390,6 +408,13 @@ export interface HarnessModelOption extends HarnessModelRef {
   /** Recorded eval-gate evidence (spec 2026-08-06-eval-gated-model-routing), carried from
    *  `/harness/status`. Absent on runner options — only configured bindings are certified. */
   certification?: HarnessCertification
+}
+
+/** The runners a harness role can name (the contract's `harnessRunnerSchema`). */
+const HARNESS_RUNNERS = ['claude', 'codex', 'opencode'] as const satisfies readonly Runner[]
+
+export function isHarnessRunner(runner: Runner): runner is (typeof HARNESS_RUNNERS)[number] {
+  return (HARNESS_RUNNERS as readonly Runner[]).includes(runner)
 }
 
 const GATEWAY_PREFIXES: ReadonlySet<string> = new Set(['opencode', 'openrouter', 'zen'])
@@ -948,10 +973,14 @@ export function buildCreateRunBody(opts: {
    *  project's own selection, applying to `runner`. Absent/empty follows the project. */
   agentProfile?: string | null
   variants: number
-  images: readonly AttachmentInput[]
+  images: readonly AttachmentEntry[]
   /** false → run in the repo working tree, no worktree (single runs only). Sent only when
    *  explicitly off; the default (isolated worktree) stays implicit. */
   worktree?: boolean
+  /** With the worktree off: fork the checkout onto a new branch first, named `branch` when
+   *  given (spec 2026-10-19-repo-git-sync). Ignored with the worktree on or for variants. */
+  newBranch?: boolean
+  branch?: string
   /** true → autonomous run (never pauses for the user). Sent only when on. */
   autonomous?: boolean
   /** false → do not ask the agent for follow-up todos. Sent only when off. */
@@ -990,6 +1019,8 @@ export function buildCreateRunBody(opts: {
     variants,
     images,
     worktree,
+    newBranch,
+    branch,
     autonomous,
     generateFollowups,
     todoId,
@@ -998,6 +1029,7 @@ export function buildCreateRunBody(opts: {
     harnessBaseAcknowledgement,
     dispatch,
   } = opts
+  const inPlace = worktree === false && variants <= 1 && !dispatch
   return {
     task,
     ...(source?.source === 'skill'
@@ -1012,6 +1044,7 @@ export function buildCreateRunBody(opts: {
     images: images.length > 0 ? [...images] : undefined,
     // Off only matters for a single run — variants always isolate.
     worktree: worktree === false && variants <= 1 ? false : undefined,
+    ...(inPlace && newBranch ? { newBranch: true, ...(branch?.trim() ? { branch: branch.trim() } : {}) } : {}),
     autonomous: autonomous === true ? true : undefined,
     generateFollowups: generateFollowups === false ? false : undefined,
     todoId: todoId || undefined,
@@ -1035,7 +1068,8 @@ export function buildCreateRunBody(opts: {
 export function buildAutomationTask(
   opts: Parameters<typeof buildCreateRunBody>[0],
 ): Omit<CreateRunInput, 'task' | 'images' | 'todoId'> & { prompt: string } {
-  const { task, images: _images, todoId: _todoId, ...body } = buildCreateRunBody(opts)
+  // A reusable template has no per-launch branch: an automation always runs with its own policy.
+  const { task, images: _images, todoId: _todoId, newBranch: _nb, branch: _b, ...body } = buildCreateRunBody(opts)
   return { prompt: task, ...body }
 }
 

@@ -7,20 +7,32 @@ import { Button } from '@/components/ui/button'
 
 import type { RunTab } from '../task-thread/run-header'
 
+/** Every run tab that renders through these loading surfaces — the standalone harness pages
+ *  (`review`, `packets`) have their own. */
+type GitRunTab = Exclude<RunTab, 'session' | 'review' | 'packets'>
+
+const LOADING_TITLE: Record<GitRunTab, string> = {
+  changes: 'Loading changes…',
+  commits: 'Loading changes…',
+  files: 'Loading files…',
+  graph: 'Loading the graph…',
+  notes: 'Loading notes…',
+  terminal: 'Loading the terminal…',
+  preview: 'Loading the preview…',
+}
+
 /**
  * The Changes/Files tabs' loading + error surfaces, in their own module for the same reason
  * as thread-loading.tsx: they double as the routes' `Suspense` fallbacks (routes.tsx), and a
  * fallback must not import anything from the chunk it is standing in for.
  */
-type GitRunTab = Extract<RunTab, 'changes' | 'commits' | 'files'>
-
 export function GitTabLoading({ tab }: { tab: GitRunTab }) {
   return (
     <div data-route={`task-${tab}`} className="flex min-h-full flex-col">
       <CenteredState
         icon={<LoaderCircleIcon className="motion-safe:animate-spin" />}
         tone="neutral"
-        title={tab === 'changes' ? 'Loading changes…' : 'Loading files…'}
+        title={LOADING_TITLE[tab]}
         subtitle="Fetching the run record."
       />
     </div>

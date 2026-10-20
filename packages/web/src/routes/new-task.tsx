@@ -7,13 +7,13 @@ import {
   SquareIcon,
 } from 'lucide-react'
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { useParams, useSearchParams } from 'react-router'
+import { Link as GlobalLink, useParams, useSearchParams } from 'react-router'
 
 import { Link, useNavigate } from '@/lib/project-router'
 
-import { createRun, getLaunchKey, postPlan, putConfig, putUiState } from '@/api/client'
+import { createRun, getLaunchKey, putConfig, putUiState } from '@/api/client'
 import { useProjectScope } from '@/api/project-scope-context'
-import { hasAccountChoice, useAgentAccounts } from '@/api/agent-accounts'
+import { hasAccountChoice, useAgentAccounts, useSelectedAccountCheck } from '@/api/agent-accounts'
 import {
   queryKeys,
   useConfig,
@@ -32,7 +32,7 @@ import {
 } from '@/api/queries'
 import type {
   HarnessPreset,
-  AttachmentInput,
+  AttachmentEntry,
   DispatchIntent,
   ProjectListEntry,
   RepoResponse,
@@ -96,6 +96,7 @@ import {
   harnessRolesIssue,
   harnessSetupPrefill,
   harnessWorkflowName,
+  isHarnessRunner,
   modelFamilyOf,
   modelsForRunner,
   normalizeHarnessPresets,
@@ -110,8 +111,7 @@ import {
   type TaskSource,
 } from './new-task-form'
 import { parseNewTaskParams } from './new-task-params'
-import { buildPlannedRunBody, pendingPlanOf, type PendingPlan } from './new-task-plan'
-import { PlanReview } from './plan-review'
+import { trackMessageSent } from '@/lib/telemetry'
 
 /** Multi-model is opt-in and off by default. Keep its substantial picker and
  * dialog surface out of the New Task route's eager graph until the user opens
@@ -139,9 +139,6 @@ function HarnessPanelLoading() {
  * `/new` — the full-screen new-task hero (spec §"New task (full-screen, #386)"; visual
  * contract docs/mockups/new-task.html): centered composer card on the twinkle surface, the
  * picker pill row inside the card below the textarea, suggested-task ghost chips underneath.
- * In plan-first mode (#383, the `Start | Plan first` segment) submit runs `POST /api/plan`
- * and opens the review overlay (plan-review.tsx) instead of starting a run.
- *
  * This route also owns the saved-bookmarklet contract (spec 011, BACKWARD_COMPATIBILITY.md):
  * a full document load of `/new?skill=&ref=&auto=1&key=` auto-starts a run unattended when the
  * key matches `GET /api/launch-key`, and only prefills otherwise — `handleDeepLink()` in
@@ -320,6 +317,8 @@ export function NewTaskRoute() {
   )
     ? draft.agentProfile
     : null
+  // The account this task will actually run on — what the server's gate judges (ac53a6ef).
+  const accountCheck = useSelectedAccountCheck(displayRunner, agentProfile ?? repoAccount?.[displayRunner])
 
   // A cold /new load mounts the textarea disabled while provider status is checked. Restore
   // the route's autofocus contract once that check enables the form, but never steal focus if
@@ -344,10 +343,9 @@ export function NewTaskRoute() {
   const harnessStatusData = harnessStatus.data
   const [harnessBaseReason, setHarnessBaseReason] = useState('')
   const harnessOptions = useMemo<HarnessModelOption[]>(() => {
-    const runnerOptions: HarnessModelOption[] = runners.flatMap((r) => {
-      // Pi is a first-class ordinary runner, but the harness has no Pi probe/runtime binding
-      // yet. Do not advertise a lineup the conductor cannot execute.
-      if (r === 'pi') return []
+    // pi, Junie, Cursor and Copilot are first-class ordinary runners, but the harness has no
+    // probe/runtime binding for them yet. Do not advertise a lineup the conductor cannot execute.
+    const runnerOptions: HarnessModelOption[] = runners.filter(isHarnessRunner).flatMap((r) => {
       return modelsForRunner(
         r,
         r === 'codex' ? codexCatalogData : r === 'opencode' ? opencodeCatalogData : claudeCatalogData,
@@ -483,12 +481,9 @@ export function NewTaskRoute() {
   // Autonomous (#autonomous): the run never pauses for the user. An explicit toggle this session
   // wins; then an interactive skill recommends handing the ball back; otherwise the configured
   // workspace default applies ('source-dependent' → skills default ON, everything else OFF).
-  // Plan-first forces it OFF (and disables the toggle): planning is inherently interactive, so
-  // the run must be able to hand the ball back.
   const runMode = resolveComposerRunMode({
     hasGit,
     variants,
-    planFirst: draft.planFirst,
     explicitAutonomous: draft.autonomous,
     explicitWorktree: draft.worktree,
     interactive: selectedSkill?.interactive,
@@ -519,11 +514,6 @@ export function NewTaskRoute() {
   const generateFollowupsOn = followupsToggleShown
     ? (draft.generateFollowups ?? uiState.data?.lastGenerateFollowups ?? true)
     : false
-
-  // ---- plan mode (#383 + spec 008) ----------------------------------------------------------
-  const [plan, setPlan] = useState<PendingPlan | null>(null)
-  const [planning, setPlanning] = useState(false)
-  const [starting, setStarting] = useState(false)
 
   // ---- bookmarklet deep-link (spec 011 — legacy handleDeepLink, verbatim) -------------------
   // `auto=1` with a ref arms the unattended start; the composer stays hidden behind a
@@ -566,6 +556,17 @@ export function NewTaskRoute() {
       setAutoStarting(false)
       return
     }
+    // A saved bookmarklet has no runner choice of its own: it implicitly targets the
+    // project's configured default. `resolveRunner` deliberately falls back to another
+    // connected runner for the editable composer, but that fallback must not turn an
+    // unattended launch into a task on a different subscription (or hide an unauthorized
+    // default behind a successful-looking start). Leave the prompt in the composer so the
+    // user can explicitly choose what should run.
+    if (runner !== defaultRunner) {
+      setNotice({ kind: 'prefill' })
+      setAutoStarting(false)
+      return
+    }
     void (async () => {
       let launchKey = ''
       try {
@@ -576,6 +577,7 @@ export function NewTaskRoute() {
       if (launchKey !== '' && deepLink.key === launchKey) {
         try {
           const created = await createRun(bookmarkletRunBody(deepLink, runner, defaultRunner))
+          trackMessageSent('bookmarklet')
           clearStartedDraft(draftProjectId)
           void queryClient.invalidateQueries({ queryKey: queryKeys.runs.all })
           void navigate(startedRunPath(created))
@@ -613,12 +615,12 @@ export function NewTaskRoute() {
     // Legacy focused the Run button so a bare Enter submits the reviewed form.
     document
       .querySelector<HTMLButtonElement>(
-        '[data-slot="composer"] button[aria-label="Start task"], [data-slot="composer"] button[aria-label="Plan task"]',
+        '[data-slot="composer"] button[aria-label="Start task"]',
       )
       ?.focus()
   }, [notice, sourcesReady]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const submit = async (text: string, images: AttachmentInput[]) => {
+  const submit = async (text: string, submitted: AttachmentEntry[]) => {
     if (!providersReady || runner === null) {
       throw new Error(
         providers.isPending
@@ -627,6 +629,11 @@ export function NewTaskRoute() {
             ? 'Provider authentication could not be verified.'
             : 'Connect an agent provider before starting a task.',
       )
+    }
+    // The selected account belongs to the Task tab's runner; a multi-model lineup sends none.
+    if (composerMode !== 'multi' && accountCheck.blocked !== null) {
+      const blocked = await accountCheck.verify()
+      if (blocked !== null) throw new Error(blocked)
     }
     if (!sourcesReady) {
       // Rejection restores the draft — nothing typed is lost to a race with the pickers.
@@ -659,7 +666,7 @@ export function NewTaskRoute() {
           runner: 'claude',
           defaultRunner: health.data?.defaultRunner ?? 'claude',
           variants: 1,
-          images,
+          images: submitted,
           harnessRoles,
           harnessSkillProfile,
           harnessBaseAcknowledgement:
@@ -672,6 +679,7 @@ export function NewTaskRoute() {
               : undefined,
         }),
       )
+      trackMessageSent('new_task')
       void putUiState({
         lastTask: multiSource,
         recentSources: pushRecentSource(recentSources, multiSource),
@@ -681,20 +689,6 @@ export function NewTaskRoute() {
       clearStartedDraft(draftProjectId)
       void queryClient.invalidateQueries({ queryKey: queryKeys.runs.all })
       navigate(startedRunPath(created))
-      return
-    }
-    if (draft.planFirst) {
-      // Plan mode: submit means PLAN. A rejection propagates — the composer toasts and
-      // restores the draft; a success restores the text ourselves (the composer already
-      // cleared optimistically) so Discard hands back exactly what was typed. The review
-      // overlay is deliberate: it's where steps are edited and saved as a reusable chain.
-      setPlanning(true)
-      try {
-        setPlan(pendingPlanOf(text, images, await postPlan(text)))
-        update({ text })
-      } finally {
-        setPlanning(false)
-      }
       return
     }
     const created = await createRun(
@@ -708,8 +702,10 @@ export function NewTaskRoute() {
         agentProfile,
         defaultRunner,
         variants,
-        images,
+        images: submitted,
         worktree: worktreeOn,
+        newBranch: draft.newBranch,
+        branch: draft.branchName,
         autonomous: autonomousOn,
         generateFollowups: generateFollowupsOn,
         // #374: when the Inbox's "Run" sent us here, hand the entry's id back so the server
@@ -721,6 +717,7 @@ export function NewTaskRoute() {
         dispatch,
       }),
     )
+    trackMessageSent('new_task')
     // Remember what was actually run so the next visit preselects it (legacy
     // `saveLastTaskSource`) and float it to the top of the picker next time
     // (recency sort) — fire-and-forget: a failed write only costs the convenience.
@@ -748,45 +745,27 @@ export function NewTaskRoute() {
     navigate(startedRunPath(created))
   }
 
-  /** ▶ Start on the reviewed plan: the (possibly edited) steps go INLINE, with the composer's
-   *  current picker choices — legacy `startPlannedRun` semantics on the new surface. */
-  const startPlanned = async () => {
-    if (plan === null || plan.steps.length === 0 || starting || !providersReady || runner === null) return
-    setStarting(true)
-    try {
-      const created = await createRun(
-        buildPlannedRunBody({
-          task: plan.task,
-          steps: plan.steps,
-          model,
-          modelsLocked,
-          runner,
-          runnerExplicit: draft.runner !== null,
-          defaultRunner,
-          variants,
-          images: plan.images,
-          generateFollowups: generateFollowupsOn,
-          todoId: deepLink.todo, // #374: planning first must not lose the inbox entry
-          dispatch,
-        }),
-      )
-      // Run-mode choices live in the current draft; stable defaults come from workspace policy.
-      // persisting the forced `false` would overwrite their real preference, so turning
-      // CEZ_FOLLOWUPS back on later would silently come up off.
-      if (followupsToggleShown) {
-        void putUiState({ lastGenerateFollowups: generateFollowupsOn })
-          .then(() => queryClient.invalidateQueries({ queryKey: queryKeys.uiState }))
-          .catch(() => {})
-      }
-      clearStartedDraft(draftProjectId)
-      setPlan(null)
-      void queryClient.invalidateQueries({ queryKey: queryKeys.runs.all })
-      navigate(startedRunPath(created))
-    } catch (error) {
-      toast(error instanceof Error ? error.message : String(error), { tone: 'danger' })
-    } finally {
-      setStarting(false)
+  // An explicit `/p/<id>` target: the scoped navigate wrapper passes already scoped paths
+  // through untouched, so this is a genuine cross-project jump. Both composer surfaces use it.
+  const switchProject = (next: string) => {
+    // What is in the box comes along (#1018). Before the navigate, because the route remounts
+    // on the way in and reads the arriving project's draft the moment it does.
+    // `handOffComposition` decides whether the move happens — it refuses to overwrite an unsent
+    // draft already waiting over there.
+    const result = handOffComposition(draftProjectId, scopeKeyOf(next))
+    if (!result.moved && result.reason === 'destination-busy') {
+      // `draftProjectId` is the API scope key, so null means the boot project. Resolve both ends
+      // through the registry: the user needs to know where their composition remains as well as
+      // which destination was occupied.
+      const departingName =
+        projectList.find((project) => project.id === (draftProjectId ?? projects.data?.bootProject))?.name ??
+        urlProjectId
+      const destinationName = projectList.find((project) => project.id === next)?.name ?? next
+      toast(`Kept your draft in ${departingName}; ${destinationName} already has an unsent draft.`, {
+        tone: 'danger',
+      })
     }
+    navigate(`/p/${encodeURIComponent(next)}/new`, { replace: true })
   }
 
   // The unattended bookmarklet start in flight: no composer, no params echoed anywhere —
@@ -822,6 +801,9 @@ export function NewTaskRoute() {
           <h1 className="text-lg font-semibold tracking-tight max-md:text-base">
             What should the agent work on?
           </h1>
+          {/* Follows the resolved run mode (#793). Printing the isolation promise
+              unconditionally made this line false for every run the user opted out of — and
+              for a non-git folder, where there is no worktree to opt into. */}
           <p data-slot="run-mode-note" className="mt-1.5 text-[13.5px] text-muted-foreground max-md:text-xs">
             {composerMode === 'multi'
               ? 'Several models implement and review in one long staged run — you publish the result.'
@@ -830,6 +812,7 @@ export function NewTaskRoute() {
                   hasGit,
                   dispatch: dispatchOn,
                   autonomous: autonomousOn,
+                  newBranch: draft.newBranch,
                 })}
           </p>
         </header>
@@ -893,14 +876,8 @@ export function NewTaskRoute() {
               : 'Describe a task for the agent — / for skills…'
           }
           ariaLabel="Describe a task for the agent"
-          sendAriaLabel={
-            composerMode === 'multi' ? 'Start multi-model run' : draft.planFirst ? 'Plan task' : 'Start task'
-          }
-          // A harness precondition blocks SENDING, never typing (2026-07-27):
-          // it used to disable the whole box, which put the probe's error text
-          // where the prompt's instructions belong and wiped the ability to
-          // keep writing every time a model changed and the probe re-ran.
-          disabled={!providersReady || starting}
+          sendAriaLabel={composerMode === 'multi' ? 'Start multi-model run' : 'Start task'}
+          disabled={!providersReady}
           disabledReason={
             providers.isPending
               ? 'Checking agent providers…'
@@ -908,6 +885,10 @@ export function NewTaskRoute() {
                 ? 'Provider authentication could not be verified.'
                 : 'Connect an agent provider before starting a task.'
           }
+          // A harness precondition blocks SENDING, never typing (2026-07-27):
+          // it used to disable the whole box, which put the probe's error text
+          // where the prompt's instructions belong and wiped the ability to
+          // keep writing every time a model changed and the probe re-ran.
           sendBlockedReason={
             composerMode === 'multi'
               ? (harnessProbeBlock ??
@@ -921,11 +902,7 @@ export function NewTaskRoute() {
             composerMode === 'multi' ? (
               <>
                 {projectList.length > 1 && urlProjectId !== undefined ? (
-                  <ProjectPill
-                    projects={projectList}
-                    projectId={urlProjectId}
-                    onPick={(next) => navigate(`/p/${encodeURIComponent(next)}/new`, { replace: true })}
-                  />
+                  <ProjectPill projects={projectList} projectId={urlProjectId} onPick={switchProject} />
                 ) : null}
                 {repo.data ? <BaseBranchPill repo={repo.data} /> : null}
               </>
@@ -941,16 +918,7 @@ export function NewTaskRoute() {
                 <ProjectPill
                   projects={projectList}
                   projectId={urlProjectId}
-                  // An explicit `/p/<id>` target: the scoped navigate wrapper passes already
-                  // scoped paths through untouched, so this is a genuine cross-project jump.
-                  onPick={(next) => {
-                    // What is in the box comes along (#1018). Before the navigate, because the
-                    // route remounts on the way in and reads the arriving project's draft the
-                    // moment it does. `handOffComposition` decides whether the move happens —
-                    // it refuses to overwrite an unsent draft already waiting over there.
-                    handOffComposition(draftProjectId, scopeKeyOf(next))
-                    navigate(`/p/${encodeURIComponent(next)}/new`, { replace: true })
-                  }}
+                  onPick={switchProject}
                 />
               ) : null}
               <SourcePill
@@ -1031,9 +999,16 @@ export function NewTaskRoute() {
                   onChange={(on) => update({ worktree: on })}
                 />
               ) : null}
+              {worktreeToggleShown && !worktreeOn ? (
+                <NewBranchToggle
+                  on={draft.newBranch === true}
+                  name={draft.branchName ?? ''}
+                  onChange={(on) => update({ newBranch: on })}
+                  onNameChange={(branchName) => update({ branchName })}
+                />
+              ) : null}
               <AutonomousToggle
                 on={autonomousOn}
-                disabled={draft.planFirst}
                 onChange={(on) => update({ autonomous: on })}
               />
               {followupsToggleShown ? (
@@ -1057,10 +1032,10 @@ export function NewTaskRoute() {
                 onSettingsOpenChange={setDispatchSettingsOpen}
                 runners={runners}
                 parentRunner={displayRunner}
-                // The parent's runner gets the composer's live catalog (one fetch, shared);
-                // any other runner its static presets — a second discovery per runner for a
-                // setting this rarely touched is not worth the request.
-                modelsFor={(id) => (id === displayRunner ? models : modelsForRunner(id))}
+                // The composer's own catalog, already fetched for the runner this task runs as —
+                // the list "same as parent" resolves to. A subtask runner the user changes to
+                // discovers its own inside the toggle, which is the only place that knows it.
+                parentModels={models}
               />
               {repo.data?.info ? <PillDivider /> : null}
               {repo.data ? <BaseBranchPill repo={repo.data} /> : null}
@@ -1082,13 +1057,6 @@ export function NewTaskRoute() {
                   Configure providers
                 </Link>
               ) : null}
-              {composerMode !== 'multi' ? (
-                <ModeSegment
-                  planFirst={draft.planFirst}
-                  planning={planning}
-                  onModeChange={(planFirst) => update({ planFirst })}
-                />
-              ) : null}
               <kbd
                 aria-hidden="true"
                 className="rounded-[5px] border border-b-2 border-border bg-card px-[5px] py-px font-mono text-[10.5px] font-medium text-muted-foreground"
@@ -1098,6 +1066,23 @@ export function NewTaskRoute() {
             </>
           }
         />
+
+        {composerMode !== 'multi' && accountCheck.blocked !== null ? (
+          <p
+            data-slot="account-signed-out"
+            role="alert"
+            className="mt-2 rounded-md border border-destructive/30 bg-destructive/[0.07] px-3 py-1.5 text-xs text-muted-foreground"
+          >
+            {accountCheck.blocked}{' '}
+            {/* Global settings sit outside every project scope — react-router's own Link. */}
+            <GlobalLink
+              to="/settings/global/accounts"
+              className="font-medium text-foreground underline underline-offset-2"
+            >
+              Agent accounts
+            </GlobalLink>
+          </p>
+        ) : null}
 
         {composerMode !== 'multi' && dispatchOn && (dispatchSettingsOpen || dispatchHintFlash) ? (
           <p
@@ -1151,28 +1136,6 @@ export function NewTaskRoute() {
         ) : null}
       </div>
 
-      {plan !== null ? (
-        <PlanReview
-          plan={plan}
-          starting={starting}
-          startAvailable={providersReady}
-          startUnavailableReason={
-            providers.isPending
-              ? 'Checking agent providers…'
-              : providers.isError
-                ? 'Provider authentication could not be verified.'
-                : 'Connect an agent provider before starting a task.'
-          }
-          startUnavailableAction={
-            !providers.isPending ? (
-              <Link to="/settings/agents#providers">Configure providers</Link>
-            ) : undefined
-          }
-          onStepsChange={(steps) => setPlan((current) => (current ? { ...current, steps } : current))}
-          onStart={() => void startPlanned()}
-          onDiscard={() => setPlan(null)}
-        />
-      ) : null}
     </div>
   )
 }
@@ -1219,6 +1182,55 @@ function WorktreeToggle({
       )}
       Worktree
     </button>
+  )
+}
+
+/** In-place on a new branch (spec 2026-10-19-repo-git-sync): shown only with the worktree off.
+ *  Checked forks the checkout onto `name` (or a generated branch) from the base first. */
+function NewBranchToggle({
+  on,
+  name,
+  onChange,
+  onNameChange,
+}: {
+  on: boolean
+  name: string
+  onChange: (on: boolean) => void
+  onNameChange: (name: string) => void
+}) {
+  return (
+    <span className="flex items-center gap-1">
+      <button
+        type="button"
+        role="checkbox"
+        aria-checked={on}
+        data-slot="new-branch-toggle"
+        onClick={() => onChange(!on)}
+        title={
+          on
+            ? 'Switches the repo checkout to a new branch from the base before the agent starts'
+            : 'Runs on whatever branch is checked out — check to start a new branch from the base'
+        }
+        className={cn(chipClass, on && 'border-primary/60 text-foreground')}
+      >
+        {on ? (
+          <CheckIcon aria-hidden="true" className="size-3 shrink-0 text-primary" />
+        ) : (
+          <SquareIcon aria-hidden="true" className="size-3 shrink-0 text-soft-foreground" />
+        )}
+        New branch
+      </button>
+      {on ? (
+        <input
+          aria-label="New branch name"
+          data-slot="new-branch-name"
+          value={name}
+          placeholder="feat/… (auto)"
+          onChange={(event) => onNameChange(event.target.value)}
+          className="h-6 w-36 rounded-md border border-input bg-card px-2 font-mono text-[11px] outline-none focus-visible:border-ring"
+        />
+      ) : null}
+    </span>
   )
 }
 
@@ -1458,61 +1470,6 @@ function BaseBranchPill({ repo }: { repo: RepoResponse }) {
         ...repo.branches.map((branch) => ({ value: branch, label: branch })),
       ]}
     />
-  )
-}
-
-/** The `Start | Plan first` segment (#383): a real toggle with an UNMISTAKABLE selected state.
- *  "Start" selected keeps the quiet card fill; "Plan first" selected takes the mockup's
- *  contrast fill + focus ring (`.seg .plan-active`) — plan mode must never be ambient. The
- *  active plan segment doubles as the busy indicator while `POST /api/plan` is in flight. */
-function ModeSegment({
-  planFirst,
-  planning,
-  onModeChange,
-}: {
-  planFirst: boolean
-  planning: boolean
-  onModeChange: (planFirst: boolean) => void
-}) {
-  return (
-    <div
-      data-slot="mode-seg"
-      role="radiogroup"
-      aria-label="Run mode"
-      className="inline-flex items-center gap-0.5 rounded-lg bg-muted p-[3px]"
-    >
-      <button
-        type="button"
-        role="radio"
-        aria-checked={!planFirst}
-        onClick={() => onModeChange(false)}
-        className={cn(
-          'h-6 rounded-md px-2 text-xs transition-colors',
-          !planFirst
-            ? 'bg-card font-semibold text-foreground shadow-xs'
-            : 'font-medium text-muted-foreground hover:text-foreground',
-        )}
-      >
-        Start
-      </button>
-      <button
-        type="button"
-        role="radio"
-        aria-checked={planFirst}
-        aria-busy={planning || undefined}
-        data-slot="mode-plan"
-        onClick={() => onModeChange(true)}
-        className={cn(
-          'h-6 rounded-md px-2 text-xs transition-colors',
-          planFirst
-            ? 'bg-contrast font-semibold text-contrast-foreground ring-2 ring-ring/55'
-            : 'font-medium text-muted-foreground hover:text-foreground',
-          planning && 'animate-pulse',
-        )}
-      >
-        {planning ? 'Planning…' : 'Plan first'}
-      </button>
-    </div>
   )
 }
 

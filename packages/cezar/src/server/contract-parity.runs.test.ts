@@ -8,12 +8,14 @@ import type {
   cancelResponseSchema,
   continueResponseSchema,
   createPrResponseSchema,
+  adoptPrResponseSchema,
   createRunResponseSchema,
   deleteRunResponseSchema,
   editQueuedMessageResponseSchema,
   finishResponseSchema,
   gitCommitResponseSchema,
   gitPushResponseSchema,
+  gitStatusResponseSchema,
   messageResponseSchema,
   openInCliResponseSchema,
   removeQueuedMessageResponseSchema,
@@ -67,7 +69,9 @@ describe('src/contract/runs.ts matches the runs routes exactly', () => {
   type Commits200 = InferResponseType<Run['commits']['$get'], 200>;
   type GitCommit200 = InferResponseType<Run['git']['commit']['$post'], 200>;
   type GitPush200 = InferResponseType<Run['git']['push']['$post'], 200>;
+  type GitStatus200 = InferResponseType<Run['git']['status']['$get'], 200>;
   type CreatePr201 = InferResponseType<Run['pr']['$post'], 201>;
+  type AdoptPr200 = InferResponseType<Run['pr']['adopt']['$post'], 200>;
   type RemoveWorktree200 = InferResponseType<Run['remove-worktree']['$post'], 200>;
   type DeleteRun200 = InferResponseType<Run['$delete'], 200>;
 
@@ -99,6 +103,7 @@ describe('src/contract/runs.ts matches the runs routes exactly', () => {
     Assert<Exact<z.infer<typeof continueResponseSchema>, Continue200>>,
     Assert<Exact<z.infer<typeof deleteRunResponseSchema>, DeleteRun200>>,
     Assert<Exact<z.infer<typeof createPrResponseSchema>, CreatePr201>>,
+    Assert<Exact<z.infer<typeof adoptPrResponseSchema>, AdoptPr200>>,
     // the queued prompt stack (#472)
     Assert<Exact<z.infer<typeof messageResponseSchema>, Message200>>,
     Assert<Exact<z.infer<typeof editQueuedMessageResponseSchema>, QueuedPatch200>>,
@@ -108,6 +113,7 @@ describe('src/contract/runs.ts matches the runs routes exactly', () => {
     Assert<Exact<z.infer<typeof runCommitsResponseSchema>, Commits200>>,
     Assert<Exact<z.infer<typeof gitCommitResponseSchema>, GitCommit200>>,
     Assert<Exact<z.infer<typeof gitPushResponseSchema>, GitPush200>>,
+    Assert<Exact<z.infer<typeof gitStatusResponseSchema>, GitStatus200>>,
     Assert<Exact<z.infer<typeof removeWorktreeResponseSchema>, RemoveWorktree200>>,
   ];
 

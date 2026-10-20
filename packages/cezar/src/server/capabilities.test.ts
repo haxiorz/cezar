@@ -120,6 +120,19 @@ describe('isLoopbackHost (our own bind host)', () => {
   });
 });
 
+describe('resolveCapabilities — terminal (CEZ_TERMINAL)', () => {
+  it('follows localHandoff when unset: on locally, off when hosted', () => {
+    expect(resolveCapabilities({}, '127.0.0.1').terminal).toBe(true);
+    expect(resolveCapabilities({ CEZ_REMOTE: '1' }, undefined).terminal).toBe(false);
+    expect(resolveCapabilities({}, '0.0.0.0').terminal).toBe(false);
+  });
+
+  it('=1 opts a hosted cockpit in; =0 turns it off everywhere', () => {
+    expect(resolveCapabilities({ CEZ_REMOTE: '1', CEZ_TERMINAL: '1' }, '0.0.0.0').terminal).toBe(true);
+    expect(resolveCapabilities({ CEZ_TERMINAL: '0' }, '127.0.0.1').terminal).toBe(false);
+  });
+});
+
 describe('resolveCapabilities — localHandoff', () => {
   it('is on for a default local bind', () => {
     expect(resolveCapabilities({}, undefined).localHandoff).toBe(true);
@@ -135,6 +148,22 @@ describe('resolveCapabilities — localHandoff', () => {
 
   it('is off for a non-loopback bind host', () => {
     expect(resolveCapabilities({}, '0.0.0.0').localHandoff).toBe(false);
+  });
+});
+
+describe('resolveCapabilities — designMode (spec 2026-10-09-design-mode)', () => {
+  it('is on for a local cockpit by default', () => {
+    expect(resolveCapabilities({}, undefined).designMode).toBe(true);
+    expect(resolveCapabilities({}, '127.0.0.1').designMode).toBe(true);
+  });
+
+  it('is off with CEZ_DESIGN_MODE=0', () => {
+    expect(resolveCapabilities({ CEZ_DESIGN_MODE: '0' }, undefined).designMode).toBe(false);
+  });
+
+  it('is off on a hosted cockpit, even with CEZ_DESIGN_MODE=1 — a loopback mirror reaches nobody', () => {
+    expect(resolveCapabilities({ CEZ_REMOTE: '1', CEZ_DESIGN_MODE: '1' }, undefined).designMode).toBe(false);
+    expect(resolveCapabilities({ CEZ_DESIGN_MODE: '1' }, '0.0.0.0').designMode).toBe(false);
   });
 });
 
@@ -157,6 +186,8 @@ describe('resolveCapabilities — followups (#471)', () => {
   it('is independent of the deployment mode', () => {
     expect(resolveCapabilities({ CEZ_FOLLOWUPS: '1', CEZ_REMOTE: '1' }, '0.0.0.0')).toEqual({
       localHandoff: false,
+      terminal: false,
+      designMode: false,
       followups: true,
       singleProject: false,
       automations: true,

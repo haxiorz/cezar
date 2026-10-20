@@ -1,4 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { realpathSync } from 'node:fs';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import type {
   AgentEvent,
   AgentRunResult,
@@ -10,6 +12,7 @@ import type {
 import type { AgentSession, SessionOptions } from './agent-runner.ts';
 import { prependSystemPrompt, trackChildExit } from './agent-runner.ts';
 import { buildChildEnv } from './agent-env.ts';
+import { disclaimedCommand } from './disclaim-spawn.ts';
 import {
   AGENT_PROCESS_DETACHED,
   terminateAgentProcessTree,
@@ -30,6 +33,7 @@ import {
   type OpencodeUiMapperState,
   type OpencodeUiMapping,
 } from './opencode-ui-mapper.ts';
+import { opencodeConfigContent } from './private-mcp.ts';
 
 export interface OpencodeRunnerOptions {
   /** Override the binary name/path; defaults to `opencode` on PATH. */
@@ -38,7 +42,13 @@ export interface OpencodeRunnerOptions {
   timeoutMs?: number;
 }
 
-const SERVER_START_TIMEOUT_MS = 30_000;
+/** Startup fails after this long with no sign of life — re-armed by any output,
+ *  so a server busy with a one-time migration is not killed mid-way. */
+export const SERVER_START_TIMEOUT_MS = 30_000;
+/** Hard cap on startup however chatty the server is. */
+export const SERVER_START_MAX_MS = 180_000;
+/** How often the port cezar asked for is probed while waiting for the URL line. */
+export const SERVER_PROBE_INTERVAL_MS = 500;
 
 /** Grace between the teardown SIGTERM and the SIGKILL that follows it. */
 export const KILL_GRACE_MS = 4_000;
@@ -66,8 +76,9 @@ export const TURN_IDLE_GRACE_MS = 5_000;
  * /session` and does not read `spec.sessionId`; resuming a server-side session
  * id is not implemented.
  *
- * Auth = the host's opencode config/logins. The agent runs autonomously
- * (auto-approved permissions); OpenCode has no per-tool allowlist, so
+ * Auth = the host's opencode config/logins. The agent runs autonomously:
+ * nothing can answer a permission prompt, so the runner answers each one
+ * itself (`opencodePermissionReply`). OpenCode has no per-tool allowlist, so
  * `spec.allowedTools` is ignored. `spec.model` is `provider/model`.
  */
 export class OpencodeServerRunner implements AgentRunner {
@@ -129,6 +140,7 @@ class OpencodeSession implements AgentSession {
     this.emit({ type: 'text', text });
   });
   private readonly toolsSeen = new Set<string>();
+  private readonly permissionsAnswered = new Set<string>();
   /** messageID → role. Parts carry no role; only assistant parts are surfaced
    *  (the user's own message also streams as parts over the same SSE feed). */
   private readonly msgRole = new Map<string, string>();
@@ -169,14 +181,17 @@ class OpencodeSession implements AgentSession {
     private readonly onEvent: ((event: AgentEvent) => void) | undefined,
     private readonly opts: SessionOptions,
   ) {
-    // Random high port; the actual bound URL is read back from stdout.
+    // Random high port; the bound URL is read back from the server's output or a `/path` probe.
     const port = 40000 + Math.floor(Math.random() * 20000);
     try {
-      this.child = nodeSpawn(bin, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
-        cwd: spec.cwd,
-        env: buildChildEnv({ backend: 'opencode', extraEnv: spec.env }),
-        detached: AGENT_PROCESS_DETACHED,
-      });
+      const env = buildChildEnv({ backend: 'opencode', extraEnv: spec.env });
+      // Private MCP servers (spec 2026-10-07-private-project-mcp): OpenCode loads
+      // OPENCODE_CONFIG_CONTENT after the project config, so these are added and win on a clash.
+      if (spec.mcpServers?.length) {
+        env.OPENCODE_CONFIG_CONTENT = opencodeConfigContent(spec.mcpServers, env.OPENCODE_CONFIG_CONTENT);
+      }
+      const [file, argv] = disclaimedCommand(bin, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], env);
+      this.child = nodeSpawn(file, argv, { cwd: spec.cwd, env, detached: AGENT_PROCESS_DETACHED });
     } catch (err) {
       throw wrapSpawnError(err, bin);
     }
@@ -204,8 +219,8 @@ class OpencodeSession implements AgentSession {
     this.child.stderr.setEncoding('utf8');
     this.child.stderr.on('data', (chunk: string) => stderrChunks.push(chunk));
 
-    // The server prints its URL on stdout once listening.
-    const urlReady = this.waitForServerUrl(port);
+    // The server prints its URL once listening (stdout or stderr), or answers on the requested port.
+    const urlReady = this.waitForServerUrl(port, stderrChunks);
 
     const limitMs = spec.timeoutMs ?? timeoutMs;
     let deadline: NodeJS.Timeout | undefined;
@@ -347,34 +362,82 @@ class OpencodeSession implements AgentSession {
 
   // ---- server lifecycle ---------------------------------------------------
 
-  private waitForServerUrl(fallbackPort: number): Promise<string> {
+  /**
+   * Resolve the server's base URL from whichever comes first: the URL line on
+   * stdout or stderr, or the port cezar asked for answering `GET /path` with
+   * this run's own directory (#1179 made a missing line fatal; a slow or
+   * differently-worded start must not be). Fails only on exit, on
+   * `SERVER_START_TIMEOUT_MS` of silence, or at `SERVER_START_MAX_MS`.
+   */
+  private waitForServerUrl(port: number, stderrChunks: readonly string[]): Promise<string> {
     return new Promise((resolve, reject) => {
+      const probeUrl = `http://127.0.0.1:${port}`;
+      const ownDir = canonicalPath(this.spec.cwd ?? process.cwd());
+      const probeAbort = new AbortController();
       let buffer = '';
-      const timer = setTimeout(() => {
+      let settled = false;
+      const fail = (message: string) => {
+        if (settled) return;
         cleanup();
-        // Nothing parsed — try the port we asked for.
-        resolve(`http://127.0.0.1:${fallbackPort}`);
-      }, SERVER_START_TIMEOUT_MS);
-      timer.unref?.();
+        // Local transcript only: the stderr tail can name paths, so it stays
+        // out of the error message that telemetry groups on.
+        const tail = stderrChunks.join('').trim().slice(-800);
+        if (tail) this.emit({ type: 'note', message: `opencode serve stderr: ${tail}` });
+        reject(new Error(message));
+      };
+      const succeed = (url: string) => {
+        if (settled) return;
+        cleanup();
+        resolve(url);
+      };
+      // Fixed messages, never the elapsed time: each distinct string is its own telemetry group.
+      let heardOutput = false;
+      const stallFail = () =>
+        fail(
+          heardOutput
+            ? `opencode serve went silent for ${SERVER_START_TIMEOUT_MS / 1000}s without reporting a listening URL`
+            : `opencode serve did not report a listening URL within ${SERVER_START_TIMEOUT_MS / 1000}s`,
+        );
+      let stall = setTimeout(stallFail, SERVER_START_TIMEOUT_MS);
+      stall.unref?.();
+      const cap = setTimeout(
+        () => fail(`opencode serve did not report a listening URL within ${SERVER_START_MAX_MS / 1000}s`),
+        SERVER_START_MAX_MS,
+      );
+      cap.unref?.();
       const onData = (chunk: string) => {
-        buffer += chunk;
-        const m = /https?:\/\/[\d.]+:\d+/.exec(buffer);
-        if (m) {
-          cleanup();
-          resolve(m[0]);
-        }
+        heardOutput = true;
+        clearTimeout(stall);
+        stall = setTimeout(stallFail, SERVER_START_TIMEOUT_MS);
+        stall.unref?.();
+        buffer = (buffer + chunk).slice(-4096);
+        const m = SERVER_URL_RE.exec(buffer);
+        if (m) succeed(m[0].replace('//localhost:', '//127.0.0.1:'));
       };
-      const onExit = () => {
-        cleanup();
-        reject(new Error('opencode serve exited before it started listening'));
-      };
+      const probe = setInterval(() => {
+        void opencodeRequest(`${probeUrl}/path`, { method: 'GET', signal: AbortSignal.any([probeAbort.signal, AbortSignal.timeout(2_000)]) })
+          .then((res) => {
+            if (res.status !== 200) return;
+            const dir = stringField(parseRecord(res.body), 'directory');
+            if (dir && canonicalPath(dir) === ownDir) succeed(probeUrl);
+          })
+          .catch(() => undefined);
+      }, SERVER_PROBE_INTERVAL_MS);
+      probe.unref?.();
+      const onExit = () => fail('opencode serve exited before it started listening');
       const cleanup = () => {
-        clearTimeout(timer);
+        settled = true;
+        clearTimeout(stall);
+        clearTimeout(cap);
+        clearInterval(probe);
+        probeAbort.abort();
         this.child.stdout.off('data', onData);
+        this.child.stderr.off('data', onData);
         this.child.off('exit', onExit);
       };
       this.child.stdout.setEncoding('utf8');
       this.child.stdout.on('data', onData);
+      this.child.stderr.on('data', onData);
       this.child.once('exit', onExit);
     });
   }
@@ -570,11 +633,37 @@ class OpencodeSession implements AgentSession {
     } else if (type === 'message.part.updated' || type === 'message.part.created') {
       this.handlePart((props.part as Record<string, unknown>) ?? props);
       this.armTurnGrace();
+    } else if (type === 'permission.asked' || type === 'permission.updated') {
+      void this.answerPermission(props);
     } else if (type === 'session.idle') {
       // The turn boundary (#897). A subtask session going idle closes only its
       // own scope, exactly as the v2 mapper reads it.
       const sid = stringField(props, 'sessionID');
       if (sid === undefined || sid === this.sessionId) this.finishTurn(true);
+    }
+  }
+
+  /** An unanswered prompt parks `opencode serve` forever — c3d30076 sat 21 h on
+   *  `external_directory` for its own handoff file. Every prompt gets a reply. */
+  private async answerPermission(props: Record<string, unknown>): Promise<void> {
+    const id = stringField(props, 'id');
+    if (!id || this.permissionsAnswered.has(id)) return;
+    this.permissionsAnswered.add(id);
+    const reply = opencodePermissionReply(props, this.spec.env);
+    if (reply === 'reject') {
+      const what = stringField(props, 'permission') ?? stringField(props, 'type') ?? 'unknown';
+      const path = isRecord(props.metadata) ? stringField(props.metadata, 'filepath') : undefined;
+      this.emit({ type: 'note', message: `opencode: refused ${what} permission${path ? ` for ${path}` : ''}` });
+    }
+    try {
+      await this.http('POST', `/permission/${encodeURIComponent(id)}/reply`, { reply });
+    } catch {
+      // Servers before the permission rework only know the session-scoped route.
+      const sid = stringField(props, 'sessionID') ?? this.sessionId;
+      if (!sid) return;
+      await this.http('POST', `/session/${encodeURIComponent(sid)}/permissions/${encodeURIComponent(id)}`, {
+        response: reply,
+      }).catch(() => undefined);
     }
   }
 
@@ -702,6 +791,71 @@ function textOf(content: ContentBlock[]): string {
     .map((b) => b.text)
     .join('\n')
     .trim();
+}
+
+/**
+ * The reply to one OpenCode permission prompt. Only this run's own state
+ * outside the worktree is granted: its handoff file (`CEZ_HANDOFF_FILE`), the
+ * files in its pasted-attachments folder (`runs/<CEZ_TASK_ID>-images/`), and
+ * its scratch directory when cezar set `TMPDIR` to it (#785). A config rule
+ * cannot do this — OpenCode matches rules against the whole parent directory
+ * (`runs/*`), which would expose every other task's transcript. Paths are
+ * compared after following symlinks. Everything else is refused, `once` so no
+ * grant outlives the call.
+ */
+export function opencodePermissionReply(
+  props: Record<string, unknown>,
+  env: Record<string, string> | undefined,
+): 'once' | 'reject' {
+  const permission = stringField(props, 'permission') ?? stringField(props, 'type');
+  const filepath = isRecord(props.metadata) ? stringField(props.metadata, 'filepath') : undefined;
+  const handoffFile = env?.CEZ_HANDOFF_FILE;
+  const taskId = env?.CEZ_TASK_ID;
+  if (permission !== 'external_directory' || !filepath || !handoffFile || !taskId) return 'reject';
+  const target = canonicalPath(filepath);
+  const handoff = canonicalPath(handoffFile);
+  if (target === handoff) return 'once';
+  const runsDir = dirname(handoff);
+  if (dirname(target) === join(runsDir, `${taskId}-images`)) return 'once';
+  const tmp = join(dirname(runsDir), 'tmp', taskId);
+  if (env.TMPDIR && canonicalPath(env.TMPDIR) === tmp && (target === tmp || target.startsWith(tmp + sep))) {
+    return 'once';
+  }
+  return 'reject';
+}
+
+/** `realpath` of the deepest existing ancestor, rest re-appended — the file a
+ *  prompt names may not exist yet (a write), but its directories decide where it lands. */
+function canonicalPath(path: string): string {
+  const abs = resolve(path);
+  const rest: string[] = [];
+  let dir = abs;
+  for (;;) {
+    try {
+      return join(realpathSync.native(dir), ...rest.reverse());
+    } catch {
+      const parent = dirname(dir);
+      if (parent === dir) return abs;
+      rest.push(basename(dir));
+      dir = parent;
+    }
+  }
+}
+
+/** The URL line opencode prints once listening — matched on stdout or stderr. */
+const SERVER_URL_RE = /https?:\/\/(?:[\d.]+|localhost):\d+/;
+
+function parseRecord(text: string): Record<string, unknown> {
+  try {
+    const value: unknown = JSON.parse(text);
+    return isRecord(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function stringField(obj: Record<string, unknown>, key: string): string | undefined {

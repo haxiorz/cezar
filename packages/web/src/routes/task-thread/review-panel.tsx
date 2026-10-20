@@ -6,8 +6,9 @@ import {
   ExternalLinkIcon,
   EyeIcon,
   GitPullRequestIcon,
+  LoaderCircleIcon,
 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { ApiError, continueRun, createRunPr } from '@/api/client'
 import { queryKeys } from '@/api/queries'
@@ -21,8 +22,12 @@ import { Link } from '@/lib/project-router'
 import { isSubmitShortcut } from '@/lib/use-submit-shortcut'
 import { isHttpUrl } from '@/lib/utils'
 
+import { GIT_ACTION_PENDING_LABELS } from '../task-git/git-toolbar'
+import { useRunGitStep } from '../task-git/run-git-step'
 import { finishTitle } from './run-actions'
 import { useContinuationProvider } from './continuation-provider'
+import { useDeliverPrompt } from './deliver-prompt'
+import { MESSAGE_TEXT_MAX, messageWithReview, type DiffComments } from './diff-comments'
 import { useDraft } from './thread-draft'
 import { useFinishRun } from './use-finish-run'
 
@@ -34,12 +39,18 @@ import { useFinishRun } from './use-finish-run'
  * a notes box with ↩ Send back (`POST /continue` with the `Review feedback:` prefix
  * — legacy semantics verbatim), Draft PR (`POST /pr`; 409 → the copyable `git merge` manual
  * fallback), and ✓ Accept (the shared finish action from use-finish-run.ts).
+ *
+ * `diffComments`, when given, is the thread's comments: the line comments left on the Changes tab
+ * ride Send back — the review gate is the self-review moment, and notes sent without them would
+ * leave them pending for some later message.
  */
 export function ReviewPanel({
   run,
+  diffComments,
   publishBlockedReason,
 }: {
   run: ApiRun
+  diffComments?: DiffComments
   publishBlockedReason?: string
 }) {
   return (
@@ -58,7 +69,7 @@ export function ReviewPanel({
       </div>
 
       <RunDiff runId={run.id} />
-      <ReviewActions run={run} publishBlockedReason={publishBlockedReason} />
+      <ReviewActions run={run} diffComments={diffComments} publishBlockedReason={publishBlockedReason} />
     </section>
   )
 }
@@ -67,9 +78,11 @@ export function ReviewPanel({
 
 function ReviewActions({
   run,
+  diffComments,
   publishBlockedReason,
 }: {
   run: ApiRun
+  diffComments?: DiffComments
   publishBlockedReason?: string
 }) {
   const queryClient = useQueryClient()
@@ -83,6 +96,15 @@ function ReviewActions({
   const [manual, setManual] = useState<string | null>(null)
   const finish = useFinishRun(run.id)
   const continuation = useContinuationProvider(run)
+  // The review notes ride the SAME delivery seam as the composer's (deliver-prompt): a record
+  // still claiming `review` over a run that has been reopened (an auto-resume, a restart
+  // recovery) sends the notes to a dead session, and only the recovery — refetch, then deliver on
+  // the live path — keeps them from bouncing back as a `run is still active` toast (77117b95).
+  const continueWith = useCallback(
+    (text: string) => continueRun(run.id, { text, runner: continuation.runnerOverride }),
+    [run.id, continuation.runnerOverride],
+  )
+  const deliverPrompt = useDeliverPrompt(run, continueWith, { surface: 'review' })
   const invalidate = () => queryClient.invalidateQueries({ queryKey: queryKeys.runs.all })
 
   // Legacy send-back semantics verbatim (web/app.js `data-action="send-back"`): the notes go
@@ -93,12 +115,17 @@ function ReviewActions({
       if (!continuation.canContinue) return null
       // Through the draft's submit seam: the notes are dropped once they have really gone back,
       // and a rejected send-back leaves them in the box AND in the store.
-      return draft.submit(() =>
-        continueRun(run.id, {
-          text: `Review feedback:\n${text}`,
-          runner: continuation.runnerOverride,
-        }),
-      )
+      // The line comments go with the notes, and are dropped on the same terms: only once the
+      // send-back has landed.
+      const deliver = async (held: Parameters<typeof messageWithReview>[1]) => {
+        // Checked against the cap with the prefix it actually goes out with.
+        const message = `Review feedback:\n${messageWithReview(text, held)}`
+        if (message.length > MESSAGE_TEXT_MAX) {
+          throw new Error('Too long with the diff comments attached — shorten the notes or remove some comments.')
+        }
+        return deliverPrompt(message, [])
+      }
+      return draft.submit(() => (diffComments ? diffComments.submit(deliver) : deliver([])))
     },
     onSuccess: (result) => {
       if (result === null) return
@@ -107,6 +134,9 @@ function ReviewActions({
     onError: (error: Error) => toast(error.message, { tone: 'danger' }),
   })
 
+  // Draft PR is the header's Create draft PR, by the same path: the agent opens it (exact target,
+  // adopted after its turn) — the server only when no agent can be reached.
+  const git = useRunGitStep(run)
   const draftPr = useMutation({
     mutationFn: () => createRunPr(run.id),
     onSuccess: (result) => {
@@ -119,9 +149,14 @@ function ReviewActions({
     },
   })
 
+  const draftPrBusy = draftPr.isPending || git.pending !== null
+  const openDraftPr = () => (git.byAgent ? git.onAction('create-draft-pr') : draftPr.mutate())
+
+  const commentCount = diffComments?.comments.length ?? 0
   const submitNotes = () => {
     const text = notes.trim()
-    if (text.length === 0) {
+    // Drafted line comments are feedback on their own.
+    if (text.length === 0 && commentCount === 0) {
       // Legacy `alertBar('Write what to change first.')` + focus.
       toast('Write what to change first.')
       notesRef.current?.focus()
@@ -160,6 +195,11 @@ function ReviewActions({
         }}
         className="min-h-[52px] text-[13px]"
       />
+      {commentCount > 0 ? (
+        <p data-slot="review-diff-comments" className="text-xs text-muted-foreground">
+          + {commentCount} {commentCount === 1 ? 'comment' : 'comments'} on the diff — sent back with these notes.
+        </p>
+      ) : null}
       {!continuation.canContinue ? (
         <p
           id="review-provider-guidance"
@@ -211,13 +251,21 @@ function ReviewActions({
             data-slot="review-draft-pr"
             variant="outline"
             size="sm"
-            title={publishBlockedReason ?? 'Push the branch and open a draft PR'}
+            title={
+              publishBlockedReason ??
+              (git.byAgent ? 'Ask the agent to push the branch and open a draft PR' : 'Push the branch and open a draft PR')
+            }
             aria-describedby={publishBlockedReason ? 'harness-publish-guidance' : undefined}
-            disabled={draftPr.isPending || publishBlockedReason !== undefined}
-            onClick={() => draftPr.mutate()}
+            disabled={draftPrBusy || publishBlockedReason !== undefined}
+            aria-busy={draftPrBusy || undefined}
+            onClick={openDraftPr}
           >
-            <GitPullRequestIcon aria-hidden="true" />
-            Draft PR
+            {draftPrBusy ? (
+              <LoaderCircleIcon aria-hidden="true" className="motion-safe:animate-spin" />
+            ) : (
+              <GitPullRequestIcon aria-hidden="true" />
+            )}
+            {draftPrBusy ? GIT_ACTION_PENDING_LABELS['create-draft-pr'] : 'Draft PR'}
           </Button>
         )}
         <Button
