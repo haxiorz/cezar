@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest'
 
 import type { HarnessLedgerResponse, RunEvent } from '@open-mercato/cezar-api-client'
 
+import { holdGitSteps } from '../task-git/run-git-step'
 import {
   activeHarnessPhase,
   currentImplementationCouncil,
+  harnessPublishBlockedReason,
   mergeHarnessLedger,
 } from './harness-state'
 
@@ -327,5 +329,62 @@ describe('orderStepsByLedger', () => {
     const { orderStepsByLedger } = await import('./harness-state')
     const steps = [{ id: 'a' }, { id: 'b' }]
     expect(orderStepsByLedger(steps, undefined)).toEqual(steps)
+  })
+})
+
+describe('harnessPublishBlockedReason — the stage-only hold on git steps', () => {
+  const harnessRun = (status: string) => ({ harness: { profile: 'multi' }, status })
+  const staged = (outcome: HarnessLedgerResponse['outcome'], extra: Partial<HarnessLedgerResponse> = {}) => ({
+    ...ledger(),
+    stage: { status: 'staged' },
+    outcome,
+    ...extra,
+  }) as HarnessLedgerResponse
+
+  it('never holds an ordinary run', () => {
+    expect(harnessPublishBlockedReason({ status: 'running' }, undefined)).toBeUndefined()
+    expect(harnessPublishBlockedReason({ status: 'review' }, undefined)).toBeUndefined()
+  })
+
+  // Main's header git steps are prompts to the task's own agent: offered mid-run, Push would be
+  // queued for the next harness phase and published a branch the harness still owns.
+  it.each(['queued', 'running', 'waiting'])('holds a %s harness run, ledger or not', (status) => {
+    expect(harnessPublishBlockedReason(harnessRun(status), staged({ status: 'ready', blockingReasons: [] }))).toMatch(
+      /review gate/,
+    )
+  })
+
+  it('holds a settled run until its ledger is readable and staged', () => {
+    expect(harnessPublishBlockedReason(harnessRun('review'), undefined)).toMatch(/unavailable/)
+    expect(harnessPublishBlockedReason(harnessRun('review'), ledger())).toMatch(/staged handoff/)
+  })
+
+  it('releases a ready outcome, and a contested one only once the user accepted it', () => {
+    expect(harnessPublishBlockedReason(harnessRun('review'), staged({ status: 'ready', blockingReasons: [] }))).toBeUndefined()
+    const contested = { status: 'contested', blockingReasons: ['risk'] } as HarnessLedgerResponse['outcome']
+    expect(harnessPublishBlockedReason(harnessRun('review'), staged(contested))).toMatch(/Accept the unresolved/)
+    const at = '2026-07-26T11:00:00.000Z'
+    const accepted = staged(
+      { ...contested, acceptedAt: at, acceptedBy: 'user', acceptanceReason: 'known risk' } as HarnessLedgerResponse['outcome'],
+      { decisions: [{ kind: 'accept-contested', by: 'user', at, detail: 'known risk' }] } as Partial<HarnessLedgerResponse>,
+    )
+    expect(harnessPublishBlockedReason(harnessRun('done'), accepted)).toBeUndefined()
+  })
+})
+
+describe('holdGitSteps', () => {
+  it('disables the step and every alternative, keeping them visible with the reason', () => {
+    const held = holdGitSteps(
+      {
+        id: 'push',
+        label: 'Push',
+        enabled: true,
+        alternatives: [{ id: 'commit', label: 'Commit', enabled: true }],
+      } as Parameters<typeof holdGitSteps>[0],
+      'held',
+    )
+    expect(held).toMatchObject({ id: 'push', enabled: false, reason: 'held' })
+    expect(held?.alternatives).toEqual([expect.objectContaining({ id: 'commit', enabled: false, reason: 'held' })])
+    expect(holdGitSteps(null, 'held')).toBeNull()
   })
 })

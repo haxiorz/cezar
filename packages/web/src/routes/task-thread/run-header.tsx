@@ -74,7 +74,7 @@ import {
   runActionFlags,
 } from './run-actions'
 import { GitActions } from '../task-git/git-toolbar'
-import { useRunGitStep, type RunGitStep } from '../task-git/run-git-step'
+import { holdGitSteps, useRunGitStep, type RunGitStep } from '../task-git/run-git-step'
 import { RunConfirmDialog } from './run-confirm-dialog'
 import { useRunEngine } from './run-engine'
 import { WorkflowSteps } from './step-rail'
@@ -1338,7 +1338,7 @@ function GitStepAndKebab({
   publishBlockedReason?: string
 }) {
   const step = useRunGitStep(run)
-  const git = publishBlockedReason ? { ...step, action: blockPublishSteps(step.action, publishBlockedReason) } : step
+  const git = publishBlockedReason ? { ...step, action: holdGitSteps(step.action, publishBlockedReason) } : step
   return (
     <>
       {/* The one git button, top right. Desktop only: on phones it leads the menu instead. */}
@@ -1349,20 +1349,6 @@ function GitStepAndKebab({
       {git.dialogs}
     </>
   )
-}
-
-/** The git steps that publish the branch. A harness run whose outcome is not publishable keeps
- *  them on screen, disabled with the harness's reason (spec 2026-07-23-harness-orchestration). */
-const PUBLISH_STEPS: ReadonlySet<GitActionId> = new Set(['push', 'commit-push', 'create-pr', 'create-draft-pr'])
-
-function blockPublishSteps(action: GitAction | null, reason: string): GitAction | null {
-  if (!action) return null
-  const block = (step: GitAction): GitAction =>
-    PUBLISH_STEPS.has(step.id) ? { ...step, enabled: false, reason } : step
-  return {
-    ...block(action),
-    ...(action.alternatives ? { alternatives: action.alternatives.map(block) } : {}),
-  }
 }
 
 /** The <md action surface: everything the desktop rows offer, folded into one menu next to the

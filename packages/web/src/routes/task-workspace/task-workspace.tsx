@@ -44,7 +44,7 @@ import { ChangesView } from '../task-git/task-changes'
 import { CommitsView } from '../task-git/task-commits'
 import { FilesView } from '../task-git/task-files'
 import { useDiffComments } from '../task-thread/diff-comments'
-import { harnessPublishBlockedReason, orderStepsByLedger } from '../task-harness/harness-state'
+import { orderStepsByLedger } from '../task-harness/harness-state'
 import { RunHeader, type RunTab } from '../task-thread/run-header'
 import { useRunRecordReconcile } from '../task-thread/run-reconcile'
 import { ThreadView } from '../task-thread/task-thread'
@@ -719,19 +719,9 @@ function WorkspaceView({
     ],
   )
 
-  // The header's git step obeys the harness stage-only contract here too (spec
-  // 2026-07-23-harness-orchestration). The durable snapshot never polls, so a status change —
-  // when the ledger's outcome settles — refetches it.
-  const isHarness = Boolean(run.harness)
-  const harness = useRunHarness(run.id, isHarness)
-  const { refetch: refetchHarness } = harness
-  const settledStatus = useRef(run.status)
-  useEffect(() => {
-    if (settledStatus.current === run.status) return
-    settledStatus.current = run.status
-    if (isHarness) void refetchHarness()
-  }, [isHarness, run.status, refetchHarness])
-  const publishBlockedReason = harnessPublishBlockedReason(run, harness.data)
+  // A harness run's step list in execution order (spec 2026-07-23-harness-orchestration). The
+  // git step's stage-only hold lives in `useRunGitStep`, which keeps this snapshot fresh.
+  const harness = useRunHarness(run.id, Boolean(run.harness))
   const orderedSteps = useMemo(
     () => (harness.data ? orderStepsByLedger(run.steps, harness.data) : undefined),
     [harness.data, run.steps],
@@ -745,7 +735,6 @@ function WorkspaceView({
         onMarkedUnread={markedUnread}
         tabs={tabs}
         headerActions={headerActions}
-        publishBlockedReason={publishBlockedReason}
         orderedSteps={orderedSteps}
         wide
       />
