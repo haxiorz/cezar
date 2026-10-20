@@ -123,6 +123,10 @@ export const harnessModelSchema = z.object({
   readinessDetail: z.string().optional(),
   binding: z.string().optional(),
   certification: harnessCertificationSchema.optional(),
+  /** A configured binding that makes exactly the call a runner-backed reviewer already makes
+   *  (the same trusted endpoint preset and model, or the same `codex exec` review command) —
+   *  the composer lists that model once, under the runner spelling. Absent = no equivalent. */
+  sameAs: z.object({ runner: z.enum(['codex', 'opencode']), model: z.string() }).optional(),
 });
 export type HarnessModel = z.infer<typeof harnessModelSchema>;
 
@@ -210,7 +214,10 @@ export const harnessReviewerRecordSchema = z.looseObject({
   family: z.string().optional(),
   status: z.string().optional(),
   freshContext: z.boolean().optional(),
-  verdict: z.enum(['approve', 'request_changes']).optional(),
+  /** `null` when the reviewer produced no verdict — a failed advisor (the driver's durable
+   *  ledger format, as on the council row below). Rejecting it made ONE failed reviewer fail the
+   *  whole ledger parse, blanking the run's models rail and review tab (2026-09-30). */
+  verdict: z.enum(['approve', 'request_changes']).nullable().optional(),
   findings: z.array(harnessFindingRecordSchema).optional(),
   reason: z.string().optional(),
   error: z.string().optional(),

@@ -50,7 +50,10 @@ import {
   certificationAdvisory,
   certifiedRoleRate,
   groupHarnessOptions,
+  harnessRefDisplay,
   harnessRolesIssue,
+  probeReadinessFor,
+  reviewerOptions,
   freeTierReviewerWarning,
   rolesEqual,
   sessionRoleOptions,
@@ -83,6 +86,11 @@ export function humanReadinessError(detail: string): string {
   if (/not supported when using Codex with a ChatGPT account/i.test(detail)) {
     return "This Codex login can't run the selected model — pick a named model (e.g. gpt-5.6-luna), or bind an API key."
   }
+  // Before the generic 403: OpenCode Zen answers a model switched off in the account's model
+  // list with a 403 too, and "re-authenticate" sent the user after a key that was fine.
+  if (/model access is disabled/i.test(detail)) {
+    return 'This model is switched off for your account on the provider (OpenCode Zen: enable it in your Zen model settings) — enable it there or pick another model.'
+  }
   if (/\b(401|403)\b|unauthor|invalid[_ -]?api[_ -]?key|authentication/i.test(detail)) {
     return 'The provider rejected the credentials for this binding — re-authenticate the CLI or update the API key.'
   }
@@ -110,7 +118,7 @@ const fromKey = (key: string): HarnessModelRef => {
 
 function optionLabel(options: readonly HarnessModelOption[], ref: HarnessModelRef): string {
   const match = options.find((o) => o.runner === ref.runner && o.model === ref.model)
-  return match ? `${match.runner} · ${match.label}` : `${ref.runner} · ${ref.model || 'auto'}`
+  return harnessRefDisplay(ref, match?.label)
 }
 
 /** The recorded eval-suite score for the reviewer role, rendered as a tiny badge on a picker
@@ -217,7 +225,14 @@ export function ModelPickerPill({
                     <CommandItem
                       key={key}
                       value={key}
-                      keywords={[option.family, option.runner, option.label, option.model]}
+                      keywords={[
+                        option.family,
+                        option.runner,
+                        option.label,
+                        option.model,
+                        harnessRefDisplay(option, option.label),
+                        ...(option.desc ? [option.desc] : []),
+                      ]}
                       data-slot={`${slot}-option`}
                       onSelect={() => {
                         onPick(
@@ -229,8 +244,15 @@ export function ModelPickerPill({
                         setSearch('')
                       }}
                     >
-                      <span className="min-w-0 flex-1 truncate text-xs font-medium">
-                        {option.runner} · {option.label}
+                      <span className="flex min-w-0 flex-1 flex-col">
+                        <span className="truncate text-xs font-medium">
+                          {harnessRefDisplay(option, option.label)}
+                        </span>
+                        {option.desc ? (
+                          <span data-slot={`${slot}-option-desc`} className="truncate text-[11px] text-soft-foreground">
+                            {option.desc}
+                          </span>
+                        ) : null}
                       </span>
                       <CertificationBadge option={option} />
                       {key === currentKey ? (
@@ -415,7 +437,7 @@ function PresetRow({
                   <span className="min-w-0 flex-1 font-mono text-[10.5px] text-muted-foreground">
                     {refs.map((ref) => (
                       <span key={`${ref.runner}::${ref.model}`} className="block truncate">
-                        {ref.runner} · {ref.model || 'auto'}
+                        {harnessRefDisplay(ref)}
                       </span>
                     ))}
                   </span>
@@ -573,8 +595,7 @@ export function HarnessPanel({
   const freeTierWarning = freeTierReviewerWarning(roles)
   const certAdvisory = certificationAdvisory(roles, options)
   const certifiedLineup = bestCertifiedRoles(options)
-  const readinessOf = (ref: HarnessModelRef) =>
-    probe?.models.find((model) => model.id === `${ref.runner}/${ref.model || 'auto'}`)?.readiness
+  const readinessOf = (ref: HarnessModelRef) => probeReadinessFor(probe, ref)
   return (
     <section
       data-slot="harness-panel"
@@ -782,7 +803,7 @@ export function HarnessPanel({
                     ariaLabel={`Reviewer ${index + 1} model`}
                     readiness={readinessOf(reviewer)}
                     value={reviewer}
-                    options={options}
+                    options={reviewerOptions(options)}
                     onPick={(ref) =>
                       onRoles({
                         ...roles,

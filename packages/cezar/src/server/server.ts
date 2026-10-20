@@ -142,7 +142,7 @@ import { resolveHarnessPlan } from '../harness/profile-plan.ts';
 import { harnessArtifactDir } from '../harness/driver.ts';
 import { providerFamilyOf } from '../harness/model-family.ts';
 import { canonicalizeAdvisorRefs } from '../harness/advisor-identity.ts';
-import { opencodeSeatingError } from '../harness/reviewer-binding.ts';
+import { opencodeSeatingError, runnerEquivalentOf } from '../harness/reviewer-binding.ts';
 import { releaseIssueClaim } from '../harness/issue-claim.ts';
 import {
   HARNESS_PROFILES,
@@ -4222,6 +4222,7 @@ export function createApp(deps: ServerDeps) {
             adapter?: unknown;
             roles?: unknown;
           };
+          const sameAs = runnerEquivalentOf(raw);
           return {
             id,
             family: typeof model.family === 'string' ? model.family : undefined,
@@ -4232,6 +4233,7 @@ export function createApp(deps: ServerDeps) {
               : [],
             profiles: profilesUsing(id),
             certification: certified(id),
+            ...(sameAs ? { sameAs } : {}),
           };
         }),
       ];

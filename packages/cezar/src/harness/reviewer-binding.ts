@@ -125,6 +125,35 @@ export function synthesizeReviewerBinding(
   };
 }
 
+/**
+ * The runner-backed reviewer a configured `agentHarness.models` entry is equivalent to, or
+ * null. The inverse of {@link synthesizeReviewerBinding}: a trusted gateway preset pointed at
+ * its own endpoint is the `<gateway>/<model>` reviewer, and a `codex exec` review command is
+ * the codex reviewer. The composer uses it to list each model once (2026-09-29: a setup run
+ * that bound every Zen model left the reviewer picker showing each of them twice).
+ */
+export function runnerEquivalentOf(
+  entry: unknown,
+): { runner: 'codex' | 'opencode'; model: string } | null {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const binding = entry as Record<string, unknown>;
+  const model = binding.model;
+  if (typeof model !== 'string' || model === '') return null;
+  if (binding.adapter === 'preset') {
+    const gateway = Object.entries(GATEWAYS).find(
+      ([, wire]) => wire.preset === binding.preset && wire.endpoint === binding.endpoint,
+    );
+    return gateway ? { runner: 'opencode', model: `${gateway[0]}/${model}` } : null;
+  }
+  if (binding.adapter === 'command') {
+    const review = (binding.commands as Record<string, unknown> | undefined)?.review;
+    if (Array.isArray(review) && review[0] === 'codex' && review[1] === 'exec') {
+      return { runner: 'codex', model };
+    }
+  }
+  return null;
+}
+
 const sanitize = (value: string): string => value.replace(/[^A-Za-z0-9._-]+/g, '-');
 
 /** The shape every caller of {@link opencodeSeatingError} shares — the contract's

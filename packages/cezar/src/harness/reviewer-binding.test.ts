@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { opencodeSeatingError, reviewerFamily, synthesizeReviewerBinding } from './reviewer-binding.js';
+import {
+  opencodeSeatingError,
+  reviewerFamily,
+  runnerEquivalentOf,
+  synthesizeReviewerBinding,
+} from './reviewer-binding.js';
 
 /**
  * The port's central defect (2026-07-25): cezar ran council reviewers as full
@@ -146,5 +151,79 @@ describe('opencodeSeatingError', () => {
     expect(
       opencodeSeatingError({ orchestrator: claude, implementer: codex, reviewers: [claude, codex] }),
     ).toBeNull();
+  });
+});
+
+describe('runnerEquivalentOf', () => {
+  it('maps a trusted gateway preset on its own endpoint to the `<gateway>/<model>` reviewer', () => {
+    expect(
+      runnerEquivalentOf({
+        adapter: 'preset',
+        preset: 'opencode-zen',
+        endpoint: 'https://opencode.ai/zen/v1/chat/completions',
+        model: 'glm-5.3',
+        credentialEnv: 'OM_ZEN_KEY',
+        authStoreProvider: 'opencode',
+      }),
+    ).toEqual({ runner: 'opencode', model: 'opencode/glm-5.3' });
+    expect(
+      runnerEquivalentOf({
+        adapter: 'preset',
+        preset: 'deepseek-api',
+        endpoint: 'https://api.deepseek.com/chat/completions',
+        model: 'deepseek-v4-pro',
+      }),
+    ).toEqual({ runner: 'opencode', model: 'deepseek/deepseek-v4-pro' });
+  });
+
+  it('is the exact inverse of synthesizeReviewerBinding for every gateway', () => {
+    for (const model of ['opencode/qwen3.8-max', 'deepseek/deepseek-v4-pro']) {
+      const synthesized = synthesizeReviewerBinding({ runner: 'opencode', model });
+      expect(runnerEquivalentOf(synthesized?.entry)).toEqual({ runner: 'opencode', model });
+    }
+  });
+
+  it('maps a `codex exec` review command to the codex reviewer', () => {
+    expect(
+      runnerEquivalentOf({
+        adapter: 'command',
+        model: 'gpt-5.6-sol',
+        commands: { review: ['codex', 'exec', '--sandbox', 'read-only', '-'] },
+      }),
+    ).toEqual({ runner: 'codex', model: 'gpt-5.6-sol' });
+  });
+
+  it('claims no twin for anything else — a different endpoint, a kimi CLI, a malformed entry', () => {
+    expect(
+      runnerEquivalentOf({
+        adapter: 'preset',
+        preset: 'opencode-zen',
+        endpoint: 'https://proxy.example.com/v1/chat/completions',
+        model: 'glm-5.3',
+      }),
+    ).toBeNull();
+    expect(
+      runnerEquivalentOf({ adapter: 'command', model: 'k3', commands: { review: ['kimi', 'review'] } }),
+    ).toBeNull();
+    expect(runnerEquivalentOf({ adapter: 'preset', preset: 'opencode-zen' })).toBeNull();
+    expect(runnerEquivalentOf(null)).toBeNull();
+    expect(runnerEquivalentOf(['preset'])).toBeNull();
+  });
+});
+
+describe('the composer\'s reviewer gateways', () => {
+  it('match the gateways synthesizeReviewerBinding can route', async () => {
+    const { readFileSync } = await import('node:fs');
+    const text = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8');
+    const server = text('./reviewer-binding.ts').match(/const GATEWAYS[\s\S]*?= \{([\s\S]*?)\n\};/)?.[1] ?? '';
+    const gateways = [...server.matchAll(/^  ([a-z-]+): \{/gm)].map((match) => match[1]);
+    const mirror = text('../../../web/src/routes/new-task-form.ts').match(
+      /REVIEWER_GATEWAYS: readonly string\[\] = \[([^\]]*)\]/,
+    )?.[1];
+    expect(gateways.length).toBeGreaterThan(0);
+    expect(mirror?.split(',').map((entry) => entry.trim().replace(/'/g, ''))).toEqual(gateways);
+    for (const gateway of gateways) {
+      expect(synthesizeReviewerBinding({ runner: 'opencode', model: `${gateway}/m` })).not.toBeNull();
+    }
   });
 });

@@ -53,6 +53,13 @@ const MAX_MODELS = 200;
 export const TERM_GRACE_MS = 2_000;
 export const KILL_GRACE_MS = 2_000;
 const REQUEST_ID = 'cez-list-models-1';
+/**
+ * The fallback request. Claude Code CLIs that predate `list_models` (2.1.193 answers it with
+ * "Unsupported control request subtype") still publish the same `{value, displayName,
+ * description}` rows under `models` in their `initialize` answer — the catalog the SDK exposes
+ * as `supportedModels()`. Without this fallback such a CLI showed only the static tier aliases.
+ */
+const INITIALIZE_REQUEST_ID = 'cez-initialize-1';
 
 /**
  * The `value` that stands for "whatever the CLI would pick on its own". cezar already spells that
@@ -143,17 +150,17 @@ function childFailure(child: ChildProcessWithoutNullStreams): Promise<never> {
 }
 
 async function readCatalog(child: ChildProcessWithoutNullStreams): Promise<ModelOption[]> {
-  try {
-    child.stdin.write(
-      `${JSON.stringify({
-        type: 'control_request',
-        request_id: REQUEST_ID,
-        request: { subtype: 'list_models' },
-      })}\n`,
-    );
-  } catch {
-    throw new Error('Claude model discovery could not reach the CLI');
-  }
+  const send = (requestId: string, subtype: string): void => {
+    try {
+      child.stdin.write(
+        `${JSON.stringify({ type: 'control_request', request_id: requestId, request: { subtype } })}\n`,
+      );
+    } catch {
+      throw new Error('Claude model discovery could not reach the CLI');
+    }
+  };
+  send(REQUEST_ID, 'list_models');
+  let pending = REQUEST_ID;
 
   for await (const line of readNdjson(child.stdout)) {
     let message: unknown;
@@ -167,10 +174,18 @@ async function readCatalog(child: ChildProcessWithoutNullStreams): Promise<Model
     const parsed = controlResponseSchema.safeParse(message);
     if (!parsed.success) continue;
     const { response } = parsed.data;
-    if (response.request_id !== undefined && response.request_id !== REQUEST_ID) continue;
+    if (response.request_id !== undefined && response.request_id !== pending) continue;
     if (response.subtype !== 'success') {
-      // An older CLI answers `Unsupported control request subtype: list_models` here. That is an
-      // unavailable catalog, not a broken cezar — the reason is never surfaced verbatim.
+      if (pending === REQUEST_ID) {
+        send(INITIALIZE_REQUEST_ID, 'initialize');
+        pending = INITIALIZE_REQUEST_ID;
+        continue;
+      }
+      // Neither request is understood. That is an unavailable catalog, not a broken cezar —
+      // the CLI's reason is never surfaced verbatim.
+      throw new Error('Claude model discovery is unsupported by this CLI');
+    }
+    if (pending === INITIALIZE_REQUEST_ID && !listModelsSchema.safeParse(response.response).success) {
       throw new Error('Claude model discovery is unsupported by this CLI');
     }
     return toModelOptions(response.response);

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { harnessLedgerResponseSchema } from '@open-mercato/cezar-contract';
 import { createLedger, readLedger, saveLedger } from '../harness/ledger.js';
 import { acquireIssueClaim } from '../harness/issue-claim.js';
 import { HARNESS_FIX_ISSUE } from '../harness/workflows.js';
@@ -150,6 +151,40 @@ describe('harness API', () => {
       expect(codex).toMatchObject({ model: 'gpt-5.6-sol', family: 'openai', roles: ['worker', 'reviewer'] });
       expect(codex?.profiles).toContain('multi');
       expect(body.models.some((m) => m.id === 'claude')).toBe(true);
+    });
+
+    it('marks a binding that makes a runner-backed reviewer\'s exact call as sameAs it, and only that', async () => {
+      mkdirSync(join(repoRoot, '.ai'), { recursive: true });
+      writeFileSync(
+        join(repoRoot, '.ai', 'agentic.config.json'),
+        JSON.stringify({
+          agentHarness: {
+            version: 1,
+            models: {
+              'zen-glm-5.3': {
+                adapter: 'preset',
+                preset: 'opencode-zen',
+                endpoint: 'https://opencode.ai/zen/v1/chat/completions',
+                family: 'zhipu',
+                model: 'glm-5.3',
+                roles: ['reviewer'],
+              },
+              kimi: { adapter: 'preset', family: 'moonshot', model: 'kimi-code/k3', roles: ['reviewer'] },
+            },
+          },
+        }),
+        'utf8',
+      );
+      const res = await apiRequest(app, '/api/v1/harness/status');
+      const body = (await res.json()) as {
+        models: Array<{ id: string; sameAs?: { runner: string; model: string } }>;
+      };
+      expect(body.models.find((m) => m.id === 'zen-glm-5.3')?.sameAs).toEqual({
+        runner: 'opencode',
+        model: 'opencode/glm-5.3',
+      });
+      // No twin → the key is absent from the wire, not `null`/`undefined`.
+      expect(body.models.find((m) => m.id === 'kimi')).not.toHaveProperty('sameAs');
     });
 
     it('answers a claude-only roster with no config at all', async () => {
@@ -328,6 +363,35 @@ describe('harness API', () => {
       expect(body.version).toBe(2);
       expect(body.workflow).toBe(HARNESS_FIX_ISSUE);
       expect(body.snapshotSeq).toBe(0);
+    });
+
+    it('answers a ledger with a failed council reviewer in a shape the cockpit accepts', async () => {
+      // 2026-09-30, run 49ffff20: two Zen free-tier reviewers answered HTTP 403, the driver
+      // recorded them with `verdict: null`, and the cockpit's strict parse of this response
+      // failed on that one field — the whole models rail and review tab went with it.
+      const run = store.createRun({ title: 't', workflow: HARNESS_FIX_ISSUE, task: 'x', steps: [] });
+      const ledger = createLedger({
+        workflow: HARNESS_FIX_ISSUE,
+        requestedProfile: 'standard',
+        subject: { kind: 'brief', text: 'x' },
+      });
+      (ledger as unknown as { councils: unknown[] }).councils = [
+        {
+          round: 1,
+          kind: 'spec',
+          verdict: 'request_changes',
+          reviewers: [
+            { id: 'codex/gpt-6.1-sol', status: 'completed', verdict: 'request_changes', findings: [] },
+            { id: 'opencode/opencode/mimo-v2.6-flash-free', runner: 'harness', status: 'failed', verdict: null, findings: [], error: 'HTTP 403' },
+          ],
+        },
+      ];
+      saveLedger(dataDir, run.id, ledger);
+
+      const res = await apiRequest(app, `/api/v1/runs/${run.id}/harness`);
+      expect(res.status).toBe(200);
+      const parsed = harnessLedgerResponseSchema.safeParse(await res.json());
+      expect(parsed.success ? null : parsed.error.issues).toBeNull();
     });
 
     it('returns 409 for corrupt or future ledger state instead of pretending it is absent', async () => {

@@ -15,6 +15,7 @@ import {
   defaultHarnessRoles,
   freeTierReviewerWarning,
   groupHarnessOptions,
+  harnessRefDisplay,
   harnessRolesIssue,
   modelFamilyOf,
   normalizeHarnessPresets,
@@ -31,7 +32,10 @@ import {
   modelsForRunner,
   modelCatalogStatus,
   modelConflictsWithRunner,
+  probeReadinessFor,
   pushRecentSource,
+  REVIEWER_GATEWAYS,
+  reviewerOptions,
   resolveModel,
   resolveRunner,
   resolveSource,
@@ -524,6 +528,53 @@ describe('harness form rules (spec 2026-07-23-harness-orchestration)', () => {
     expect(defaults).not.toBeNull()
     const refs = [defaults!.orchestrator, defaults!.implementer, ...defaults!.reviewers]
     expect(refs.every((ref) => ref.runner !== 'harness')).toBe(true)
+  })
+
+  it('defaultHarnessRoles prefers a named model over the CLI default for every seat', () => {
+    // A Codex ChatGPT login refuses its own default (`auto`), so a lineup seated on it opened
+    // with a red implementer and Start disabled. The catalog order is the CLI's own ranking.
+    const options = [
+      { runner: 'claude' as const, model: '', label: 'auto', family: 'anthropic' },
+      { runner: 'claude' as const, model: 'opus[1m]', label: 'Opus', family: 'anthropic' },
+      { runner: 'claude' as const, model: 'sonnet', label: 'Sonnet', family: 'anthropic' },
+      { runner: 'codex' as const, model: '', label: 'auto', family: 'openai' },
+      { runner: 'codex' as const, model: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', family: 'openai' },
+      { runner: 'codex' as const, model: 'gpt-5.6-luna', label: 'GPT-5.6-Luna', family: 'openai' },
+    ]
+    const defaults = defaultHarnessRoles(options)
+    expect(defaults).toEqual({
+      orchestrator: { runner: 'claude', model: 'sonnet' },
+      implementer: { runner: 'codex', model: 'gpt-5.6-sol' },
+      reviewers: [
+        { runner: 'claude', model: 'opus[1m]' },
+        { runner: 'codex', model: 'gpt-5.6-sol' },
+      ],
+    })
+  })
+
+  it('probeReadinessFor finds the claude default under the id the probe gives it', () => {
+    const probe = {
+      profile: 'custom',
+      ready: true,
+      models: [
+        { id: 'claude', roles: [], readiness: 'ready' as const },
+        { id: 'codex/auto', roles: [], readiness: 'failed' as const },
+        { id: 'harness/deepseek', roles: [], readiness: 'ready' as const },
+      ],
+    }
+    expect(probeReadinessFor(probe, { runner: 'claude', model: '' })).toBe('ready')
+    expect(probeReadinessFor(probe, { runner: 'codex', model: '' })).toBe('failed')
+    expect(probeReadinessFor(probe, { runner: 'harness', model: 'deepseek' })).toBe('ready')
+    expect(probeReadinessFor(probe, { runner: 'claude', model: 'opus' })).toBeUndefined()
+    expect(probeReadinessFor(undefined, { runner: 'claude', model: '' })).toBeUndefined()
+  })
+
+  it('defaultHarnessRoles still seats `auto` for a family with no named model', () => {
+    const defaults = defaultHarnessRoles([
+      { runner: 'claude' as const, model: 'sonnet', label: 'sonnet', family: 'anthropic' },
+      { runner: 'codex' as const, model: '', label: 'auto', family: 'openai' },
+    ])
+    expect(defaults?.implementer).toEqual({ runner: 'codex', model: '' })
   })
 
   it('defaultHarnessRoles never seats OpenCode on the orchestrator or implementer', () => {
@@ -1067,6 +1118,68 @@ describe('eval-gate certification helpers (spec 2026-08-06-eval-gated-model-rout
   const claudeOpus: Parameters<typeof bestCertifiedRoles>[0][number] = {
     runner: 'claude', model: 'opus', label: 'opus', family: 'anthropic',
   }
+
+  it('advisorHarnessOptions lists each model once — a binding equivalent to a listed reviewer is dropped', () => {
+    // 2026-09-29: a setup run bound every Zen model, and the reviewer picker showed each twice —
+    // `harness · zen-glm-5.3` next to `opencode · opencode/glm-5.3`, the exact same call.
+    const status = {
+      enabled: true,
+      configured: true,
+      profiles: ['standard'],
+      driven: ['standard'],
+      runtime: { installed: true, source: 'bundled' as const, commit: 'a'.repeat(40) },
+      models: [
+        { id: 'zen-glm-5.3', family: 'zhipu', model: 'glm-5.3', adapter: 'preset', roles: ['reviewer'],
+          sameAs: { runner: 'opencode' as const, model: 'opencode/glm-5.3' } },
+        { id: 'deepseek', family: 'deepseek', model: 'deepseek-v4-pro', adapter: 'preset', roles: ['reviewer'],
+          sameAs: { runner: 'opencode' as const, model: 'deepseek/deepseek-v4-pro' } },
+        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', adapter: 'command', roles: ['worker', 'reviewer'],
+          sameAs: { runner: 'codex' as const, model: 'gpt-5.6-sol' } },
+        { id: 'kimi', family: 'moonshot', model: 'kimi-code/k3', adapter: 'preset', roles: ['reviewer'] },
+      ],
+    }
+    const listed = [
+      { runner: 'opencode' as const, model: 'opencode/glm-5.3', label: 'opencode/glm-5.3', family: 'zhipu' },
+      { runner: 'codex' as const, model: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', family: 'openai' },
+    ]
+    // The DeepSeek-API binding stays: its twin is not listed (no `deepseek/…` in this catalog),
+    // and dropping it would remove the only route. A binding with no twin always stays.
+    expect(advisorHarnessOptions(status, listed).map((o) => o.model)).toEqual(['deepseek', 'kimi'])
+    // Without runner options (no OpenCode, catalog still loading) nothing is dropped.
+    expect(advisorHarnessOptions(status).map((o) => o.model)).toEqual(['zen-glm-5.3', 'deepseek', 'codex', 'kimi'])
+  })
+
+  it('harnessRefDisplay names the provider a gateway reviewer really calls, not OpenCode', () => {
+    expect(harnessRefDisplay({ runner: 'opencode', model: 'deepseek/deepseek-v4-pro' })).toBe('DeepSeek API · deepseek-v4-pro')
+    expect(harnessRefDisplay({ runner: 'opencode', model: 'opencode/glm-5.3' })).toBe('Zen · glm-5.3')
+    expect(harnessRefDisplay({ runner: 'claude', model: 'opus[1m]' }, 'Opus')).toBe('claude · Opus')
+    expect(harnessRefDisplay({ runner: 'codex', model: '' })).toBe('codex · auto')
+    // A provider prefix with no gateway keeps the plain spelling rather than inventing a name.
+    expect(harnessRefDisplay({ runner: 'opencode', model: 'openai/gpt-5.6-sol' })).toBe('opencode · openai/gpt-5.6-sol')
+    // Every routable gateway has a name.
+    for (const gateway of REVIEWER_GATEWAYS) {
+      expect(harnessRefDisplay({ runner: 'opencode', model: `${gateway}/m` })).not.toMatch(/^opencode ·/)
+    }
+  })
+
+  it('reviewerOptions drops OpenCode models no gateway can route — they could never start', () => {
+    const options = [
+      { runner: 'claude' as const, model: 'opus', label: 'Opus', family: 'anthropic' },
+      { runner: 'codex' as const, model: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', family: 'openai' },
+      { runner: 'opencode' as const, model: 'opencode/glm-5.3', label: 'glm', family: 'zhipu' },
+      { runner: 'opencode' as const, model: 'deepseek/deepseek-v4-pro', label: 'ds', family: 'deepseek' },
+      { runner: 'opencode' as const, model: 'openai/gpt-5.6-sol', label: 'sol', family: 'openai' },
+      { runner: 'opencode' as const, model: '', label: 'auto', family: 'opencode' },
+      { runner: 'harness' as const, model: 'kimi', label: 'kimi', family: 'moonshot' },
+    ]
+    expect(reviewerOptions(options).map((o) => o.model)).toEqual([
+      'opus',
+      'gpt-5.6-sol',
+      'opencode/glm-5.3',
+      'deepseek/deepseek-v4-pro',
+      'kimi',
+    ])
+  })
 
   it('advisorHarnessOptions carries certification through from /harness/status', () => {
     const status = {

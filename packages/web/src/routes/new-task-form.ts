@@ -384,6 +384,9 @@ export function withoutHarnessWorkflows(workflows: readonly WorkflowDef[]): Work
 export interface HarnessModelOption extends HarnessModelRef {
   label: string
   family: string
+  /** The catalog's description, e.g. "Opus 5.5 with 1M context". An alias like `opus` names no
+   *  version on its own, and the picker showing only "Opus" read as "Opus 5.5 is missing". */
+  desc?: string
   /** Recorded eval-gate evidence (spec 2026-08-06-eval-gated-model-routing), carried from
    *  `/harness/status`. Absent on runner options — only configured bindings are certified. */
   certification?: HarnessCertification
@@ -441,9 +444,19 @@ export function modelFamilyOf(ref: HarnessModelRef): string {
  *  DeepSeek via API, kimi via its subscription CLI, Zen presets — executed by the
  *  runtime's review council, not a runner session (spec 2026-07-24-advisor-reviewers).
  *  Reviewer-only: the other roles filter these out. */
-export function advisorHarnessOptions(status?: HarnessStatusResponse): HarnessModelOption[] {
+export function advisorHarnessOptions(
+  status?: HarnessStatusResponse,
+  runnerOptions: readonly HarnessModelOption[] = [],
+): HarnessModelOption[] {
+  // One row per model (2026-09-29). A binding the server reports as `sameAs` a runner-backed
+  // reviewer makes that reviewer's exact call, so it is dropped when that reviewer is already
+  // listed — and kept when it is not (OpenCode missing, a model its catalog lacks), so no
+  // route disappears.
+  const listed = (ref: { runner: string; model: string }) =>
+    runnerOptions.some((option) => option.runner === ref.runner && option.model === ref.model)
   return (status?.models ?? [])
     .filter((m) => m.adapter !== undefined && m.adapter !== 'host' && m.roles.includes('reviewer'))
+    .filter((m) => !(m.sameAs && listed(m.sameAs)))
     .map((m) => ({
       runner: 'harness' as const,
       model: m.id,
@@ -688,11 +701,55 @@ export function sessionRoleOptions(
   )
 }
 
+/**
+ * The OpenCode providers a reviewer can be routed through — the keys of `GATEWAYS` in
+ * `packages/cezar/src/harness/reviewer-binding.ts` (a test there holds the two lists equal). An
+ * OpenCode reviewer becomes one structured call to its gateway; any other provider prefix
+ * (`openai/…` through OpenCode's own login, the bare `auto`) has no such call, and the server
+ * refuses the start with "no structured review path".
+ */
+export const REVIEWER_GATEWAYS: readonly string[] = ['opencode', 'deepseek']
+
+/** What each reviewer gateway IS, for the picker. An `opencode/…` or `deepseek/…` reviewer is one
+ *  HTTPS call to that provider with your key — OpenCode only stores the key — so labelling the
+ *  row `opencode ·` read as "through OpenCode" (2026-09-30: "I want DeepSeek via my API, not
+ *  through opencode" — it already was). Keys match {@link REVIEWER_GATEWAYS}. */
+const GATEWAY_NAMES: Readonly<Record<string, string>> = { opencode: 'Zen', deepseek: 'DeepSeek API' }
+
+/** One lineup ref as the picker shows it: `Zen · glm-5.3`, `DeepSeek API · deepseek-v4-pro`,
+ *  `claude · Opus`. `label` is the catalog's display name when there is one. */
+export function harnessRefDisplay(ref: HarnessModelRef, label?: string): string {
+  if (ref.runner === 'opencode') {
+    const slash = ref.model.indexOf('/')
+    const name = slash > 0 ? GATEWAY_NAMES[ref.model.slice(0, slash)] : undefined
+    if (name) return `${name} · ${ref.model.slice(slash + 1)}`
+  }
+  return `${ref.runner} · ${label ?? (ref.model || 'auto')}`
+}
+
+/**
+ * The models a REVIEWER seat can hold: everything except OpenCode models no gateway can
+ * reach. Offering those only let the user build a council that could never start (2026-09-29).
+ */
+export function reviewerOptions(options: readonly HarnessModelOption[]): HarnessModelOption[] {
+  return options.filter((option) => {
+    if (option.runner !== 'opencode') return true
+    const slash = option.model.indexOf('/')
+    return slash > 0 && REVIEWER_GATEWAYS.includes(option.model.slice(0, slash))
+  })
+}
+
 export function defaultHarnessRoles(allOptions: readonly HarnessModelOption[]): HarnessRoles | null {
   const options = sessionRoleOptions(allOptions)
   const families = [...new Set(options.map((o) => o.family))]
   if (families.length < 2 || options.length < 2) return null
-  const byFamily = (family: string) => options.filter((o) => o.family === family)
+  // Named models first. `auto` (model '') is whatever the CLI picks on its own, and for a Codex
+  // ChatGPT login that is a model the account refuses — the zero-config lineup opened blocked
+  // on a red implementer (2026-09-28). `auto` stays the fallback for a family with no catalog.
+  const byFamily = (family: string) => {
+    const members = options.filter((o) => o.family === family)
+    return [...members.filter((o) => o.model !== ''), ...members.filter((o) => o.model === '')]
+  }
   const anthropic = byFamily('anthropic')
   const orchestrator = anthropic.find((o) => o.model === 'sonnet') ?? anthropic[0] ?? options[0]!
   const otherFamily = families.find((f) => f !== orchestrator.family)!
@@ -828,6 +885,20 @@ export function certificationAdvisory(
   if (flagged.length === 0) return null
   const parts = flagged.map((f) => `${f.label} — ${f.why}`).join('; ')
   return `${parts}. Runs are unaffected; their review results are simply unverified by the eval suite.`
+}
+
+/**
+ * The probe's verdict for one lineup seat. The probe ids a ref `runner/model`, with `auto` for
+ * the CLI default — except Claude's default, which it ids `claude` to match the status roster's
+ * host row. Looking up only `claude/auto` left that chip with no dot at all.
+ */
+export function probeReadinessFor(
+  probe: HarnessProbeResponse | undefined,
+  ref: HarnessModelRef,
+): HarnessProbeResponse['models'][number]['readiness'] | undefined {
+  const ids = [`${ref.runner}/${ref.model || 'auto'}`]
+  if (ref.runner === 'claude' && !ref.model) ids.push('claude')
+  return probe?.models.find((model) => ids.includes(model.id))?.readiness
 }
 
 /**

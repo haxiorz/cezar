@@ -343,29 +343,29 @@ export function NewTaskRoute() {
   const harnessStatus = useHarnessStatus(multiModelEnabled)
   const harnessStatusData = harnessStatus.data
   const [harnessBaseReason, setHarnessBaseReason] = useState('')
-  const harnessOptions = useMemo<HarnessModelOption[]>(
-    () => [
-      ...runners.flatMap((r) => {
-        // Pi is a first-class ordinary runner, but the harness has no Pi probe/runtime binding
-        // yet. Do not advertise a lineup the conductor cannot execute.
-        if (r === 'pi') return []
-        return modelsForRunner(
-          r,
-          r === 'codex' ? codexCatalogData : r === 'opencode' ? opencodeCatalogData : claudeCatalogData,
-        ).map((m) => ({
-          runner: r,
-          model: m.id,
-          label: m.label,
-          family: modelFamilyOf({ runner: r, model: m.id }),
-        }))
-      }),
-      ...advisorHarnessOptions(harnessStatusData),
-    ],
-    // `runners` derives from provider status; join to a stable key so the memo
-    // doesn't churn on every render's fresh array identity.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [runners.join(','), claudeCatalogData, codexCatalogData, opencodeCatalogData, harnessStatusData],
-  )
+  const harnessOptions = useMemo<HarnessModelOption[]>(() => {
+    const runnerOptions: HarnessModelOption[] = runners.flatMap((r) => {
+      // Pi is a first-class ordinary runner, but the harness has no Pi probe/runtime binding
+      // yet. Do not advertise a lineup the conductor cannot execute.
+      if (r === 'pi') return []
+      return modelsForRunner(
+        r,
+        r === 'codex' ? codexCatalogData : r === 'opencode' ? opencodeCatalogData : claudeCatalogData,
+      ).map((m) => ({
+        runner: r,
+        model: m.id,
+        label: m.label,
+        family: modelFamilyOf({ runner: r, model: m.id }),
+        // OpenCode's descriptions only say "via <provider>", which the row label already names.
+        ...(m.desc && r !== 'opencode' ? { desc: m.desc } : {}),
+      }))
+    })
+    return [...runnerOptions, ...advisorHarnessOptions(harnessStatusData, runnerOptions)]
+  },
+  // `runners` derives from provider status; join to a stable key so the memo
+  // doesn't churn on every render's fresh array identity.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [runners.join(','), claudeCatalogData, codexCatalogData, opencodeCatalogData, harnessStatusData])
   // Split by transport, because they answer different questions (2026-07-27):
   // orchestrator and implementer can ONLY be runner-backed, so a workspace with
   // one runner family and three configured advisors still cannot field a lineup

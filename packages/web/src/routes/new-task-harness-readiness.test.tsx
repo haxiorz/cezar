@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HarnessModel, HarnessRoles } from '@open-mercato/cezar-api-client'
@@ -239,16 +239,52 @@ describe('composer readiness surface', () => {
   })
 })
 
+describe('model picker rows', () => {
+  it('shows the version an alias resolves to, so "Opus" does not read as "no Opus 5.5"', () => {
+    render(
+      <HarnessPanel
+        mode="implement-feature"
+        onMode={() => {}}
+        roles={roles}
+        onRoles={() => {}}
+        options={[
+          {
+            runner: 'claude',
+            model: 'opus[1m]',
+            label: 'Opus (1M context)',
+            family: 'anthropic',
+            desc: 'Opus 5.5 with 1M context · Best for everyday, complex tasks',
+          },
+          ...options,
+        ]}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Orchestrator model' }))
+
+    expect(screen.getByText('claude · Opus (1M context)')).not.toBeNull()
+    expect(screen.getByText(/Opus 5\.5 with 1M context/)).not.toBeNull()
+  })
+})
+
 describe('humanReadinessError', () => {
   it.each([
     ["codex exec exited 1: The '' model is not supported when using Codex with a ChatGPT account.", /pick a named model/i],
     ['request failed with status 401 unauthorized', /re-authenticate/i],
+    [
+      'https://opencode.ai/zen/v1/chat/completions → 403 {"error":{"type":"server_error","message":"Upstream request failed: Model access is disabled"}}',
+      /switched off for your account/i,
+    ],
     ['429 rate limit exceeded', /rate-limiting/i],
     ['spawn codex ENOENT', /not installed/i],
     ['connect ECONNREFUSED 127.0.0.1:4096', /could not be reached/i],
     ['adapter missing', /no usable binding/i],
   ])('summarises %s', (detail, expected) => {
     expect(humanReadinessError(detail)).toMatch(expected)
+  })
+
+  it('does not send a Zen model the account switched off to re-authentication', () => {
+    const detail = 'https://opencode.ai/zen/v1/chat/completions → 403 {"error":{"message":"Model access is disabled"}}'
+    expect(humanReadinessError(detail)).not.toMatch(/re-authenticate/i)
   })
 
   it('never returns a wall of text for an unrecognised failure', () => {
