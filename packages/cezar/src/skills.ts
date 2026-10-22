@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join, resolve, basename, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
-import { gatedSkillsRepos } from './config.ts';
+import { gatedSkillsRepos, multiModelEnabled } from './config.ts';
 import { getTeamSkillsCached } from './skills-remote.ts';
 import { readUiState } from './ui-state.ts';
 import { builtinSkills } from './automations/builtin-skill.ts';
@@ -105,13 +105,17 @@ export function bundledSkillsDir(): string {
  */
 export async function discoverSkills(
   repoRoot: string,
-  opts: { bundledDir?: string | null } = {},
+  opts: { bundledDir?: string | null; includeHarness?: boolean } = {},
 ): Promise<Skill[]> {
   const layers = await discoverSkillLayers(repoRoot, opts);
+  // Internal recovery keeps its runtime available after the feature is hidden.
+  const includeHarness = opts.includeHarness === true || multiModelEnabled(repoRoot);
   const merged: Skill[] = [];
   const seen = new Set<string>();
   for (const skills of layers) {
     for (const skill of skills) {
+      if (!includeHarness && skill.source === 'bundled' &&
+          (skill.name === 'cez-harness' || skill.name === 'cez-setup-harness')) continue;
       if (seen.has(skill.name)) continue;
       seen.add(skill.name);
       merged.push(skill);

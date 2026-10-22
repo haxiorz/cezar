@@ -69,6 +69,7 @@ import type {
   RunDraftsResponse,
   SetRunDraftInput,
   FinishResponse,
+  LandResponse,
   FsBrowseResponse,
   GitCommitResponse,
   GitPushResponse,
@@ -1707,6 +1708,15 @@ export async function markAllRunsSeen(): Promise<MarkAllReadResponse> {
 }
 
 /** Close a waiting session gracefully — the run completes as done. 409 when nothing is open. */
+export async function landRun(id: string): Promise<LandResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].runs[':id'].land.$post({
+      param: { projectId: queryScope(), id: encodeURIComponent(id) },
+    }),
+    runPath(id, '/land'),
+  )
+}
+
 export async function finishRun(id: string): Promise<FinishResponse> {
   return unwrap(
     await cez.api.v1.p[':projectId'].runs[':id'].finish.$post({
@@ -2577,13 +2587,16 @@ export async function createAgentProfile(
  *  land. `refresh` drops the server's cached answer for this account and re-probes. */
 export async function getAgentAccountStatus(
   routeId: string,
-  opts?: ReadOptions & { refresh?: boolean },
+  opts?: ReadOptions & { refresh?: boolean; recheck?: boolean },
 ): Promise<AgentAccountStatusResponse> {
   return unwrap(
     await cez.api.v1.workspace['agent-profiles'][':id'].status.$get(
       {
         param: { id: encodeURIComponent(routeId) },
-        query: opts?.refresh ? { refresh: '1' } : {},
+        query: {
+          ...(opts?.refresh || opts?.recheck ? { refresh: '1' } : {}),
+          ...(opts?.recheck ? { recheck: '1' } : {}),
+        },
       },
       init(opts),
     ),

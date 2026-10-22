@@ -439,6 +439,18 @@ export const configResponseSchema = z.object({
   /** Multi-model harness feature flag (off by default): gates the harness workflows, the
    *  composer's Multi-model tab and the Settings → Harness section. */
   multiModel: z.boolean(),
+  /** Trunk-based projects (spec 2026-10-20-trunk-based-projects); null = the key is unset
+   *  and the branch-per-task default applies. */
+  profile: z.enum(['branches', 'trunk']).nullable(),
+  taskWorkspace: z.enum(['worktree', 'in-place']).nullable(),
+  landing: z.enum(['review', 'auto']).nullable(),
+  /** Why `landing: auto` is not honored here (a git-tracked config.json), or null. */
+  landingBlocked: z.string().nullable(),
+  requiredChecks: z.array(z.string()),
+  defaultSkill: z.string().nullable(),
+  askSkill: z.string().nullable(),
+  /** False when `skillsRepos` is `[]` — team skill repositories are off for this project. */
+  teamSkills: z.boolean(),
 });
 export type ConfigResponse = z.infer<typeof configResponseSchema>;
 
@@ -494,6 +506,16 @@ export const setConfigInputSchema = z.object({
   reviewGate: z.boolean().nullable().optional(),
   /** Multi-model harness feature flag: null clears the key back to the default (OFF). */
   multiModel: z.boolean().nullable().optional(),
+  /** Trunk-based keys (spec 2026-10-20-trunk-based-projects): `null` clears each back to
+   *  the branch-per-task default. */
+  profile: z.enum(['branches', 'trunk']).nullable().optional(),
+  taskWorkspace: z.enum(['worktree', 'in-place']).nullable().optional(),
+  landing: z.enum(['review', 'auto']).nullable().optional(),
+  requiredChecks: z.array(z.string().trim().min(1).max(2_000)).max(10).nullable().optional(),
+  defaultSkill: z.string().trim().max(200).nullable().optional(),
+  askSkill: z.string().trim().max(200).nullable().optional(),
+  /** `false` writes `skillsRepos: []`; `true` drops that override back to the default repos. */
+  teamSkills: z.boolean().optional(),
 });
 export type SetConfigInput = z.infer<typeof setConfigInputSchema>;
 

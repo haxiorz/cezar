@@ -736,6 +736,7 @@ function WorkspaceView({
         tabs={tabs}
         headerActions={headerActions}
         orderedSteps={orderedSteps}
+        hideWorkflowProgress={Boolean(harness.data) && layouts.layout?.columns.some((column) => column.view === 'session')}
         wide
       />
       {layouts.loadFailed ? (

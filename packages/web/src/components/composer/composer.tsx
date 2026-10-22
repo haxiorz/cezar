@@ -155,6 +155,15 @@ export interface ComposerHandle {
 
 const QUICK_REPLIES: Record<string, string> = { KeyA: 'Yes, approved.', KeyC: 'Continue.' }
 
+/** Every scrolled ancestor with its scrollTop, so the autosize pass can put them back. */
+function scrollAncestors(el: HTMLElement): Array<[Element, number]> {
+  const out: Array<[Element, number]> = []
+  for (let node = el.parentElement; node; node = node.parentElement) {
+    if (node.scrollTop > 0) out.push([node, node.scrollTop])
+  }
+  return out
+}
+
 export function Composer({
   onSubmit,
   value,
@@ -349,8 +358,12 @@ export function Composer({
   useLayoutEffect(() => {
     const el = textareaRef.current
     if (!el) return
+    // The `auto` pass collapses the box for a moment; inside the task's sticky dock that shrinks
+    // the shared scroller, which clamps its scrollTop and jumps the thread on every keystroke.
+    const scrolled = scrollAncestors(el)
     el.style.height = 'auto'
     el.style.height = `${Math.min(el.scrollHeight, 220)}px`
+    for (const [node, top] of scrolled) if (node.scrollTop !== top) node.scrollTop = top
   }, [text])
 
   // ---- attachments ---------------------------------------------------------------------------
@@ -431,7 +444,7 @@ export function Composer({
             if (!next) dropped.push(a)
             return next ?? list
           }, messageImages)
-          for (const a of dropped) toast(`${a.name} removed — the restored message fills the attachment limit`, { tone: 'danger' })
+          for (const a of dropped) toast(`“${a.name}” removed — the restored message fills the attachment limit`, { tone: 'danger' })
           setImages(restored)
         }
       } finally {

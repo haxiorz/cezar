@@ -6,7 +6,7 @@ import {
   SparklesIcon,
   SquareIcon,
 } from 'lucide-react'
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link as GlobalLink, useParams, useSearchParams } from 'react-router'
 
 import { Link, useNavigate } from '@/lib/project-router'
@@ -54,6 +54,7 @@ import {
 } from '@/components/ui/command'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { toast } from '@/components/ui/toaster'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   autoApplyText,
   availablePromptTemplates,
@@ -76,7 +77,9 @@ import {
 } from './new-task-autostart'
 import {
   clearStartedDraft,
+  autoLandsUnreviewed,
   composerRunModeNote,
+  explicitWorktreeFor,
   handOffComposition,
   readAttachments,
   readDraft,
@@ -104,6 +107,8 @@ import {
   pushRecentSource,
   resolveModel,
   resolveRunner,
+  looksLikeQuestion,
+  projectDefaultSource,
   resolveSource,
   startedRunPath,
   withoutHarnessWorkflows,
@@ -145,6 +150,7 @@ function HarnessPanelLoading() {
  * web/app.js, verbatim (see new-task-autostart.ts for the verified semantics).
  */
 export function NewTaskRoute() {
+  const composerTabsId = useId()
   const [search] = useSearchParams()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -237,7 +243,6 @@ export function NewTaskRoute() {
   // only to the Multi-model surface while ordinary Task composition resolves against its
   // filtered catalog.
   const rawSource = resolveSource(draft.source, skillList, workflowList)
-  const source = resolveSource(draft.source, skillList, taskWorkflows)
 
   // ---- cez-harness / Multi-model tab (role-based, user feedback 2026-07-24) -----------------
   // Feature flag (off by default): with `multiModel` unset or false the Multi-model tab is not
@@ -249,6 +254,22 @@ export function NewTaskRoute() {
   const harnessMode =
     draft.harnessMode ?? HARNESS_MODES.find((m) => m.workflow === rawSource?.ref)?.id ?? 'fix-issue'
   const harnessSkillProfile = draft.harnessSkillProfile ?? 'generic'
+  // The draft's pick alone — a fresh `/new` selects nothing (see `resolveSource` for what the
+  // persisted `lastTask` preselection was load-bearing for, and why it is gone).
+  // Trunk-based projects (spec 2026-10-20-trunk-based-projects): an in-place project offers
+  // the Ask chip, a trunk-based project asks on its own when the message is a question, and nothing
+  // picked falls back to the project's default (or Ask) skill.
+  const inPlaceByDefault = config.data?.taskWorkspace === 'in-place'
+  const askOffered = repo.data?.info != null && (inPlaceByDefault || config.data?.profile === 'trunk')
+  const askWanted =
+    composerMode !== 'multi' &&
+    askOffered &&
+    draft.variants <= 1 &&
+    draft.dispatch === null &&
+    (draft.readOnly ?? (config.data?.profile === 'trunk' && looksLikeQuestion(draft.text)))
+  const source =
+    resolveSource(draft.source, skillList, taskWorkflows) ??
+    projectDefaultSource(config.data, askWanted, skillList)
   const selectedSkill = source?.source === 'skill'
     ? skillList.find((skill) => skill.name === source.ref)
     : undefined
@@ -393,9 +414,11 @@ export function NewTaskRoute() {
   )
   const harnessProbeBlock = harnessStartBlock(
     harnessProbe.data,
-    harnessProbe.isPending,
+    harnessProbe.isPending || harnessProbe.isFetching,
     harnessProbe.isError,
   )
+  const harnessCatalogsLoading = providers.isPending || harnessStatus.isPending ||
+    runners.filter(isHarnessRunner).some((candidate) => harnessCatalogs[candidate].isPending)
   const [harnessSetupOpen, setHarnessSetupOpen] = useState(false)
   useEffect(() => {
     // Opening the Multi-model tab without the models to field a council prompts setup
@@ -405,9 +428,9 @@ export function NewTaskRoute() {
     // `/harness/status` land asynchronously, so the first render of this tab is
     // always "blocked", and a dialog that only ever opened then sat on top of a
     // perfectly valid lineup once the data arrived.
-    if (health.data === undefined) return
+    if (harnessCatalogsLoading) return
     setHarnessSetupOpen(composerMode === 'multi' && harnessBlocked)
-  }, [composerMode, harnessBlocked, health.data !== undefined]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [composerMode, harnessBlocked, harnessCatalogsLoading]) // eslint-disable-line react-hooks/exhaustive-deps
   // Saved lineups (2026-07-24) live in the project's ui-state — passthrough by design, so
   // this is purely additive client state. Save replaces a same-named preset; the list caps.
   const uiHarnessPresets = uiState.data?.harnessPresets
@@ -415,7 +438,7 @@ export function NewTaskRoute() {
   const persistHarnessPresets = (next: HarnessPreset[]) => {
     void putUiState({ harnessPresets: next })
       .then(() => queryClient.invalidateQueries({ queryKey: queryKeys.uiState }))
-      .catch(() => {})
+      .catch(() => toast('Could not save your model lineups. Try again.', { tone: 'danger' }))
   }
   const saveHarnessPreset = (name: string) => {
     if (harnessRoles === null) return
@@ -485,14 +508,17 @@ export function NewTaskRoute() {
     hasGit,
     variants,
     explicitAutonomous: draft.autonomous,
-    explicitWorktree: draft.worktree,
+    explicitWorktree: explicitWorktreeFor(draft, config.data?.taskWorkspace),
     interactive: selectedSkill?.interactive,
-    configuredAutonomous:
+    configuredAutonomous: autoLandsUnreviewed(
       workspaceConfig.data?.composerDefaults?.autonomous
       ?? workspaceConfig.data?.composerDefaults?.inheritedAutonomous
       ?? 'source-dependent',
-    configuredWorktree:
-      workspaceConfig.data?.composerDefaults?.worktree
+      config.data?.landing === 'auto',
+    ),
+    configuredWorktree: config.data?.taskWorkspace
+      ? config.data.taskWorkspace === 'worktree'
+      : workspaceConfig.data?.composerDefaults?.worktree
       ?? workspaceConfig.data?.composerDefaults?.inheritedWorktree
       ?? true,
     // Nothing picked runs the plain built-in workflow, and the 'source-dependent' autonomy
@@ -500,7 +526,8 @@ export function NewTaskRoute() {
     source: source?.source ?? 'workflow',
     dispatch: dispatchOn,
   })
-  const worktreeOn = runMode.worktree
+  const askOn = askWanted && !dispatchOn && variants <= 1
+  const worktreeOn = runMode.worktree && !askOn
   const autonomousOn = runMode.autonomous
 
   // Follow-up generation (#444) is offered only while the server has the global inbox on
@@ -715,6 +742,8 @@ export function NewTaskRoute() {
         // generation for THIS task must not stop the entry it came from being marked started.
         todoId: deepLink.todo,
         dispatch,
+        readOnly: askOn,
+        inPlaceByDefault,
       }),
     )
     trackMessageSent('new_task')
@@ -796,7 +825,11 @@ export function NewTaskRoute() {
       <TwinkleBackdrop />
       <GhostCodeBackdrop />
 
-      <div className="w-full max-w-[720px]">
+      <Tabs
+        value={composerMode}
+        onValueChange={(value) => update({ composerMode: value === 'multi' ? 'multi' : 'task' })}
+        className="w-full max-w-[720px] gap-0"
+      >
         <header className="mb-4 text-center max-md:mb-3">
           <h1 className="text-lg font-semibold tracking-tight max-md:text-base">
             What should the agent work on?
@@ -813,6 +846,8 @@ export function NewTaskRoute() {
                   dispatch: dispatchOn,
                   autonomous: autonomousOn,
                   newBranch: draft.newBranch,
+                  readOnly: askOn,
+                  autoLand: config.data?.landing === 'auto' && config.data.landingBlocked === null,
                 })}
           </p>
         </header>
@@ -823,16 +858,14 @@ export function NewTaskRoute() {
             the whole strip disappears rather than rendering a single-tab tablist. */}
         {multiModelEnabled ? (
         <div className="mb-3 flex justify-center">
-          <div
-            role="tablist"
+          <TabsList
             aria-label="Composer mode"
             className="inline-flex items-center gap-0.5 rounded-lg bg-muted p-[3px]"
           >
-            <button
-              type="button"
-              role="tab"
-              aria-selected={composerMode === 'task'}
-              onClick={() => update({ composerMode: 'task' })}
+            <TabsTrigger
+              value="task"
+              id={`${composerTabsId}-task`}
+              aria-controls={`${composerTabsId}-panel`}
               className={cn(
                 'h-7 rounded-md px-3 text-[12.5px] transition-colors',
                 composerMode === 'task'
@@ -841,13 +874,12 @@ export function NewTaskRoute() {
               )}
             >
               Task
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={composerMode === 'multi'}
+            </TabsTrigger>
+            <TabsTrigger
+              value="multi"
+              id={`${composerTabsId}-multi`}
+              aria-controls={`${composerTabsId}-panel`}
               data-slot="multi-model-tab"
-              onClick={() => update({ composerMode: 'multi' })}
               className={cn(
                 'inline-flex h-7 items-center gap-1.5 rounded-md px-3 text-[12.5px] transition-colors',
                 composerMode === 'multi'
@@ -857,11 +889,18 @@ export function NewTaskRoute() {
             >
               <SparklesIcon aria-hidden="true" className="size-3 text-violet" />
               Multi-model
-            </button>
-          </div>
+            </TabsTrigger>
+          </TabsList>
         </div>
         ) : null}
 
+        <TabsContent
+          value={composerMode}
+          id={`${composerTabsId}-panel`}
+          role={multiModelEnabled ? 'tabpanel' : undefined}
+          aria-labelledby={multiModelEnabled ? `${composerTabsId}-${composerMode}` : undefined}
+          tabIndex={multiModelEnabled ? 0 : undefined}
+        >
         <Composer
           ref={composerRef}
           onSubmit={submit}
@@ -987,7 +1026,10 @@ export function NewTaskRoute() {
                   extras (templates, dispatch) | WHERE it forks from. The dividers only
                   exist on md-and-up; a phone wraps the row and a divider mid-wrap is noise. */}
               <PillDivider />
-              {worktreeToggleShown ? (
+              {askOffered ? (
+                <AskToggle on={askOn} auto={draft.readOnly === undefined} onChange={(on) => update({ readOnly: on })} />
+              ) : null}
+              {worktreeToggleShown && !askOn ? (
                 <WorktreeToggle
                   on={worktreeOn}
                   disabled={worktreeForced}
@@ -996,10 +1038,10 @@ export function NewTaskRoute() {
                       ? "Dispatch forks this task's commits — subtasks need a worktree"
                       : 'Parallel variants always use isolated worktrees'
                   }
-                  onChange={(on) => update({ worktree: on })}
+                  onChange={(on) => update({ worktree: on, worktreeBasis: config.data?.taskWorkspace ?? 'default' })}
                 />
               ) : null}
-              {worktreeToggleShown && !worktreeOn ? (
+              {worktreeToggleShown && !worktreeOn && !askOn ? (
                 <NewBranchToggle
                   on={draft.newBranch === true}
                   name={draft.branchName ?? ''}
@@ -1103,6 +1145,9 @@ export function NewTaskRoute() {
               skillProfile={harnessSkillProfile}
               onSkillProfile={(next) => update({ harnessSkillProfile: next })}
               probe={harnessProbe.data}
+              probePending={harnessProbe.isFetching}
+              probeError={harnessProbe.isError ? 'Model readiness could not be verified. Try again.' : undefined}
+              onRetryProbe={() => { void harnessProbe.refetch() }}
               base={harnessStatusData?.base}
               baseAcknowledgementReason={harnessBaseReason}
               onBaseAcknowledgementReason={setHarnessBaseReason}
@@ -1134,7 +1179,8 @@ export function NewTaskRoute() {
             />
           </Suspense>
         ) : null}
-      </div>
+        </TabsContent>
+      </Tabs>
 
     </div>
   )
@@ -1143,6 +1189,33 @@ export function NewTaskRoute() {
 /** The thin seam between the footer's pill clusters. Hidden on phones, where the row wraps. */
 function PillDivider() {
   return <span aria-hidden="true" className="mx-0.5 h-3.5 w-px shrink-0 bg-border max-md:hidden" />
+}
+
+/** The Ask chip (spec 2026-10-20-trunk-based-projects): a read-only question about the
+ *  checkout — no branch, no lease, nothing lands. */
+function AskToggle({ on, auto, onChange }: { on: boolean; auto: boolean; onChange: (on: boolean) => void }) {
+  return (
+    <button
+      type="button"
+      role="checkbox"
+      aria-checked={on}
+      data-slot="ask-toggle"
+      onClick={() => onChange(!on)}
+      title={
+        on
+          ? `Read-only question — answers from the checkout, changes nothing${auto ? ' (picked because the message is a question)' : ''}`
+          : 'Check to ask a read-only question instead of filing a change'
+      }
+      className={cn(chipClass, on && 'border-primary/60 text-foreground')}
+    >
+      {on ? (
+        <CheckIcon aria-hidden="true" className="size-3 shrink-0 text-primary" />
+      ) : (
+        <SquareIcon aria-hidden="true" className="size-3 shrink-0 text-soft-foreground" />
+      )}
+      Ask
+    </button>
+  )
 }
 
 /** Worktree opt-out toggle (#worktree-toggle): a checkbox-style chip for ordinary runs.

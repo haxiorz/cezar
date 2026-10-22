@@ -120,7 +120,7 @@ type SettingsTree = ReturnType<typeof useSettingsTree>
 /**
  * The capabilities plus the `multiModel` config flag of the project the URL names, which the
  * registry uses to hide the Harness section while the feature is off (default). Only that
- * project's config is loaded, so other projects' rows keep the section; routes stay registered
+ * project's config is loaded, so other projects' rows hide the section; routes stay registered
  * either way (routes.tsx cannot know a project's config), and the section explains the gate
  * itself on a direct URL.
  */

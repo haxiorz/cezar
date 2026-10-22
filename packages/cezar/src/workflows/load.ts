@@ -2,7 +2,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { extname, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { loadConfig } from '../config.ts';
-import { harnessWorkflowDefs } from '../harness/workflows.js';
+import { harnessWorkflowDefs, isHarnessWorkflow } from '../harness/workflows.js';
 import { graphIssues, graphToSteps, workflowGraphFileSchema } from './graph.ts';
 import { BUILT_IN_GRAPH_WORKFLOWS } from './templates.ts';
 import {
@@ -103,7 +103,7 @@ export async function loadWorkflows(
   const fileNames = new Set(fromFiles.map((w) => w.name));
   const builtIns = [QUICK_TASK_WORKFLOW, ...BUILT_IN_GRAPH_WORKFLOWS, ...(multiModel ? harnessWorkflowDefs() : [])];
   const workflows = [
-    ...fromFiles,
+    ...fromFiles.filter((workflow) => multiModel || !isHarnessWorkflow(workflow.name)),
     ...builtIns.filter((w) => !fileNames.has(w.name)),
   ];
   workflows.sort((a, b) => a.name.localeCompare(b.name));

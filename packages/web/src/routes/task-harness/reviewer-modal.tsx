@@ -50,7 +50,7 @@ function ReviewerConversation({
   onSelect: (id: string) => void
 }) {
   const ordered = [...invocations].reverse()
-  const detail = useHarnessInvocation(runId, openId)
+  const detail = useHarnessInvocation(runId, openId, invocations.find((entry) => entry.id === openId))
 
   if (ordered.length === 0) return null
 
@@ -231,7 +231,10 @@ export function ReviewerModal({
   const selectAttempt = (id: string) => {
     if (reviewerId) setAttemptByReviewer((current) => ({ ...current, [reviewerId]: id }))
   }
-  const attemptDetail = useHarnessInvocation(runId, openAttemptId)
+  const attemptDetail = useHarnessInvocation(
+    runId, open ? openAttemptId : null,
+    invocations.find((entry) => entry.id === openAttemptId),
+  )
   const attemptFindings = parseReviewFindings(attemptDetail.data?.result ?? null)
   const attemptNumber =
     openAttemptId === null

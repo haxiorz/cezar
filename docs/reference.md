@@ -469,7 +469,7 @@ Useful environment variables:
 
 | Var | Effect |
 |---|---|
-| `CEZ_DRY_RUN=1` | Use the bundled mock instead of the real `claude` CLI — the entire cockpit works offline, for demos and development. |
+| `CEZ_DRY_RUN=1` | Use the bundled mock instead of the real `claude` CLI for offline demos and development. Multi-model harness probes and execution report unavailable without invoking live models; stored review evidence remains readable. |
 | `CEZ_TELEMETRY=0` | Block usage telemetry even after you opted in. Telemetry is opt-in — nothing is sent until you answer yes in the cockpit, Settings → Privacy or `cezar telemetry enable` ([docs/telemetry.md](telemetry.md)). `DO_NOT_TRACK=1` works too. `CEZ_TELEMETRY=1` only lifts the CI / test-runner / `CEZ_DRY_RUN=1` block; it never grants consent. |
 | `CEZ_INSTANCE_ID` | Internal server-install identity set automatically in generated systemd/launchd services; normally leave unset. It is surfaced additively by `/api/v1/health` for install verification. |
 | `CEZ_AGENT_MODELS_LOCKED=1` | Globally lock each runner to the model configured in its native Claude/Codex/OpenCode settings while keeping runner selection available. Exact `1` also delegates authentication and provider enablement to those native agents, so Cezar skips its credential probes and provider-disable preferences. Existing Cezar presets are preserved but ignored, and an environment change requires a restart. The config-file equivalent is `"modelsLocked": true` in global `~/.cezar/config.json` or one repository's `.ai/cezar/config.json`; config-file locks do not disable provider checks. |
@@ -719,6 +719,10 @@ works and how to redeploy new versions.
 
 ## Configuration (optional)
 
+The experimental multi-model harness is hidden by default. Enable it per repository
+with `"multiModel": true` in `.ai/cezar/config.json`; see
+[the opt-in and recovery behavior](multi-model-harness.md#enabling-the-feature).
+
 Zero config is the default — everything below is opt-in via
 `.ai/cezar/config.json` (a missing or invalid file simply uses the defaults, and
 never blocks startup; configured lifecycle transitions pause on malformed configuration rather than treating it as an empty cleanup list):
@@ -740,12 +744,29 @@ never blocks startup; configured lifecycle transitions pause on malformed config
   "branchNaming": "your branch naming preferences",
                              // optional: task branches are named from the first prompt under these
                              // instructions (Settings → Instructions); absent = cez/<id8>
+  // Trunk-based projects (Settings → Tasks → Development model); every key optional:
+  "taskWorkspace": "in-place", // tasks work in the checkout, write tasks one at a time
+  "landing": "auto",           // finished in-place tasks commit, rebase, run requiredChecks, push
+                               // (ignored while this file is tracked by git)
+  "requiredChecks": ["npm test"],
+  "defaultSkill": "my-skill",   // composer preselect; "askSkill" for read-only Ask tasks
   "startApp": { "services": ["npm run api", "npm run web"], "url": "http://localhost:5173" }
                              // optional: what the Preview's Start app runs, each service in its own
                              // terminal tab; url = the address to show (absent: the first one printed).
                              // A `startApp` in your project entry of ~/.cezar/config.json wins.
 }
 ```
+
+**Trunk-based projects** (many small changes that should land straight on the
+base branch — a docs or notes repo, a config repo, a solo project): set
+**Settings → Tasks → Development model** to *Trunk-based*. Tasks then run in the
+repo checkout instead of a worktree, write tasks take turns so two tasks never
+conflict. A finished task waits for your review in Changes; reply with
+corrections, then **Finish** commits, rebases on the remote, runs
+`requiredChecks` and pushes to the base branch. Autonomous tasks land on their
+own. A failed rebase or check goes back to the agent. The composer's **Ask** chip starts a
+read-only question: no branch, no lease, runs beside a write task. Spec:
+`.ai/specs/2026-10-20-trunk-based-projects.md`.
 
 Put the same `"modelsLocked": true` key in `~/.cezar/config.json` to apply it
 to every registered project. When the key is absent or `false` in both config

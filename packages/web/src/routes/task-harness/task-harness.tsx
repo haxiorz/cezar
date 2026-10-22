@@ -89,8 +89,8 @@ function HarnessLoadState({
 function useHarnessRouteState() {
   const { id } = useParams<{ id: string }>()
   const run = useRun(id)
-  const harness = useRunHarness(id, Boolean(run.data?.harness))
   const events = useRunEvents(id)
+  const harness = useRunHarness(id, Boolean(run.data?.harness), events)
   const lastHarnessSeq = events.reduce(
     (max, event) => (event.type.startsWith('harness.') ? Math.max(max, event.seq) : max),
     0,
@@ -118,7 +118,7 @@ function HarnessPage({
   return (
     <OpenReviewerContext.Provider value={setOpenReviewer}>
     <div data-route={`task-harness-${tab}`} className="flex min-h-full flex-col">
-      <RunHeader run={run} tab={tab} orderedSteps={orderStepsByLedger(run.steps, ledger)} />
+      <RunHeader run={run} tab={tab} orderedSteps={orderStepsByLedger(run.steps, ledger)} hideWorkflowProgress />
       {/* Same shell width as the header (review 2026-07-27): these two used to
           cap at 1120px and 820px respectively, so at any viewport above 820px
           the header block and the content cards were visibly out of line. */}
@@ -131,7 +131,7 @@ function HarnessPage({
           />
         </div>
       </div>
-      <main
+      <div
         className={cn('flex flex-1 flex-col gap-3 px-4 py-5 md:px-6', runShellClass(true))}
       >
         <div className={RUN_RAIL_GRID}>
@@ -143,7 +143,7 @@ function HarnessPage({
             onOpenReviewer={setOpenReviewer}
           />
         </div>
-      </main>
+      </div>
       <HarnessTimelineDialog ledger={ledger} open={timelineOpen} onOpenChange={setTimelineOpen} />
       <ReviewerModal
         runId={run.id}

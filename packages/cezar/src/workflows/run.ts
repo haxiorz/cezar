@@ -64,7 +64,10 @@ import { getTeamSkillsCached, materializeSkillDir, waitForTeamSkills } from '../
 import { provisionSkills } from '../skills-provision.ts';
 import { seedAgentConfigLocalLayer } from '../agent-config/seed.ts';
 import { readAgentModelProvider } from '../agent-config/models.ts';
-import { loadConfig, resolveWorktreeRetention } from '../config.ts';
+import { loadConfig, multiModelEnabled, resolveWorktreeRetention, type CezConfig } from '../config.ts';
+import { isLifecycleConfigTracked } from '../worktree-lifecycle/config.ts';
+import { generateCommitMessage } from './commit-message.ts';
+import { hasUnlanded, landInPlace, landingPromptPart, READ_ONLY_PROMPT, READ_ONLY_TOOLS, type LandResult } from './landing.ts';
 import { deleteRunLayouts } from '../runs/layouts.ts';
 import {
   autosaveCommit,
@@ -491,6 +494,8 @@ const REPOSITORY_ROOT_LOCK_DISABLED_NOTE =
   'repository-root lock disabled by CEZ_DISABLE_REPO_LOCK=1 (shared checkout is unsafe)';
 
 interface ActiveRun {
+  /** Existing harness runs keep their private skill catalog when the feature is disabled. */
+  includeHarnessSkills: boolean;
   /** Identity of this async owner; stale promises must not mutate a replacement owner. */
   ownerToken: symbol;
   cancelled: boolean;
@@ -610,6 +615,11 @@ interface ActiveRun {
    *  Worktree-backed runs never need it; root runs ordinarily do unless the
    *  explicit unsafe bypass is active. */
   releaseRepoRoot?: () => void;
+  /** Auto-land policy of an in-place run (spec 2026-10-20-trunk-based-projects). Set at BOTH
+   *  construction sites (`execute`, `runContinuation`) through `landingPolicy`. */
+  autoLand?: { checks: string[]; baseBranch?: string; baseLabel: string; attempts: number; inFlight?: Promise<LandResult> };
+  /** A read-only Ask task: read-only tools, no repo-root lease. */
+  readOnly?: boolean;
   /** An in-place run (`cwd === repoRoot`) that parked — on a question, or as a monitor waiting
    *  for its dispatched children — gives the exclusive working-tree lease back while it sits
    *  (`parkRepoRoot`), so other in-place tasks are not stuck behind a session that is not
@@ -632,6 +642,36 @@ interface ActiveRun {
 /** Safety cap on autonomous auto-continues per run — stops a stuck agent from nudging forever.
  *  Exported so the tests assert against the real cap instead of restating `40`. */
 export const MAX_AUTO_CONTINUES = 40;
+/** Auto-land failures handed back to the agent before the run gives up (spec 2026-10-20-trunk-based-projects). */
+export const MAX_LAND_ATTEMPTS = 3;
+
+/** What the header's Commit step answers (`POST /runs/:id/land`). */
+export interface LandAnswer {
+  outcome: 'landed' | 'nothing' | 'failed' | 'busy' | 'unavailable';
+  message: string;
+  sha?: string;
+  pushed?: boolean;
+}
+
+function landFailurePrompt(outcome: Extract<LandResult, { result: 'failed' }>): string {
+  return `cezar could not land your changes — ${outcome.stage} failed:\n\n${outcome.error}\n\nFix this, then end your turn with CEZ:DONE again.`;
+}
+
+function landAnswer(outcome: LandResult, base: string, withAgent: boolean): LandAnswer {
+  if (outcome.result === 'landed') {
+    return {
+      outcome: 'landed',
+      message: `landed ${outcome.sha.slice(0, 8)} on ${base}${outcome.pushed ? ' and pushed' : ' (committed locally — no upstream)'}`,
+      sha: outcome.sha,
+      pushed: outcome.pushed,
+    };
+  }
+  if (outcome.result === 'nothing') return { outcome: 'nothing', message: 'nothing to commit' };
+  return {
+    outcome: 'failed',
+    message: withAgent ? `${outcome.stage} failed — sent back to the agent to fix` : `${outcome.stage} failed`,
+  };
+}
 /** The turn-end nudge text for `#autonomous`. Exported because `scripts/mock-claude.mjs`
  *  RECOGNISES this string to answer a nudge with `CEZ:DONE` (it matches the opening words, since
  *  the nudge carries no `mock:` marker of its own). Rewording it without updating that mock does
@@ -820,6 +860,9 @@ export interface StartRunInput {
    *  (spec 2026-10-19-repo-git-sync). `branch` names it; else the namer, else `cez/<id8>`. */
   newBranch?: boolean;
   branch?: string;
+  /** A read-only Ask task (spec 2026-10-20-trunk-based-projects): in place, read-only tools,
+   *  no repo-root lease, never lands. Wins over `worktree`, `newBranch` and dispatch. */
+  readOnly?: boolean;
   /** Autonomous mode (#autonomous): the run never parks at `waiting` for the
    *  user — turn-ends auto-continue until the agent signals done or the safety
    *  cap is hit. No "needs you" is ever raised. */
@@ -1573,7 +1616,16 @@ export class RunManager {
     input: StartRunInput,
     group?: { groupId: string; variant: string },
   ): RunRecord {
+    if (input.readOnly && !group) {
+      input = { ...input, worktree: false, newBranch: undefined, dispatchIntent: undefined, forkRef: undefined };
+    }
     if (isHarnessWorkflow(workflow.name)) {
+      if (!multiModelEnabled(this.repoRoot)) {
+        throw new Error('multi-model workflows require the multiModel feature flag');
+      }
+      if (input.readOnly) {
+        throw new Error('harness workflows cannot run in read-only mode');
+      }
       if (input.worktree === false) {
         throw new Error('harness workflows require an isolated git worktree');
       }
@@ -1660,6 +1712,7 @@ export class RunManager {
     if (run.worktree === false && input.newBranch) {
       this.store.updateRun(run.id, { inPlaceBranch: true, ...(input.branch ? { branch: input.branch } : {}) });
     }
+    if (run.worktree === false && input.readOnly) this.store.updateRun(run.id, { readOnly: true });
     // A pull-request head run (spec 2026-10-06-agentic-e2e-checks Phase 3): the fetched sha is
     // recorded as the fork point BEFORE the run is queued, so `execute` — and a restart that
     // revives the queued run — forks from it through the "recorded fork point wins" rule rather
@@ -2049,6 +2102,7 @@ export class RunManager {
         dispatch: run.dispatch,
         // Preserve an explicit worktree opt-out across a queued restart.
         worktree: run.worktree,
+        ...(run.readOnly ? { readOnly: true } : {}),
       }),
     });
     this.queue.push(run.id);
@@ -2312,7 +2366,11 @@ export class RunManager {
     // continuation (or another owner) may have claimed the same run id by the time that old
     // promise reaches finally; never let stale cleanup release the newer owner's slot.
     if (expectedState !== undefined && state !== expectedState) return;
-    if (state?.acceptReviewOnDrop && !state.cancelled && this.store.getRun(runId)?.status === 'review') {
+    const acceptReview = state?.acceptReviewOnDrop && !state.cancelled && this.store.getRun(runId)?.status === 'review';
+    // An in-place run's accept lands its changes (spec 2026-10-20-trunk-based-projects) — once
+    // the tree is released below, through the same path as Finish on a settled review.
+    const landOnAccept = acceptReview && this.store.getRun(runId)?.worktree === false;
+    if (acceptReview && !landOnAccept) {
       this.store.updateRun(runId, { status: 'done' });
       this.store.appendEvent(runId, { type: 'lifecycle', message: 'review accepted — finished without a PR' });
     }
@@ -2351,6 +2409,7 @@ export class RunManager {
     // resumed through the queue is already queued when the pump sweeps.
     this.reportSettledChildToParent(runId);
     this.releaseSlot();
+    if (landOnAccept) void this.finishReview(runId);
     // A run leaving the active registry is a terminal transition (done/review/
     // failed/cancelled) — the one moment the finished-worktree count can grow.
     // Enforce count-based retention (#483) here so a single hook covers every
@@ -2633,8 +2692,9 @@ export class RunManager {
    * reason back as the route's 409 body. A parent that had no `dispatch` record becomes a root the
    * first time it dispatches: its tree directory is created and its brief written from its own
    * task text. The child forks its worktree off the parent's branch, inherits runner and model
-   * unless the order names others, gets a budget carved out of the parent's, and always runs
-   * autonomously — a child parked at `waiting` after every turn would need a human per rung.
+   * unless the order names others (a model only on the runner it was picked for), gets a budget
+   * carved out of the parent's, and always runs autonomously — a child parked at `waiting` after
+   * every turn would need a human per rung.
    */
   dispatch(
     parentId: string,
@@ -2696,13 +2756,20 @@ export class RunManager {
         },
       ],
     };
+    const childRunner = input.runner ?? intent?.runner ?? parent.runner;
+    // An inherited model only follows its own runner: a codex parent's `gpt-*` handed to a
+    // `--runner claude` child fails at spawn (telemetry 43bdda11). Otherwise the child's runner picks.
+    const sameRunner = (runner: RunnerId | undefined) => (runner ?? 'claude') === (childRunner ?? 'claude');
+    const childModel = input.model
+      ?? (intent?.model && sameRunner(intent.runner ?? parent.runner) ? intent.model : undefined)
+      ?? (parent.model && sameRunner(parent.runner) ? parent.model : undefined);
     const record = this.startRun(opts.workflow ?? workflow, {
       // The tree directory lines are composed against the id the run is ABOUT to get: `startRun`
       // mints it, so the envelope is finished below once it exists.
       task: childTaskEnvelope(input, { id: parentId, branch: parent.branch }, ['{{TREE_PATHS}}']),
       systemPrompt: composeDispatchPrompt(input.kind),
-      runner: input.runner ?? intent?.runner ?? parent.runner,
-      ...(input.model ?? intent?.model ?? parent.model ? { model: input.model ?? intent?.model ?? parent.model } : {}),
+      runner: childRunner,
+      ...(childModel ? { model: childModel } : {}),
       autonomous: true,
       dispatch: {
         rootRunId,
@@ -3962,6 +4029,25 @@ export class RunManager {
       state.graphFinish();
       return true;
     }
+    if (
+      state?.session?.open &&
+      state.autoLand &&
+      !state.autonomous &&
+      !state.repoRootParked &&
+      this.store.getRun(runId)?.status === 'waiting'
+    ) {
+      // A trunk-based interactive run: Finish is the user's approval to land (spec
+      // 2026-10-20-trunk-based-projects). A failure goes back to the agent; success closes. Mid-turn
+      // or parked off the tree, the ordinary Finish below closes first and settle lands after.
+      this.clearIdleTimer(state);
+      state.idleClosed = undefined;
+      if (state.askPark === 'waiting') state.askPark = 'abandoned';
+      this.store.appendEvent(runId, { type: 'lifecycle', message: 'finished by user — landing the changes' });
+      return this.landWithAgent(runId, state, state.currentStepId, () => {
+        state.finishRequested = true;
+        state.session?.end();
+      }) !== undefined;
+    }
     if (state?.session?.open) {
       this.clearIdleTimer(state);
       // Finish is explicit user intent, even if the watchdog callback already ran
@@ -3995,6 +4081,10 @@ export class RunManager {
     // repeat of a Finish already pressed on this session is not an accept — it stays at review.
     if (state && !state.cancelled && run?.status === 'review') {
       if (!state.finishRequested) state.acceptReviewOnDrop = true;
+      return true;
+    }
+    if (run?.status === 'review' && !this.isActive(runId) && run.worktree === false && !run.readOnly) {
+      void this.finishReview(runId);
       return true;
     }
     if (run?.status === 'review' && !this.isActive(runId)) {
@@ -4037,7 +4127,7 @@ export class RunManager {
     if (!['done', 'failed', 'cancelled', 'review'].includes(run.status)) {
       return { ok: false, error: `cannot continue a ${run.status} run` };
     }
-    if (run.harness && run.status === 'failed') {
+    if (run.harness) {
       if (opts.images?.length) {
         return {
           ok: false,
@@ -4080,6 +4170,12 @@ export class RunManager {
                 ? { kind: 'issue', id: run.harness.issueId, text: run.task }
                 : { kind: 'brief', text: run.task },
             });
+      if (ledger.effectiveProfile === 'high-assurance' && ledger.stage.status === 'staged') {
+        return {
+          ok: false,
+          error: 'Completed high-assurance harness runs require a new task for feedback; packet leases cannot be reopened safely.',
+        };
+      }
       const continuationText = opts.text?.trim();
       let queuedBoundaryMessage:
         | { id: string; text: string; createdAt: string }
@@ -4140,7 +4236,7 @@ export class RunManager {
 
       const workflow = workflowDef as unknown as WorkflowDef;
       for (const step of run.steps) {
-        if (step.status === 'failed' || step.status === 'running' || step.status === 'waiting') {
+        if (step.status === 'failed' || step.status === 'cancelled' || step.status === 'running' || step.status === 'waiting') {
           this.store.updateStep(runId, step.id, {
             status: 'pending',
             error: undefined,
@@ -4334,6 +4430,7 @@ export class RunManager {
     if (beforePreparation?.worktreePath && gatedContinuation) {
       // Keep the original continuation intent durable before any script can start.
       const preparing: ActiveRun = {
+        includeHarnessSkills: Boolean(beforePreparation.harness),
         ownerToken: effectiveOwnerToken, cancelled: false, interrupt: () => undefined,
         cwd: beforePreparation.worktreePath, autonomous: beforePreparation.autonomous === true, autoContinues: 0,
         autosaveExcludedPaths: this.checkArtifactSnapshots.get(runId) ?? new Map(),
@@ -4384,6 +4481,7 @@ export class RunManager {
     // start and `recover` preserves. `autoContinues` restarts per session, which is the point:
     // the cap bounds ONE unattended stretch, and a human Continue is attention.
     const state: ActiveRun = {
+      includeHarnessSkills: Boolean(record?.harness),
       ownerToken: effectiveOwnerToken,
       cancelled: false,
       interrupt: () => undefined,
@@ -4400,7 +4498,11 @@ export class RunManager {
     this.active.set(runId, state);
     this.starting.delete(runId);
     if (record?.worktreePath && state.cwd !== this.repoRoot) state.releaseWorktree = await this.lifecycle.acquireAgentLease(runId);
+    state.readOnly = record?.readOnly === true && state.cwd === this.repoRoot;
     if (state.cwd === this.repoRoot) {
+      state.autoLand = await this.landingPolicy(record, await loadConfig(this.repoRoot));
+    }
+    if (state.cwd === this.repoRoot && !state.readOnly) {
       if (repositoryRootLockDisabled()) {
         this.store.appendEvent(runId, {
           type: 'note',
@@ -4429,7 +4531,7 @@ export class RunManager {
     // sessions; a continuation builds its OWN ActiveRun, and without this the resumed session
     // expanded against an empty registry and leaked `/om-...` verbatim to the backend, which
     // answered "Unknown skill" (#811). Best-effort — discovery must never break Continue.
-    state.skills = await discoverSkills(this.repoRoot).catch(() => [] as Skill[]);
+    state.skills = await discoverSkills(this.repoRoot, { includeHarness: state.includeHarnessSkills }).catch(() => [] as Skill[]);
     // The dispatch session snapshot — the SECOND of the two `ActiveRun` construction
     // sites (spec 2026-09-10-dispatch; AGENTS.md § "every construction site"). A Continue
     // that skipped this would resume a task with no dispatch prompt and no way to dispatch:
@@ -4582,9 +4684,12 @@ export class RunManager {
         }
         if (done) {
           // Goal achieved (agent contract, #347) — same as in runAgentStep.
-          this.store.appendEvent(runId, { type: 'lifecycle', message: 'goal achieved — session closed' });
-          appendHandoffHeartbeat(this.dataDir, runId, 'turn complete — goal achieved, session closed');
-          state.session?.end();
+          const close = () => {
+            this.store.appendEvent(runId, { type: 'lifecycle', message: 'goal achieved — session closed' });
+            appendHandoffHeartbeat(this.dataDir, runId, 'turn complete — goal achieved, session closed');
+            state.session?.end();
+          };
+          if (!this.landOnDone(runId, state, stepId, close)) close();
           return;
         }
         // Autonomous (#autonomous): never hand the ball back to the user. Nudge the agent to
@@ -4801,8 +4906,8 @@ export class RunManager {
             : contextualOpeningPrompt,
           ...(openingImages.length ? { images: openingImages } : {}),
           cwd: state.cwd,
-          allowedTools: toolsStep?.allowedTools ?? DEFAULT_ALLOWED_TOOLS,
-          bashAllowlist: toolsStep?.bashAllowlist,
+          allowedTools: state.readOnly ? READ_ONLY_TOOLS : toolsStep?.allowedTools ?? DEFAULT_ALLOWED_TOOLS,
+          bashAllowlist: state.readOnly ? undefined : toolsStep?.bashAllowlist,
             additionalDirectories: agentDirectories(
               join(this.dataDir, 'runs'),
               state.grantedAttachmentLibrary,
@@ -4937,6 +5042,7 @@ export class RunManager {
 
   private async execute(runId: string, workflow: WorkflowDef, input: StartRunInput, ownerToken?: symbol): Promise<void> {
     const state: ActiveRun = {
+      includeHarnessSkills: isHarnessWorkflow(workflow.name),
       ownerToken: ownerToken ?? Symbol('run-owner'),
       cancelled: false,
       interrupt: () => undefined,
@@ -4966,9 +5072,33 @@ export class RunManager {
     // happened yet here, so the run goes back to the queue untouched (spec
     // 2026-08-03-auto-resume-after-usage-limit).
     if (this.requeueWhileHeld(runId, workflow, input, taskBackend)) return;
+    // The project's default workspace (spec 2026-10-20-trunk-based-projects), for every caller
+    // that left it open — the composer, automations, the CLI. Never for variants, dispatch or a PR head.
+    const defaultable = this.store.getRun(runId);
+    if (
+      input.worktree === undefined &&
+      !isHarnessWorkflow(workflow.name) &&
+      config.taskWorkspace === 'in-place' &&
+      !defaultable?.groupId &&
+      !defaultable?.dispatch &&
+      !input.dispatchIntent &&
+      !input.forkRef
+    ) {
+      input = { ...input, worktree: false };
+      this.store.updateRun(runId, { worktree: false });
+    }
+    state.readOnly = input.readOnly === true && input.worktree === false;
+    state.autoLand = await this.landingPolicy(this.store.getRun(runId), config, (message) =>
+      this.store.appendEvent(runId, { type: 'note', message }),
+    );
     // Extra system prompt (R2 2.3): POST override > config default; echoed on
-    // the record so the UI/API can show what the run actually used.
-    const extraSystemPrompt = resolveExtraSystemPrompt(input.systemPrompt, config.systemPrompt);
+    // the record so the UI/API can show what the run actually used. The landing permission or the
+    // read-only rule rides along, so a Continue (which reads the record) keeps it.
+    const extraSystemPrompt = composeSystemPrompt(
+      resolveExtraSystemPrompt(input.systemPrompt, config.systemPrompt),
+      state.autoLand ? landingPromptPart(state.autoLand.baseLabel, state.autoLand.checks, state.autonomous === true) : undefined,
+      state.readOnly ? READ_ONLY_PROMPT : undefined,
+    ) || undefined;
     // Canonical provider/model identity (#405) — the normalised `provider/model`
     // the task ran with, persisted for cost attribution / reproducible replay
     // beside the free-text `model`. Best-effort here (a per-step `runner`/`model`
@@ -5126,7 +5256,9 @@ export class RunManager {
       emit({ type: 'note', message: 'not a git repository — running in place, one task at a time' });
     }
 
-    if (state.cwd === this.repoRoot) {
+    if (state.cwd === this.repoRoot && state.readOnly) {
+      emit({ type: 'note', message: 'read-only — answering from the repo working tree, alongside any running task' });
+    } else if (state.cwd === this.repoRoot) {
       if (repositoryRootLockDisabled()) {
         emit({
           type: 'note',
@@ -5180,7 +5312,7 @@ export class RunManager {
     const seeded = this.store.getRun(runId);
     if (seeded) seedHandoffFile(this.dataDir, seeded);
 
-    const skills = await discoverSkills(this.repoRoot);
+    const skills = await discoverSkills(this.repoRoot, { includeHarness: state.includeHarnessSkills });
     // Every ActiveRun construction site must carry the registry — `runContinuation` builds
     // its own, and the one that skipped this leaked raw `/skill` text to the backend (#811).
     state.skills = skills;
@@ -5378,6 +5510,7 @@ export class RunManager {
     taskBackend: RunnerId,
     extraSystemPrompt: string | undefined,
   ): Promise<string | null> {
+    if (state.cwd === this.repoRoot) return 'harness workflows require an isolated git worktree';
     const recorded = this.store.getRun(runId)?.harness;
     let requested = input.harness?.profile ?? recorded?.profile;
     const roles =
@@ -6529,7 +6662,7 @@ export class RunManager {
         return catalog;
       };
       const rootsIn = (catalog: readonly Skill[]) => wanted.flatMap((name) => catalog.filter((s) => s.name === name));
-      state.skills = await discoverSkills(this.repoRoot);
+      state.skills = await discoverSkills(this.repoRoot, { includeHarness: state.includeHarnessSkills });
       let catalog = catalogOf(state.skills);
       let roots = rootsIn(catalog);
       // An unknown `/name` is most likely a backend's own command (`/compact`): never stall it.
@@ -6547,7 +6680,7 @@ export class RunManager {
           }),
         ]);
         clearTimeout(timer);
-        state.skills = await discoverSkills(this.repoRoot);
+        state.skills = await discoverSkills(this.repoRoot, { includeHarness: state.includeHarnessSkills });
         catalog = catalogOf(state.skills);
         roots = rootsIn(catalog);
       }
@@ -6950,9 +7083,12 @@ export class RunManager {
         if (done) {
           // Goal achieved (agent contract, #347): close the session instead
           // of parking at `waiting` — the run completes and frees its slot.
-          emit({ type: 'lifecycle', message: 'goal achieved — session closed' });
-          appendHandoffHeartbeat(this.dataDir, runId, 'turn complete — goal achieved, session closed');
-          state.session?.end();
+          const close = () => {
+            emit({ type: 'lifecycle', message: 'goal achieved — session closed' });
+            appendHandoffHeartbeat(this.dataDir, runId, 'turn complete — goal achieved, session closed');
+            state.session?.end();
+          };
+          if (!this.landOnDone(runId, state, step.id, close)) close();
           return;
         }
         // `waiting` now also covers a NON-final step parking on an ask or monitor (#917, #1076),
@@ -7090,7 +7226,8 @@ export class RunManager {
     try {
       const normalized = normalizeModelForBackend(
         stepBackend,
-        agentModelsLocked(this.repoRoot) ? undefined : step.model ?? input.model,
+        // The task's model was picked for the task's runner; a step on another runner gets its own default.
+        agentModelsLocked(this.repoRoot) ? undefined : step.model ?? (stepBackend === taskBackend ? input.model : undefined),
         { configuredProvider: await configuredModelProvider(stepBackend, state.cwd) },
       );
       backendModel = normalized?.backendModel;
@@ -7150,8 +7287,8 @@ export class RunManager {
           userPrompt: prompt,
           images,
           cwd: state.cwd,
-          allowedTools: step.allowedTools ?? DEFAULT_ALLOWED_TOOLS,
-          bashAllowlist: step.bashAllowlist,
+          allowedTools: state.readOnly ? READ_ONLY_TOOLS : step.allowedTools ?? DEFAULT_ALLOWED_TOOLS,
+          bashAllowlist: state.readOnly ? undefined : step.bashAllowlist,
           // The handoff file lives outside the worktree — grant access.
           additionalDirectories: agentDirectories(
             join(this.dataDir, 'runs'),
@@ -7442,7 +7579,7 @@ export class RunManager {
     try {
       let skillDescription: string | undefined;
       if (skillName) {
-        const skills = await discoverSkills(this.repoRoot).catch(() => [] as Skill[]);
+        const skills = await discoverSkills(this.repoRoot, { includeHarness: Boolean(this.store.getRun(runId)?.harness) }).catch(() => [] as Skill[]);
         skillDescription = skills.find((s) => s.name === skillName)?.description;
       }
       // Only the creation call names the branch: the live refresh must never move it.
@@ -7618,6 +7755,30 @@ export class RunManager {
    * off — settle straight to `done`, leaving the diff in the worktree untouched.
    */
   private async settleSuccess(runId: string): Promise<void> {
+    const landingError = await this.landBeforeSettle(runId);
+    if (landingError === 'review') {
+      this.store.updateRun(runId, {
+        status: 'review',
+        finishedAt: new Date().toISOString(),
+        currentStepId: undefined,
+        autoResumeAttempts: undefined,
+      });
+      this.store.appendEvent(runId, {
+        type: 'lifecycle',
+        message: 'changes ready for review — check Changes, Continue with corrections, or Commit (or Finish) to land them',
+      });
+      return;
+    }
+    if (landingError) {
+      this.store.updateRun(runId, {
+        status: 'failed',
+        error: landingError,
+        finishedAt: new Date().toISOString(),
+        currentStepId: undefined,
+      });
+      this.store.appendEvent(runId, { type: 'lifecycle', message: `run failed — ${landingError}` });
+      return;
+    }
     const review = await this.reviewGateApplies(runId);
     this.store.updateRun(runId, {
       status: review ? 'review' : 'done',
@@ -7636,6 +7797,288 @@ export class RunManager {
           : 'changes ready for review — send feedback, open a draft PR, or finish'
         : 'run finished',
     });
+  }
+
+  /**
+   * The auto-land policy of an in-place run (spec 2026-10-20-trunk-based-projects), or
+   * undefined. Like worktree scripts, a git-tracked config.json cannot grant it: pushing to the
+   * base branch is the owner's permission, never the repository's.
+   */
+  private async landingPolicy(
+    run: RunRecord | undefined,
+    config: CezConfig,
+    note?: (message: string) => void,
+  ): Promise<ActiveRun['autoLand']> {
+    if (!run || run.harness || run.worktree !== false || run.readOnly || run.inPlaceBranch || config.landing !== 'auto') return undefined;
+    const repo = await getRepoInfo(this.repoRoot);
+    if (!repo) return undefined;
+    if (await isLifecycleConfigTracked(this.repoRoot).catch(() => true)) {
+      note?.('auto-land is off — .ai/cezar/config.json is tracked by git, and only local configuration can grant it');
+      return undefined;
+    }
+    return { checks: config.requiredChecks ?? [], baseBranch: config.baseBranch, baseLabel: config.baseBranch ?? repo.branch, attempts: 0 };
+  }
+
+  /** The most recent thing the user asked this task for — context for a commit message. */
+  private latestRequest(runId: string): string | undefined {
+    const events = this.store.readEvents(runId);
+    for (let i = events.length - 1; i >= 0; i--) {
+      const event = events[i] as { type?: string; text?: unknown };
+      if (event.type === 'user-message' && typeof event.text === 'string' && event.text.trim()) return event.text;
+    }
+    return this.store.getRun(runId)?.task;
+  }
+
+  /** Land now and record the outcome on the run. A `nothing` never overwrites an earlier result. */
+  private async landNow(runId: string, policy: NonNullable<ActiveRun['autoLand']>): Promise<LandResult> {
+    const run = this.store.getRun(runId);
+    this.store.appendEvent(runId, {
+      type: 'note',
+      message: `auto-land — committing, rebasing${policy.checks.length ? ', running required checks' : ''} and pushing`,
+    });
+    const env = { ...process.env, ...this.agentEnv(runId) };
+    const outcome = await landInPlace(this.repoRoot, {
+      // From the staged change itself: the title names the first request and goes stale.
+      describe: async (staged) => {
+        const written = await generateCommitMessage(this.repoRoot, staged, this.latestRequest(runId));
+        if (written.subject === undefined && staged.files.length > 0) {
+          this.store.appendEvent(runId, {
+            type: 'note',
+            message: `commit message named from the files — ${this.store.redactRunText(runId, written.reason)}`,
+          });
+        }
+        return written.subject;
+      },
+      baseBranch: policy.baseBranch,
+      since: run?.baseBranch,
+      checks: policy.checks,
+      env,
+    });
+    const at = new Date().toISOString();
+    if (outcome.result === 'landed') {
+      this.store.updateRun(runId, {
+        landing: { status: 'landed', at, branch: outcome.branch, sha: outcome.sha, pushed: outcome.pushed, files: outcome.files },
+      });
+      this.store.appendEvent(runId, {
+        type: 'note',
+        message: `landed ${outcome.sha.slice(0, 8)} on ${outcome.branch}${outcome.pushed ? ' and pushed' : ' (no upstream — committed locally)'}: ${outcome.files.length} file${outcome.files.length === 1 ? '' : 's'}`,
+      });
+    } else if (outcome.result === 'nothing') {
+      if (!run?.landing) this.store.updateRun(runId, { landing: { status: 'nothing', at } });
+      this.store.appendEvent(runId, { type: 'note', message: 'auto-land — nothing to land' });
+    } else {
+      this.store.updateRun(runId, { landing: { status: 'failed', at, stage: outcome.stage, error: this.store.redactRunText(runId, outcome.error) } });
+    }
+    return outcome;
+  }
+
+  /**
+   * `CEZ:DONE` on an auto-land run. An autonomous run lands before its session closes; an
+   * interactive one parks for review instead, and the user's Finish lands it (`finish`). True
+   * when it took the turn over. Both turn-end handlers call it.
+   */
+  private landOnDone(runId: string, state: ActiveRun, stepId: string | undefined, close: () => void): boolean {
+    if (!state.autoLand || state.cancelled) return false;
+    if (state.autonomous) return this.landWithAgent(runId, state, stepId, close) !== undefined;
+    void hasUnlanded(this.repoRoot).then((pending) => {
+      if (state.cancelled || this.active.get(runId) !== state) return;
+      if (!pending) {
+        close();
+        return;
+      }
+      this.parkForReview(runId, state, stepId);
+    });
+    return true;
+  }
+
+  /** The waiting park of an interactive auto-land run with changes: the session and the
+   *  working-tree lease stay, so the user can review, send corrections, or Finish to land. */
+  private parkForReview(runId: string, state: ActiveRun, stepId: string | undefined): void {
+    this.store.updateRun(runId, { status: 'waiting', activity: undefined });
+    if (stepId) this.store.updateStep(runId, stepId, { status: 'waiting' });
+    this.leaveMonitoring(runId);
+    this.clearMonitoringWakeTimer(state, runId);
+    this.store.appendEvent(runId, {
+      type: 'note',
+      stepId,
+      message: `changes ready for review — check Changes, reply with corrections, or Commit to ${state.autoLand?.baseLabel ?? 'the base branch'} (or Finish) to land them`,
+    });
+    this.waiting.add(runId);
+    this.armIdleTimer(runId, state);
+    this.releaseSlot();
+  }
+
+  /** Land with the session still open, so a failure goes back to the agent to fix. The promise
+   *  of the landing, shared while one is in flight; undefined when the run has no landing policy. */
+  private landWithAgent(
+    runId: string,
+    state: ActiveRun,
+    stepId: string | undefined,
+    close: () => void,
+  ): Promise<LandResult> | undefined {
+    const policy = state.autoLand;
+    if (!policy || state.cancelled) return undefined;
+    if (policy.inFlight) return policy.inFlight;
+    policy.inFlight = this.landNow(runId, policy)
+      .catch((err: unknown): LandResult => ({ result: 'failed', stage: 'commit', error: err instanceof Error ? err.message : String(err) }))
+      .then((outcome) => {
+        policy.inFlight = undefined;
+        if (state.cancelled || this.active.get(runId) !== state) return outcome;
+        if (outcome.result !== 'failed') {
+          close();
+          return outcome;
+        }
+        policy.attempts += 1;
+        if (policy.attempts >= MAX_LAND_ATTEMPTS) {
+          this.store.appendEvent(runId, {
+            type: 'note',
+            stepId,
+            message: `auto-land failed ${policy.attempts} times (${outcome.stage}) — not landed; fix it and Commit again`,
+          });
+          close();
+          return outcome;
+        }
+        if (!this.deliverMessage(runId, [{ type: 'text', text: this.store.redactRunText(runId, landFailurePrompt(outcome)) }], false)) {
+          close();
+          return outcome;
+        }
+        this.store.appendEvent(runId, {
+          type: 'note',
+          stepId,
+          message: `auto-land failed at ${outcome.stage} — sent back to the agent (${policy.attempts}/${MAX_LAND_ATTEMPTS})`,
+        });
+        return outcome;
+      });
+    return policy.inFlight;
+  }
+
+  /**
+   * The header's Commit step on an in-place task (spec 2026-10-20-trunk-based-projects), in any
+   * state: with the session open it lands like Finish; with it closed it lands directly, and a
+   * failure reopens the task with the error so the agent fixes it. Never throws.
+   */
+  async land(runId: string): Promise<LandAnswer> {
+    const run = this.store.getRun(runId);
+    if (!run || run.worktree !== false || run.readOnly) {
+      return { outcome: 'unavailable', message: 'only a task that works in the checkout can commit to the base branch' };
+    }
+    const policy = await this.landingPolicy(run, await loadConfig(this.repoRoot));
+    if (!policy) return { outcome: 'unavailable', message: 'auto-land is not enabled for this project' };
+    const base = policy.baseBranch ?? (await getRepoInfo(this.repoRoot))?.branch ?? 'the base branch';
+    const state = this.active.get(runId);
+    if (state?.session?.open && run.status === 'waiting') {
+      if (state.repoRootParked) {
+        return { outcome: 'busy', message: 'this task lent the checkout to another task while it waits — commit once it resumes' };
+      }
+      this.clearIdleTimer(state);
+      state.idleClosed = undefined;
+      if (state.askPark === 'waiting') state.askPark = 'abandoned';
+      const landing = this.landWithAgent(runId, state, state.currentStepId, () => {
+        state.finishRequested = true;
+        state.session?.end();
+      });
+      if (!landing) return { outcome: 'busy', message: 'the task is stopping — try again in a moment' };
+      return landAnswer(await landing, base, true);
+    }
+    if (state || this.isActive(runId)) {
+      return { outcome: 'busy', message: 'the agent is still working — commit once its turn ends' };
+    }
+    if (this.repoRootBusy > 0) {
+      return { outcome: 'busy', message: 'another task is working in the checkout — commit once it is done' };
+    }
+    // Hold the tree while landing, so a task queued behind cannot edit the checkout mid-rebase.
+    const lease = this.chainRepoRoot();
+    let outcome: LandResult;
+    try {
+      if (!(await hasUnlanded(this.repoRoot))) return { outcome: 'nothing', message: 'nothing to commit' };
+      outcome = await this.landNow(runId, policy);
+    } finally {
+      lease.release();
+    }
+    if (outcome.result === 'failed') {
+      // Help rather than refuse: the session is gone, so reopen the task with the error.
+      const reopened = this.continueRun(runId, { text: landFailurePrompt(outcome) });
+      return reopened.ok
+        ? { outcome: 'failed', message: `${outcome.stage} failed — sent back to the agent to fix` }
+        : { outcome: 'failed', message: `${outcome.stage} failed: ${this.store.redactRunText(runId, outcome.error).split('\n')[0]}` };
+    }
+    if (run.status !== 'done') {
+      this.store.updateRun(runId, { status: 'done', error: undefined });
+      this.store.appendEvent(runId, { type: 'lifecycle', message: 'changes landed' });
+    }
+    return landAnswer(outcome, base, false);
+  }
+
+  /** Accept an in-place run resting at `review`: land it when the project auto-lands, else the
+   *  ordinary accept. */
+  private async finishReview(runId: string): Promise<void> {
+    await this.landReviewed(runId);
+    const after = this.store.getRun(runId);
+    if (after?.status === 'review' && !(await this.landingPolicy(after, await loadConfig(this.repoRoot)))) {
+      this.store.updateRun(runId, { status: 'done' });
+      this.store.appendEvent(runId, { type: 'lifecycle', message: 'review accepted — finished without a PR' });
+    }
+  }
+
+  /**
+   * Finish on a run resting at `review` with unlanded in-place changes: land them, then `done`.
+   * Refused while another task works in the checkout — it would commit that task's edits too.
+   */
+  private async landReviewed(runId: string): Promise<void> {
+    const run = this.store.getRun(runId);
+    const policy = run && (await this.landingPolicy(run, await loadConfig(this.repoRoot)));
+    if (!policy) return;
+    if (this.repoRootBusy > 0) {
+      this.store.appendEvent(runId, {
+        type: 'note',
+        message: 'not landed — another task is working in the checkout; Finish again once it is done',
+      });
+      return;
+    }
+    const lease = this.chainRepoRoot();
+    let outcome: LandResult;
+    try {
+      outcome = await this.landNow(runId, policy);
+    } finally {
+      lease.release();
+    }
+    if (outcome.result === 'failed') {
+      this.store.appendEvent(runId, {
+        type: 'note',
+        message: `not landed — ${outcome.stage} failed: ${this.store.redactRunText(runId, outcome.error).split('\n')[0]}. Continue the task to fix it, then Finish again.`,
+      });
+      return;
+    }
+    this.store.updateRun(runId, { status: 'done' });
+    this.store.appendEvent(runId, { type: 'lifecycle', message: 'review accepted — changes landed' });
+  }
+
+  /**
+   * The settle-time half of auto-land: a run that ends without a `CEZ:DONE` landing (Finish, an
+   * idle close) still lands what it left, and a landing that never succeeded fails the run rather
+   * than wearing a success badge. Answers the failure message, or undefined.
+   */
+  private async landBeforeSettle(runId: string): Promise<string | 'review' | undefined> {
+    const run = this.store.getRun(runId);
+    if (!run || run.worktree !== false || run.readOnly) return undefined;
+    const policy = await this.landingPolicy(run, await loadConfig(this.repoRoot));
+    if (!policy || !(await hasUnlanded(this.repoRoot))) return undefined;
+    // Only an autonomous run or the user's Finish may land; anything else rests at review.
+    const state = this.active.get(runId);
+    if (run.autonomous !== true && state?.finishRequested !== true) return 'review';
+    // Land only while holding the tree: this run's own lease, else a fresh one (restart recovery).
+    const holdsTree = Boolean(state?.releaseRepoRoot) && !state?.repoRootParked;
+    if (!holdsTree && this.repoRootBusy > 0) return 'review';
+    const lease = holdsTree ? undefined : this.chainRepoRoot();
+    let outcome: LandResult;
+    try {
+      outcome = await this.landNow(runId, policy);
+    } finally {
+      lease?.release();
+    }
+    return outcome.result === 'failed'
+      ? `auto-land failed (${outcome.stage}): ${this.store.redactRunText(runId, outcome.error).split('\n')[0]}`
+      : undefined;
   }
 
   /** Whether settling this run now would park it at the review gate (#489). */

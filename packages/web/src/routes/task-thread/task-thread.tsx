@@ -207,7 +207,7 @@ function useThreadHarnessLedger(
   events: readonly RunEvent[],
   enabled: boolean,
 ): HarnessLedgerResponse | undefined {
-  const harness = useRunHarness(run.id, enabled && Boolean(run.harness))
+  const harness = useRunHarness(run.id, enabled && Boolean(run.harness), events)
   const lastHarnessSeq = events.reduce(
     (max, event) => (event.type.startsWith('harness.') ? Math.max(max, event.seq) : max),
     0,
@@ -428,6 +428,7 @@ export function ThreadView({
         publishBlockedReason={harnessPublishBlocked}
         onJumpToStep={jumpToStep}
         orderedSteps={orderedSteps}
+        hideWorkflowProgress={Boolean(harnessLedger)}
         onMarkedUnread={markedUnread}
         // The badge the user already opens to inspect runner/account/model now edits the SAME
         // continuation choice as the dock. One hook owns both renderings, so a header pick is
@@ -571,7 +572,7 @@ export function ThreadView({
         {/* The review gate (spec 009): a finished run with changes parks here — nothing
             auto-merges. The panel exists exactly while the run rests at `review`. */}
         {/* Send back carries the drafted line comments, like the composer does. */}
-        {run.status === 'review' && !lifecycleGate ? (
+        {run.status === 'review' && !lifecycleGate && run.worktree !== false ? (
           <ReviewPanel run={run} diffComments={diffComments} publishBlockedReason={harnessPublishBlocked} />
         ) : null}
           </div>

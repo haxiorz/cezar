@@ -641,7 +641,8 @@ export const AppRoutes = memo(function AppRoutes() {
           path="settings/prompt-templates"
           element={<ScopedNavigate to={{ pathname: '/settings/instructions', hash: '#prompt-templates' }} replace />}
         />
-        {visibleSettingsSections('project', capabilities).map((section) => (
+        {/* Keep direct links routable; the sidebar independently requires an enabled project flag. */}
+        {visibleSettingsSections('project', { ...capabilities, multiModel: true }).map((section) => (
           <Route
             key={section.id}
             path={`settings/${section.id}`}

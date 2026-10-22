@@ -119,6 +119,8 @@ interface RunHeaderProps {
   /** Steps in EXECUTION order (harness pages derive it from the ledger) —
    *  older harness runs recorded their dynamic steps appended at the tail. */
   orderedSteps?: StepState[]
+  /** A harness status bar in the view already owns progress and the expandable timeline. */
+  hideWorkflowProgress?: boolean
   /** Fired the moment "Mark unread" is invoked, BEFORE the mutation — the Session tab uses it
    *  to suppress its auto-mark-read effect for the rest of the visit (#775). Optional because
    *  the three `task-git` tabs render this same header and run no such effect. */
@@ -141,6 +143,7 @@ const headerPropComparators = {
   publishBlockedReason: (before, after) => before.publishBlockedReason === after.publishBlockedReason,
   onJumpToStep: (before, after) => before.onJumpToStep === after.onJumpToStep,
   orderedSteps: (before, after) => before.orderedSteps === after.orderedSteps,
+  hideWorkflowProgress: (before, after) => before.hideWorkflowProgress === after.hideWorkflowProgress,
   onMarkedUnread: (before, after) => before.onMarkedUnread === after.onMarkedUnread,
   continuationEngine: (before, after) => before.continuationEngine === after.continuationEngine,
   tabs: (before, after) => before.tabs === after.tabs,
@@ -162,6 +165,7 @@ function RunHeaderView({
   publishBlockedReason,
   onJumpToStep,
   orderedSteps,
+  hideWorkflowProgress = false,
   onMarkedUnread,
   continuationEngine,
   tabs,
@@ -389,7 +393,7 @@ function RunHeaderView({
             )}
           </div>
 
-          {run.steps.length > 0 ? (
+          {!hideWorkflowProgress && run.steps.length > 0 ? (
             <div className={cn('border-t border-border pt-1 pb-0 md:pt-2 md:pb-1', collapsed && 'md:hidden')}>
               <WorkflowSteps runId={run.id} steps={orderedSteps ?? run.steps} onJumpToStep={onJumpToStep} />
             </div>

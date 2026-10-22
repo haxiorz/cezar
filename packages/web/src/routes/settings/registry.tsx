@@ -146,7 +146,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   {
     id: 'tasks',
     title: 'Tasks',
-    description: 'Base branch, review before finishing, live titles.',
+    description: 'Development model, landing, required checks, base branch, review, live titles.',
     icon: ListChecksIcon,
     component: TasksSection,
     scope: 'project',
@@ -256,9 +256,8 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
  * the same shell, so this filter is the only thing keeping them apart.
  */
 /** What decides whether a section is listed: the health capabilities, plus the project's
- *  `multiModel` config flag. `false` hides the Harness section (feature off); absent keeps it —
- *  route registration happens above the project scope, where the config is unknowable, and the
- *  section component itself explains the gate on a direct URL. */
+ *  `multiModel` config flag. The Harness section stays hidden until the project explicitly
+ *  enables it, including while config is loading or another project is expanded. */
 export type SectionVisibility = Partial<Pick<Capabilities, 'singleProject'>> & { multiModel?: boolean }
 
 export function visibleSettingsSections(
@@ -270,7 +269,7 @@ export function visibleSettingsSections(
       !section.hidden &&
       section.scope === scope &&
       !(capabilities?.singleProject === true && section.id === 'projects') &&
-      !(capabilities?.multiModel === false && section.id === 'harness'),
+      !(capabilities?.multiModel !== true && section.id === 'harness'),
   )
 }
 

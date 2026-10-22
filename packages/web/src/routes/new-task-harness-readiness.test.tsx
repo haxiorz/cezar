@@ -64,6 +64,42 @@ function panel(models: HarnessModel[] = []) {
  * the picker never comes back, and the readiness evidence behind the Start gate stays visible.
  */
 describe('multi-model start surface', () => {
+  it('shows a failed readiness request with a retry instead of checking forever', () => {
+    const onRetryProbe = vi.fn()
+    render(
+      <HarnessPanel
+        mode="implement-feature"
+        onMode={() => {}}
+        roles={roles}
+        onRoles={() => {}}
+        options={options}
+        probeError="Model readiness could not be verified. Try again."
+        onRetryProbe={onRetryProbe}
+      />,
+    )
+    expect(screen.queryByText('checking bindings…')).toBeNull()
+    expect(screen.getByRole('alert').textContent).toContain('Model readiness could not be verified.')
+    fireEvent.click(screen.getByRole('button', { name: 'Retry readiness check' }))
+    expect(onRetryProbe).toHaveBeenCalledOnce()
+  })
+
+  it('can recheck an unready lineup after the provider is repaired', () => {
+    const onRetryProbe = vi.fn()
+    render(
+      <HarnessPanel
+        mode="implement-feature"
+        onMode={() => {}}
+        roles={roles}
+        onRoles={() => {}}
+        options={options}
+        probe={{ profile: 'custom', ready: false, reason: 'Provider login expired', models: [] }}
+        onRetryProbe={onRetryProbe}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Retry readiness check' }))
+    expect(onRetryProbe).toHaveBeenCalledOnce()
+  })
+
   it('offers no execution-profile picker — only the custom lineup', () => {
     panel()
 

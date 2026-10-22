@@ -21,6 +21,8 @@ import {
   normalizeHarnessPresets,
   rolesEqual,
   sessionRoleOptions,
+  looksLikeQuestion,
+  projectDefaultSource,
   buildAutomationTask,
   availableRunners,
   buildCreateRunBody,
@@ -1354,5 +1356,38 @@ describe('eval-gate certification helpers (spec 2026-08-06-eval-gated-model-rout
     const roles = bestCertifiedRoles([claudeSonnet, claudeOpus, codexAuto, deepseek, fresh])
     expect(roles?.reviewers[0]).toEqual({ runner: 'harness', model: 'kimi', family: 'moonshot' })
     expect(roles?.reviewers[1]).toEqual({ runner: 'harness', model: 'deepseek', family: 'deepseek' })
+  })
+})
+
+describe('trunk-based projects (spec 2026-10-20-trunk-based-projects)', () => {
+  const base = { task: 'x', source: null, model: '', runner: 'claude' as const, defaultRunner: 'claude' as const, images: [] }
+  const wire = (opts: Partial<Parameters<typeof buildCreateRunBody>[0]>) =>
+    JSON.parse(JSON.stringify(buildCreateRunBody({ ...base, variants: 1, ...opts })))
+
+  it('sends an Ask task as readOnly, with no worktree or branch keys', () => {
+    expect(wire({ readOnly: true, worktree: false, newBranch: true })).toEqual({ task: 'x', workflow: 'quick-task', readOnly: true })
+    // Variants and dispatch always isolate, so they win over Ask.
+    expect(wire({ readOnly: true, variants: 2 })).not.toHaveProperty('readOnly')
+    expect(wire({ readOnly: true, dispatch: {} })).not.toHaveProperty('readOnly')
+  })
+
+  it('asks for a worktree explicitly only against an in-place project default', () => {
+    expect(wire({ worktree: true, inPlaceByDefault: true })).toMatchObject({ worktree: true })
+    expect(wire({ worktree: false, inPlaceByDefault: true })).toMatchObject({ worktree: false })
+    expect(wire({ worktree: true })).not.toHaveProperty('worktree')
+  })
+
+  it("preselects the project's default or Ask skill, only when it exists", () => {
+    const skills = [{ name: 'ingest' }, { name: 'ask' }] as Skill[]
+    const config = { defaultSkill: 'ingest', askSkill: 'ask' }
+    expect(projectDefaultSource(config, false, skills)).toEqual({ source: 'skill', ref: 'ingest' })
+    expect(projectDefaultSource(config, true, skills)).toEqual({ source: 'skill', ref: 'ask' })
+    expect(projectDefaultSource({ defaultSkill: 'gone' }, false, skills)).toBeNull()
+    expect(projectDefaultSource(undefined, false, skills)).toBeNull()
+  })
+
+  it('reads a trailing question mark as a question', () => {
+    expect(looksLikeQuestion("what's open with Daniel? ")).toBe(true)
+    expect(looksLikeQuestion('1on1 with Bjorn — I owe him the deck by Friday')).toBe(false)
   })
 })

@@ -160,6 +160,7 @@ const CONFIG: ConfigResponse = {
   worktreeRetention: 10,
   liveTitleUpdates: null,
   reviewGate: null,
+  profile: null, taskWorkspace: null, landing: null, landingBlocked: null, requiredChecks: [], defaultSkill: null, askSkill: null, teamSkills: true,
 }
 
 const WORKSPACE_CONFIG: WorkspaceConfigResponse = {
@@ -406,6 +407,40 @@ describe('the hero surface', () => {
     expect(screen.getByText('Runs in an isolated worktree — review everything before it lands.')).toBeTruthy()
   })
 
+  it('switches composer mode with arrow keys and labels the active panel', async () => {
+    serve({ health: HEALTH_MULTI, providerStatus: PROVIDERS_MULTI })
+    renderNewTask()
+    await pillReady()
+    const taskTab = screen.getByRole('tab', { name: 'Task' })
+    act(() => taskTab.focus())
+    fireEvent.keyDown(taskTab, { key: 'ArrowRight' })
+    const multiTab = screen.getByRole('tab', { name: 'Multi-model' })
+    await waitFor(() => expect(multiTab.getAttribute('aria-selected')).toBe('true'))
+    expect(document.activeElement).toBe(multiTab)
+    expect(screen.getByRole('tabpanel', { name: 'Multi-model' }).id).toBe(multiTab.getAttribute('aria-controls'))
+    fireEvent.keyDown(multiTab, { key: 'ArrowLeft' })
+    await waitFor(() => expect(taskTab.getAttribute('aria-selected')).toBe('true'))
+    expect(screen.getByRole('tabpanel', { name: 'Task' })).toBeTruthy()
+  })
+
+  it('starts an ordinary task from a persisted multi-model draft when the feature is off', async () => {
+    writeDraft({
+      ...readDraft(),
+      text: 'Fix the stale draft',
+      composerMode: 'multi',
+      source: { source: 'workflow', ref: 'cez-harness-fix-issue' },
+    })
+    serve({ config: { multiModel: false } })
+    renderNewTask()
+    await pillReady()
+    expect(document.querySelector('[data-slot="harness-panel"]')).toBeNull()
+    expect(document.querySelector('[data-slot="harness-setup-dialog"]')).toBeNull()
+    expect(requests.some((request) => request.url.includes('/harness/'))).toBe(false)
+    await startTask()
+    expect(postedBody()).toMatchObject({ task: 'Fix the stale draft', workflow: 'quick-task' })
+    expect(postedBody()).not.toHaveProperty('harness')
+  })
+
   it('starts an attachment-only task: empty task text, the attachment in images (telemetry 18c930de)', async () => {
     serve()
     renderNewTask()
@@ -428,7 +463,7 @@ describe('picker data flows', () => {
     serve({ health: HEALTH_MULTI, providerStatus: PROVIDERS_MULTI })
     const { client } = renderNewTask()
     await pillReady()
-    fireEvent.click(screen.getByRole('tab', { name: 'Multi-model' }))
+    fireEvent.mouseDown(screen.getByRole('tab', { name: 'Multi-model' }), { button: 0 })
     fireEvent.click(await screen.findByRole('button', { name: 'Orchestrator model' }))
     await waitFor(() => expect(client.getQueryState(workspaceQueryKeys.models('claude'))?.fetchStatus).toBe('idle'))
 
@@ -2337,5 +2372,68 @@ describe('the Dispatch toggle', () => {
     fireEvent.change(textarea(), { target: { value: 'Server says no' } })
     await startTask()
     expect(postedBody()).not.toHaveProperty('dispatch')
+  })
+})
+
+describe('trunk-based projects (spec 2026-10-20-trunk-based-projects)', () => {
+  const TRUNK_SKILLS: Skill[] = [
+    ...SKILLS,
+    { name: 'ingest', description: 'File a note', body: '', path: '/p/ingest.md', source: 'ai' },
+    { name: 'ask', description: 'Answer from the notes', body: '', path: '/p/ask.md', source: 'ai' },
+  ]
+  const TRUNK_CONFIG: Partial<ConfigResponse> = {
+    profile: 'trunk',
+    taskWorkspace: 'in-place',
+    landing: 'auto',
+    defaultSkill: 'ingest',
+    askSkill: 'ask',
+  }
+  const note = () => document.querySelector('[data-slot="run-mode-note"]')?.textContent
+
+  it('files a note in place with the default skill', async () => {
+    serve({ config: TRUNK_CONFIG, skills: TRUNK_SKILLS })
+    renderNewTask()
+    await pillReady('ingest')
+    expect(note()).toContain('review the changes, then Commit lands them on the base branch')
+    fireEvent.change(textarea(), { target: { value: '1on1 with Bjorn, I owe him the deck by Friday' } })
+    await startTask()
+    expect(postedBody()).toMatchObject({
+      worktree: false,
+      steps: [{ skill: 'ingest' }],
+    })
+    expect(postedBody()).not.toHaveProperty('readOnly')
+    // The default skill must not make the task autonomous: that would land it unreviewed.
+    expect(postedBody()).not.toHaveProperty('autonomous')
+  })
+
+  it('asks a question read-only with the Ask skill', async () => {
+    serve({ config: TRUNK_CONFIG, skills: TRUNK_SKILLS })
+    renderNewTask()
+    await pillReady('ingest')
+    fireEvent.change(textarea(), { target: { value: "what's open with Daniel?" } })
+    await waitFor(() => expect(document.querySelector('[data-slot="ask-toggle"]')?.getAttribute('aria-checked')).toBe('true'))
+    expect(document.querySelector('[data-slot="worktree-toggle"]')).toBeNull()
+    await startTask()
+    expect(postedBody()).toMatchObject({ readOnly: true, steps: [{ skill: 'ask' }] })
+    expect(postedBody()).not.toHaveProperty('worktree')
+  })
+
+  it('lets the project default win over a Worktree choice remembered from before it changed', async () => {
+    localStorage.setItem('cez-new-task-draft', JSON.stringify({ worktree: true }))
+    serve({ config: TRUNK_CONFIG, skills: TRUNK_SKILLS })
+    renderNewTask()
+    await pillReady('ingest')
+    const chip = () => document.querySelector('[data-slot="worktree-toggle"]')
+    expect(chip()?.getAttribute('aria-checked')).toBe('false')
+    // Ticking it now is a choice made under this setting, so it sticks.
+    fireEvent.click(chip() as HTMLButtonElement)
+    await waitFor(() => expect(chip()?.getAttribute('aria-checked')).toBe('true'))
+  })
+
+  it('leaves a branch-per-task project without the Ask chip', async () => {
+    serve()
+    renderNewTask()
+    await pillReady()
+    expect(document.querySelector('[data-slot="ask-toggle"]')).toBeNull()
   })
 })

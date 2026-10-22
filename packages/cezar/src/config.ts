@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { worktreeLifecycleConfigSchema } from '@open-mercato/cezar-contract';
@@ -149,9 +150,36 @@ const configSchema = z.object({
    * readable for history. `.catch(false)` keeps a bad value additive-safe.
    */
   multiModel: z.boolean().default(false).catch(false),
+  /**
+   * Trunk-based projects (spec 2026-10-20-trunk-based-projects). Every key is optional and
+   * absent = today's branch-per-task behavior. `profile` only labels the preset the cockpit applied;
+   * the behavior comes from the individual keys below.
+   */
+  profile: z.enum(['branches', 'trunk']).optional().catch(undefined),
+  /** Where a task works unless the composer says otherwise: `in-place` = the repo checkout. */
+  taskWorkspace: z.enum(['worktree', 'in-place']).optional().catch(undefined),
+  /** How an in-place task's finished changes reach the base branch. `auto` commits, rebases,
+   *  runs `requiredChecks` and pushes; a git-tracked config.json cannot grant it. */
+  landing: z.enum(['review', 'auto']).optional().catch(undefined),
+  /** Shell commands every auto-land must pass, run in the checkout after the rebase. */
+  requiredChecks: z.array(z.string().trim().min(1).max(2_000)).max(10).optional().catch(undefined),
+  /** Skill the composer preselects for a new task, and for a read-only (Ask) task. */
+  defaultSkill: z.string().trim().min(1).max(200).optional().catch(undefined),
+  askSkill: z.string().trim().min(1).max(200).optional().catch(undefined),
 });
 
 export type CezConfig = z.infer<typeof configSchema>;
+
+/** Synchronous admission guard for new runs; recovery uses the persisted workflow. */
+export function multiModelEnabled(repoRoot: string): boolean {
+  try {
+    const raw: unknown = JSON.parse(readFileSync(join(repoRoot, '.ai/cezar', 'config.json'), 'utf8'));
+    const parsed = configSchema.safeParse(raw);
+    return parsed.success && parsed.data.multiModel;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Fold the machine-wide agent defaults under a repo's own config (spec 2026-07-29-agent-profiles).

@@ -184,7 +184,7 @@ function json(body: unknown, status = 200): Response {
   })
 }
 
-function stubApi(): SentRequest[] {
+function stubApi(snapshot: () => HarnessLedgerResponse = ledger, record: ApiRun = run): SentRequest[] {
   const sent: SentRequest[] = []
   vi.stubGlobal(
     'fetch',
@@ -196,8 +196,8 @@ function stubApi(): SentRequest[] {
         method,
         body: typeof init.body === 'string' ? JSON.parse(init.body) : undefined,
       })
-      if (method === 'GET' && path === '/api/v1/runs/r1') return json(run)
-      if (method === 'GET' && path === '/api/v1/runs/r1/harness') return json(ledger())
+      if (method === 'GET' && path === '/api/v1/runs/r1') return json(record)
+      if (method === 'GET' && path === '/api/v1/runs/r1/harness') return json(snapshot())
       if (method === 'GET' && path === '/api/v1/runs') return json([run])
       if (method === 'GET' && path === '/api/v1/providers/status') {
         return json({
@@ -257,6 +257,47 @@ afterEach(() => {
 })
 
 describe('harness review route', () => {
+  it.each(['review', 'packets'] as const)('shows only harness progress on the %s tab', async (tab) => {
+    stubApi(ledger, {
+      ...run, steps: [{ id: 'stage', name: 'Stage', kind: 'check', status: 'done', iterations: 1, tokensUsed: 0 }],
+    })
+    const { container } = renderRoute(tab)
+    await screen.findByRole('heading', { name: 'Build billing' })
+    expect(container.querySelector('[data-slot="harness-status-bar"]')).not.toBeNull()
+    expect(container.querySelector('[data-slot="workflow-steps"]')).toBeNull()
+    expect(container.querySelector('main')).toBeNull()
+  })
+
+  it('refreshes the cached ledger after feedback and shows the new first review round', async () => {
+    let snapshot = ledger()
+    snapshot.councils[0]!.round = 3
+    const sent = stubApi(() => snapshot)
+    renderRoute('review')
+    await screen.findAllByText('Compatibility alias is not replay-safe')
+    snapshot = {
+      ...ledger(), snapshotSeq: 11, councils: [],
+      stage: { status: 'pending' }, outcome: { status: 'pending', blockingReasons: [] },
+    }
+    act(() => FakeEventSource.instances[0]?.emit('ui-event', {
+      seq: 11, ts: '2026-07-26T10:00:11.000Z', type: 'harness.feedback.applied',
+      phaseId: 'implement', messageIds: ['feedback-1'],
+    }))
+    await waitFor(() => expect(sent.filter((request) => request.path.endsWith('/harness'))).toHaveLength(2))
+    await waitFor(() => expect(screen.queryByText('Compatibility alias is not replay-safe')).toBeNull())
+    act(() => FakeEventSource.instances[0]?.emit('ui-event', {
+      seq: 12, ts: '2026-07-26T10:00:12.000Z', type: 'harness.council.updated',
+      council: {
+        round: 1, kind: 'implementation', verdict: 'request_changes',
+        reviewers: [{ id: 'claude', status: 'completed', verdict: 'request_changes', findings: [
+          { severity: 'major', title: 'New feedback needs a regression guard' },
+        ] }],
+        findings: [{ severity: 'major', title: 'New feedback needs a regression guard', by: 'claude' }],
+      },
+    }))
+    await screen.findAllByText('New feedback needs a regression guard')
+    expect(screen.queryByText('Compatibility alias is not replay-safe')).toBeNull()
+  })
+
   it('renders the durable council matrix and preserves findings after explicit risk acceptance', async () => {
     const sent = stubApi()
     renderRoute('review')

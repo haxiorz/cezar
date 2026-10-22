@@ -121,6 +121,8 @@ import type {
   CreateAgentProfileInput,
   HarnessProfile,
   HarnessRoles,
+  HarnessInvocationRecord,
+  RunEvent,
   ApiRun,
   HealthResponse,
   MessageInput,
@@ -853,7 +855,7 @@ export function useConnectAgentAccount() {
 }
 
 /**
- * Re-probe ONE account for real (`?refresh=1`), for the "Check again" the pane offers beside
+ * Re-probe ONE account for real (`?refresh=1&recheck=1`), for the "Check again" the pane offers beside
  * Connect — the affordance the cached-by-default listing is designed around.
  *
  * Writes the answer straight into the per-account status cache so the row updates without a second
@@ -862,7 +864,7 @@ export function useConnectAgentAccount() {
 export function useRecheckAgentAccount() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (routeId: string) => getAgentAccountStatus(routeId, { refresh: true }),
+    mutationFn: (routeId: string) => getAgentAccountStatus(routeId, { recheck: true }),
     retry: false,
     onSuccess: (answer, routeId) => {
       queryClient.setQueryData(workspaceQueryKeys.agentAccountStatus(routeId), answer)
@@ -1132,21 +1134,47 @@ export function useRun(id: string | undefined) {
 
 /** Durable harness snapshot. Live progress is folded from the existing per-run SSE stream by
  *  the routed views, so this query never polls and does not open another connection. */
-export function useRunHarness(id: string | undefined, enabled = true) {
-  return useQuery({
+export function useRunHarness(id: string | undefined, enabled = true, events: readonly RunEvent[] = []) {
+  const queryClient = useQueryClient()
+  const scope = queryScope()
+  const feedbackSeq = events.reduce(
+    (latest, event) => event.type === 'harness.feedback.applied' ? Math.max(latest, event.seq) : latest,
+    0,
+  )
+  const refreshed = useRef('')
+  const query = useQuery({
     queryKey: queryKeys.runs.harness(id ?? ''),
     queryFn: ({ signal }) => getRunHarness(id as string, { signal }),
     enabled: Boolean(id) && enabled,
     retry: false,
     staleTime: Number.POSITIVE_INFINITY,
   })
+  useEffect(() => {
+    const refreshKey = `${scope}:${id}:${feedbackSeq}`
+    if (!id || !enabled || !feedbackSeq || refreshed.current === refreshKey ||
+      feedbackSeq <= (query.data?.snapshotSeq ?? 0)) return
+    refreshed.current = refreshKey
+    const queryKey = [scope, 'runs', 'harness', id] as const
+    // The run-status refresh can finish BEFORE the driver persists its reset. Cancel any
+    // older read, then fetch after the persisted event; invalidate cached conversations too.
+    void queryClient.cancelQueries({ queryKey }).then(() => queryClient.invalidateQueries({ queryKey }))
+  }, [scope, id, enabled, feedbackSeq, query.data?.snapshotSeq, queryClient])
+  return query
 }
 
-/** A reviewer's conversation. Enabled only while its drawer is open, and cached
- *  indefinitely — a finished invocation's artifacts never change. */
-export function useHarnessInvocation(id: string | undefined, invocationId: string | null) {
+/** A reviewer's conversation, cached per invocation revision: a feedback continuation may
+ *  reuse the invocation id and rewrite its prompt/result artifacts. */
+export function useHarnessInvocation(
+  id: string | undefined,
+  invocationId: string | null,
+  revision?: HarnessInvocationRecord,
+) {
   return useQuery({
-    queryKey: [...queryKeys.runs.harness(id ?? ''), 'invocation', invocationId ?? ''] as const,
+    queryKey: [
+      ...queryKeys.runs.harness(id ?? ''), 'invocation', invocationId ?? '',
+      revision?.inputSha256, revision?.status, revision?.attempt,
+      revision?.startedAt, revision?.endedAt, revision?.artifactSha256,
+    ] as const,
     queryFn: ({ signal }) => getHarnessInvocation(id as string, invocationId as string, { signal }),
     enabled: Boolean(id) && Boolean(invocationId),
     retry: false,

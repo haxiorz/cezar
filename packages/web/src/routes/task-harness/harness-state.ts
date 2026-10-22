@@ -52,9 +52,9 @@ function invocationFrom(value: unknown): HarnessInvocationRecord | null {
 }
 
 /**
- * Fold persisted + live harness events over the durable snapshot. Every event carries a complete
- * entity (phase, council, packet, invocation), so reconnect replay is idempotent and never needs
- * a second socket or a polling interval.
+ * Fold persisted + live harness events over the durable snapshot. Entity updates carry complete
+ * records; feedback resets discard the previous implementation cycle before its next updates.
+ * Reconnect replay is idempotent and never needs a second socket or a polling interval.
  */
 export function mergeHarnessLedger(
   snapshot: HarnessLedgerResponse | undefined,
@@ -75,6 +75,21 @@ export function mergeHarnessLedger(
 
   for (const event of events) {
     if (event.seq <= (snapshot.snapshotSeq ?? 0)) continue
+    if (event.type === 'harness.feedback.applied' && typeof event.phaseId === 'string') {
+      // A new cycle starts again at round 1. Keeping an earlier round 3 would make it
+      // win currentImplementationCouncil forever while the authoritative read is in flight.
+      const start = ledger.phases.findIndex((phase) => phase.id === event.phaseId)
+      ledger = {
+        ...ledger,
+        councils: ledger.councils.filter((council) => council.kind !== 'implementation'),
+        phases: ledger.phases.map((phase, index) => start >= 0 && index >= start
+          ? { ...phase, status: 'pending', startedAt: undefined, endedAt: undefined, error: undefined }
+          : phase),
+        stage: { status: 'pending' },
+        outcome: { status: 'pending', blockingReasons: [] },
+      }
+      continue
+    }
     if (event.type === 'harness.phase.updated') {
       const phase = phaseFrom(event.phase)
       if (phase) ledger = { ...ledger, phases: replaceBy(ledger.phases, phase, (a, b) => a.id === b.id) }

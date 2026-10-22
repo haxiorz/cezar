@@ -88,11 +88,12 @@ describe('UiEvent vocabulary (compile-time contract)', () => {
       'harness.council.updated': 'thread',
       'harness.packet.updated': 'dock',
       'harness.stage.updated': 'meta',
+      'harness.feedback.applied': 'meta',
     } as const satisfies Record<UiEventType, 'thread' | 'meta' | 'dock' | 'gauge' | 'reserved'>;
 
     // And the map has no extra keys either: its key set IS the event set.
     assertType<Equal<keyof typeof renderRelevance, UiEventType>>();
-    expect(Object.keys(renderRelevance)).toHaveLength(20);
+    expect(Object.keys(renderRelevance)).toHaveLength(21);
   });
 
   it('the event union narrows on `type`', () => {
@@ -125,6 +126,7 @@ describe('UiEvent vocabulary (compile-time contract)', () => {
         case 'harness.council.updated':
         case 'harness.packet.updated':
         case 'harness.stage.updated':
+        case 'harness.feedback.applied':
           return event.type;
         default: {
           // Exhaustiveness: a new variant makes this line fail to compile.

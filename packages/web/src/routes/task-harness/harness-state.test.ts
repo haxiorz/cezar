@@ -85,6 +85,32 @@ function event(seq: number, type: string, payload: Record<string, unknown>): Run
 }
 
 describe('mergeHarnessLedger', () => {
+  it('replaces an old round 3 with feedback round 1 before the refreshed snapshot arrives', () => {
+    const snapshot = ledger()
+    snapshot.councils = [
+      { round: 1, kind: 'spec', reviewers: [] },
+      { round: 3, kind: 'implementation', reviewers: [], verdict: 'approve' },
+    ]
+    snapshot.stage = { status: 'staged' }
+    snapshot.outcome = { status: 'ready', blockingReasons: [] }
+    const reset = event(10, 'harness.feedback.applied', {
+      phaseId: 'implement', messageIds: ['message-1'],
+    })
+    const restarted = mergeHarnessLedger(snapshot, [reset])!
+    expect(restarted.stage.status).toBe('pending')
+    expect(restarted.outcome.status).toBe('pending')
+    expect(restarted.councils).toEqual([{ round: 1, kind: 'spec', reviewers: [] }])
+
+    const merged = mergeHarnessLedger(snapshot, [reset, event(11, 'harness.council.updated', {
+      council: { round: 1, kind: 'implementation', reviewers: [], verdict: 'request_changes' },
+    })])!
+    expect(currentImplementationCouncil(merged)).toMatchObject({
+      round: 1, verdict: 'request_changes',
+    })
+    expect(snapshot.councils[1]?.round).toBe(3)
+    expect(snapshot.stage.status).toBe('staged')
+  })
+
   it('reconstructs every live harness entity over a durable snapshot without mutating it', () => {
     const snapshot = ledger()
     const events = [

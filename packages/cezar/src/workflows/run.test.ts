@@ -928,6 +928,8 @@ describe('a bundled directory skill materializes with its requires closure into 
 
   beforeAll(async () => {
     repoRoot = mkdtempSync(join(tmpdir(), 'cez-bundled-run-'));
+    mkdirSync(join(repoRoot, '.ai/cezar'), { recursive: true });
+    writeFileSync(join(repoRoot, '.ai/cezar/config.json'), JSON.stringify({ multiModel: true }));
     savedEnv.CEZ_DRY_RUN = process.env.CEZ_DRY_RUN;
     process.env.CEZ_DRY_RUN = '1';
     await run('git', ['init', '-q', '-b', 'main'], { cwd: repoRoot });

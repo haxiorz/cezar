@@ -409,6 +409,9 @@ export function createLiveTransport(deps: {
   timeoutMs?: number;
 }): ProbeTransport {
   return async (ref) => {
+    if (process.env.CEZ_DRY_RUN === '1') {
+      return { status: 'unverified', detail: 'Multi-model readiness probes are unavailable with CEZ_DRY_RUN=1.' };
+    }
     if (ref.runner === 'claude') {
       return probeClaude(ref, { cwd: deps.cwd, timeoutMs: deps.timeoutMs });
     }

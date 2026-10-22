@@ -1,12 +1,24 @@
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import * as childProcess from 'node:child_process';
+import * as net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ClaudeCliRunner } from '../core/claude-cli-runner.js';
 import {
   createLiveTransport,
   probeAdvisorHttp,
   probeKimiSubscription,
 } from './probe-transports.js';
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, spawn: vi.fn(actual.spawn), spawnSync: vi.fn(actual.spawnSync) };
+});
+vi.mock('node:net', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:net')>();
+  return { ...actual, createServer: vi.fn(actual.createServer) };
+});
 
 describe('harness live probe transports', () => {
   const dirs: string[] = [];
@@ -16,6 +28,39 @@ describe('harness live probe transports', () => {
     delete process.env.CEZ_TEST_KIMI_BIN;
     delete process.env.CEZ_TEST_ADVISOR_KEY;
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    vi.resetAllMocks();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    { runner: 'claude', model: 'sonnet' },
+    { runner: 'codex', model: 'gpt-5.6-sol' },
+    { runner: 'opencode', model: 'opencode/mimo-v2.5-free' },
+    { runner: 'harness', model: 'kimi' },
+    { runner: 'harness', model: 'http-advisor' },
+  ] as const)('does no probe IO in dry-run mode for $runner/$model', async (ref) => {
+    vi.stubEnv('CEZ_DRY_RUN', '1');
+    vi.stubEnv('CEZ_TEST_ADVISOR_KEY', 'test-only-key');
+    const forbidden = () => { throw new Error('unexpected live probe IO'); };
+    const spawn = vi.spyOn(childProcess, 'spawn').mockImplementation(forbidden);
+    const spawnSync = vi.spyOn(childProcess, 'spawnSync').mockImplementation(forbidden);
+    const server = vi.spyOn(net, 'createServer').mockImplementation(forbidden);
+    const claude = vi.spyOn(ClaudeCliRunner.prototype, 'run').mockRejectedValue(new Error('unexpected live probe IO'));
+    const fetch = vi.fn(forbidden);
+    vi.stubGlobal('fetch', fetch);
+    const transport = createLiveTransport({ advisors: {
+      kimi: { model: 'kimi-code/k3', preset: 'kimi-subscription' },
+      'http-advisor': { model: 'advisor', endpoint: 'https://example.invalid', credentialEnv: 'CEZ_TEST_ADVISOR_KEY' },
+    } });
+
+    await expect(transport(ref)).resolves.toMatchObject({
+      status: 'unverified',
+      detail: expect.stringContaining('CEZ_DRY_RUN=1'),
+    });
+    for (const operation of [spawn, spawnSync, server, claude, fetch]) {
+      expect(operation).not.toHaveBeenCalled();
+    }
   });
 
   const kimiStub = (): string => {

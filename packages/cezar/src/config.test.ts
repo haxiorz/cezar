@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { DEFAULT_SKILLS_REPOS, gatedSkillsRepos, loadConfig, resolveWorktreeRetention } from './config.ts';
+import { DEFAULT_SKILLS_REPOS, gatedSkillsRepos, loadConfig, multiModelEnabled, resolveWorktreeRetention } from './config.ts';
 
 /**
  * `config.json` schema roundtrips (R2 2.3: `systemPrompt?`). The invariants
@@ -121,14 +121,24 @@ describe('loadConfig systemPrompt', () => {
   describe('multiModel', () => {
     it('defaults to false, round-trips true, and degrades a bad value to false', async () => {
       expect((await loadConfig(repoRoot)).multiModel).toBe(false);
+      expect(multiModelEnabled(repoRoot)).toBe(false);
 
       write({ multiModel: true });
       expect((await loadConfig(repoRoot)).multiModel).toBe(true);
+      expect(multiModelEnabled(repoRoot)).toBe(true);
 
       write({ multiModel: 'on', defaultRunner: 'codex' });
       const config = await loadConfig(repoRoot);
       expect(config.multiModel).toBe(false);
+      expect(multiModelEnabled(repoRoot)).toBe(false);
       expect(config.defaultRunner).toBe('codex');
+    });
+    it('keeps synchronous admission and asynchronous config fail-closed on malformed files', async () => {
+      for (const raw of ['{', 'null', '[]', '{"multiModel":true,"maxParallel":"invalid"}']) {
+        writeFileSync(join(repoRoot, '.ai/cezar', 'config.json'), raw);
+        expect(multiModelEnabled(repoRoot)).toBe((await loadConfig(repoRoot)).multiModel);
+        expect(multiModelEnabled(repoRoot)).toBe(false);
+      }
     });
   });
 

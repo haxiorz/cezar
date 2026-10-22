@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { harnessLedgerResponseSchema } from '@open-mercato/cezar-contract';
+import { harnessLedgerResponseSchema, harnessProbeInputSchema, harnessStartInputSchema } from '@open-mercato/cezar-contract';
 import { createLedger, readLedger, saveLedger } from '../harness/ledger.js';
 import { acquireIssueClaim } from '../harness/issue-claim.js';
 import { HARNESS_FIX_ISSUE } from '../harness/workflows.js';
@@ -108,6 +108,37 @@ describe('harness API', () => {
       expect(((await res.json()) as { error: string }).error).toMatch(/multiModel/);
       expect(captured).toBeUndefined();
     });
+  });
+
+  it('rejects read-only harness starts before probing or dispatching a writing workflow', async () => {
+    const res = await post('/api/v1/runs', {
+      task: 'Fix issue #642',
+      workflow: HARNESS_FIX_ISSUE,
+      readOnly: true,
+      harness: { profile: 'standard' },
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toMatch(/read.only/i);
+    expect(captured).toBeUndefined();
+  });
+
+  it('shares the bounded role-input contract with clients', () => {
+    const roles = {
+      orchestrator: { runner: 'claude', model: '' },
+      implementer: { runner: 'codex', model: '' },
+      reviewers: [{ runner: 'claude', model: 'sonnet' }, { runner: 'codex', model: 'gpt-5' }],
+    };
+    expect(harnessProbeInputSchema.safeParse({}).success).toBe(false);
+    for (const reviewers of [[], roles.reviewers.slice(0, 1), [roles.reviewers[0], roles.reviewers[0]],
+      [{ runner: 'harness', model: '' }, roles.reviewers[1]],
+      [{ runner: 'codex', model: 'x'.repeat(201) }, roles.reviewers[0]]]) {
+      expect(harnessStartInputSchema.safeParse({ roles: { ...roles, reviewers } }).success).toBe(false);
+      expect(harnessProbeInputSchema.safeParse({ roles: { ...roles, reviewers } }).success).toBe(false);
+    }
+    expect(harnessStartInputSchema.safeParse({ roles }).success).toBe(true);
+    expect(harnessStartInputSchema.safeParse({ baseAcknowledgement: {
+      configuredBase: 'main', remoteDefault: 'develop', reason: ' ',
+    } }).success).toBe(false);
   });
 
   describe('GET /api/v1/harness/status', () => {

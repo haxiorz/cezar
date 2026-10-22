@@ -82,6 +82,7 @@ const AGENTS_CONFIG = {
   worktreeRetention: 10,
   liveTitleUpdates: null,
   reviewGate: null,
+  profile: null, taskWorkspace: null, landing: null, landingBlocked: null, requiredChecks: [], defaultSkill: null, askSkill: null, teamSkills: true,
 }
 
 /** Seeds the step-3.2 route gates — boot id (legacy redirect) + registry (known-check) — so a
@@ -167,7 +168,7 @@ afterEach(() => {
   document.documentElement.classList.remove('light')
 })
 
-const PROJECT_SECTIONS = ['tracker', 'secrets', 'integrations', 'agents', 'harness', 'instructions', 'tasks', 'agent-config', 'worktrees', 'bookmarklets']
+const PROJECT_SECTIONS = ['tracker', 'secrets', 'integrations', 'agents', 'instructions', 'tasks', 'agent-config', 'worktrees', 'bookmarklets']
 const GLOBAL_SECTIONS = [
   'appearance',
   'notifications',
@@ -210,15 +211,13 @@ describe('the section registry', () => {
     expect(visibleSettingsSections('global').map((s) => s.id)).toEqual(GLOBAL_SECTIONS)
   })
 
-  it('hides Harness when the multiModel flag is known-off; absent keeps it routed', () => {
-    // `false` = the project's config said the feature is off (the default) — the nav drops the
-    // section. Absent = the caller cannot know (route registration), so the section stays and
-    // the component itself explains the gate.
-    expect(visibleSettingsSections('project', { multiModel: false }).map((s) => s.id)).toEqual(
-      PROJECT_SECTIONS.filter((id) => id !== 'harness'),
-    )
-    expect(visibleSettingsSections('project', { multiModel: true }).map((s) => s.id)).toEqual(PROJECT_SECTIONS)
-    expect(visibleSettingsSections('project').map((s) => s.id)).toEqual(PROJECT_SECTIONS)
+  it('hides Harness until the project explicitly enables multiModel', () => {
+    for (const capabilities of [undefined, {}, { multiModel: false }]) {
+      expect(visibleSettingsSections('project', capabilities).map((s) => s.id)).toEqual(PROJECT_SECTIONS)
+    }
+    expect(visibleSettingsSections('project', { multiModel: true }).map((s) => s.id)).toEqual([
+      ...PROJECT_SECTIONS.slice(0, 4), 'harness', ...PROJECT_SECTIONS.slice(4),
+    ])
   })
 })
 

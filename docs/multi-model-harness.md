@@ -307,6 +307,26 @@ re-reviewing, and salvaging work that declared itself done.
 | Workflow defs + catalog gating | `packages/cezar/src/harness/workflows.ts`, `src/workflows/load.ts` |
 | Founding spec | `.ai/specs/2026-07-23-harness-orchestration.md` |
 
-The feature rides the `multiModel` flag (`.ai/cezar/config.json`, off by default).
-Flipping it off never strands in-flight runs — revival reads the persisted workflow
-definition, and the ledger routes stay readable for history.
+## Enabling the feature
+
+Multi-model is **off by default**, per repository. To opt in, add `"multiModel": true`
+to the existing `.ai/cezar/config.json` object, preserving its other keys (or create
+`{ "multiModel": true }` when the file does not exist). Reload the cockpit to reveal
+the **Multi-model** composer and **Harness** settings. The project config API also
+accepts `PUT /api/v1/p/:projectId/config` with `{ "multiModel": true }`.
+
+Set the key to `false`, remove it, or send `null` through the config API to disable
+new harness runs and live model probes. Missing, malformed and unreadable config
+all leave the feature disabled. Disabling it preserves existing runs: recovery and
+Continue use the saved workflow, and their review evidence remains readable.
+
+Harness tasks always use isolated worktrees and stop for human review, including
+in projects configured for trunk development or automatic landing. Read-only Ask
+tasks cannot start a writing harness workflow.
+
+`CEZ_DRY_RUN=1` leaves live harness probes and execution unavailable, including
+recovery, so offline testing cannot invoke a real reviewer or writing agent.
+Stored review evidence remains readable. Ordinary harness feedback restarts
+implementation and its validation/review gates. A completed, staged
+`high-assurance` packet run requires a new task for further changes; interrupted
+packet runs and no-action decisions can still resume.

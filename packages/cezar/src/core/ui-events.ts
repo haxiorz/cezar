@@ -426,6 +426,13 @@ export interface UiHarnessStageUpdatedEvent {
   stage: Record<string, unknown>;
 }
 
+/** A persisted feedback restart invalidates the previous implementation review cycle. */
+export interface UiHarnessFeedbackAppliedEvent {
+  type: 'harness.feedback.applied';
+  phaseId: string;
+  messageIds: string[];
+}
+
 export type UiEvent =
   | UiSessionStartedEvent
   | UiSessionEndedEvent
@@ -446,7 +453,8 @@ export type UiEvent =
   | UiHarnessReadinessUpdatedEvent
   | UiHarnessCouncilUpdatedEvent
   | UiHarnessPacketUpdatedEvent
-  | UiHarnessStageUpdatedEvent;
+  | UiHarnessStageUpdatedEvent
+  | UiHarnessFeedbackAppliedEvent;
 
 /** Every v2 event discriminator — `satisfies Record<UiEventType, …>` maps
  *  downstream keep new event types honest at compile time. */

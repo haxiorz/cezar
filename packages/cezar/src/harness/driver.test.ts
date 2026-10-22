@@ -1,16 +1,19 @@
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as claudeGuard from './claude-guard.js';
 import { loadLedger, saveLedger, createLedger, startPhase, finishPhase } from './ledger.js';
 import { HARNESS_FIX_ISSUE, HARNESS_IMPLEMENT_FEATURE } from './workflows.js';
 import {
@@ -1070,6 +1073,37 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(await snapshotHarnessStageSubject(repo)).not.toBe(unstagedStageSubject);
   });
 
+  it.each(['executable mode', 'file type'] as const)(
+    'invalidates review and stage subjects when a dirty path changes %s',
+    async (change) => {
+      const repo = join(dir, 'subject-metadata-repo');
+      mkdirSync(repo);
+      const git = (...args: string[]) =>
+        execFileSync('git', args, { cwd: repo, encoding: 'utf8' });
+      git('init', '-q', '-b', 'main');
+      git('config', 'user.email', 'test@local');
+      git('config', 'user.name', 'test');
+      const path = join(repo, 'script');
+      writeFileSync(path, 'base\n');
+      git('add', 'script');
+      git('commit', '-q', '-m', 'base');
+      writeFileSync(path, 'symlink:target');
+      chmodSync(path, 0o644);
+      const beforeReview = await snapshotHarnessReviewSubject(repo);
+      const beforeStage = await snapshotHarnessStageSubject(repo);
+
+      if (change === 'executable mode') {
+        chmodSync(path, 0o755);
+      } else {
+        rmSync(path);
+        symlinkSync('target', path);
+      }
+
+      expect(await snapshotHarnessReviewSubject(repo)).not.toBe(beforeReview);
+      expect(await snapshotHarnessStageSubject(repo)).not.toBe(beforeStage);
+    },
+  );
+
   /**
    * Regression (run 5f6fe8ae, 2026-07-28): the cockpit's diff polling runs
    * `git add -N .` in task worktrees so untracked files show in diffstats. The
@@ -1575,6 +1609,29 @@ describe('harness driver — standard fix-issue graph', () => {
     );
   });
 
+  it.each([false, true])('refuses dry-run execution before probes or model work (resume=%s)', async (resume) => {
+    if (resume) {
+      const previous = makeHarness(dir);
+      expect(await runHarnessDriver(previous.host, input, previous.deps)).toBeNull();
+    }
+    const h = makeHarness(dir);
+    const before = loadLedger(h.host.dataDir, h.host.runId);
+    const prober = vi.fn(h.deps.createProber!);
+    const runtime = vi.fn(h.deps.createRuntime!);
+    h.deps.createProber = prober;
+    h.deps.createRuntime = runtime;
+    vi.stubEnv('CEZ_DRY_RUN', '1');
+    try {
+      await expect(runHarnessDriver(h.host, input, h.deps)).resolves.toMatch(/unavailable.*CEZ_DRY_RUN=1/);
+      expect(prober).not.toHaveBeenCalled();
+      expect(runtime).not.toHaveBeenCalled();
+      expect(h.calls).toEqual([]);
+      expect(loadLedger(h.host.dataDir, h.host.runId)).toEqual(before);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('reruns stage when the complete post-review code subject changes', async () => {
     const first = makeHarness(dir);
     expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
@@ -1589,6 +1646,34 @@ describe('harness driver — standard fix-issue graph', () => {
         (invocation) => invocation.id === 'runtime:stage',
       ),
     ).toMatchObject({ status: 'completed', attempt: 1 });
+  });
+
+  it('clears prior risk acceptance when the staged subject is invalidated', async () => {
+    const first = makeHarness(dir);
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const accepted = loadLedger(first.host.dataDir, first.host.runId)!;
+    accepted.outcome = {
+      status: 'contested',
+      blockingReasons: ['previously reviewed risk'],
+      acceptedAt: '2026-10-22T10:00:00.000Z',
+      acceptedBy: 'user',
+      acceptanceReason: 'accepted for the previous diff',
+    };
+    saveLedger(first.host.dataDir, first.host.runId, accepted);
+
+    const unchanged = makeHarness(dir);
+    expect(await runHarnessDriver(unchanged.host, input, unchanged.deps)).toBeNull();
+    expect(loadLedger(first.host.dataDir, first.host.runId)?.outcome.acceptedAt).toBe(
+      accepted.outcome.acceptedAt,
+    );
+
+    const changed = makeHarness(dir);
+    changed.deps.snapshotStageSubject = async () => 'changed-stage-subject';
+    expect(await runHarnessDriver(changed.host, input, changed.deps)).toBeNull();
+    const outcome = loadLedger(first.host.dataDir, first.host.runId)?.outcome;
+    expect(outcome?.acceptedAt).toBeUndefined();
+    expect(outcome?.acceptedBy).toBeUndefined();
+    expect(outcome?.acceptanceReason).toBeUndefined();
   });
 
   it('reruns legacy v1 model phases instead of blessing old approvals with current hashes', async () => {
@@ -1864,6 +1949,84 @@ describe('harness driver — standard fix-issue graph', () => {
     ).toBe(true);
   });
 
+  it('applies review-gate feedback through implementation and fresh gates on every continuation', async () => {
+    const first = makeHarness(dir);
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+
+    for (let round = 1; round <= 3; round += 1) {
+      const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+      ledger.pendingMessages.push({
+        id: `feedback-${round}`,
+        text: `Preserve correction ${round}.`,
+        createdAt: new Date().toISOString(),
+      });
+      saveLedger(first.host.dataDir, first.host.runId, ledger);
+      const resumed = makeHarness(dir);
+      let implementPrompt = '';
+      resumed.agentBehavior.set('implement', (req) => {
+        implementPrompt = req.prompt;
+        writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/fix.ts'] }));
+        return null;
+      });
+
+      expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+
+      expect(resumed.calls.filter((call) => call.kind === 'agent').map((call) => call.id))
+        .toEqual(['implement', 'review']);
+      expect(resumed.ops.map((call) => call.id)).toContain('stage');
+      for (let correction = 1; correction <= round; correction += 1) {
+        expect(implementPrompt).toContain(`Preserve correction ${correction}.`);
+      }
+      expect(loadLedger(first.host.dataDir, first.host.runId)?.pendingMessages.at(-1))
+        .toMatchObject({ consumedByPhaseId: 'implement', consumedAt: expect.any(String) });
+    }
+  });
+
+  it('reconsiders a no-action result when the operator supplies new evidence', async () => {
+    const first = makeHarness(dir);
+    first.agentBehavior.set('qualify', (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ outcome: 'no_action', evidence: 'not reproduced' }));
+      return null;
+    });
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    ledger.pendingMessages.push({
+      id: 'new-evidence',
+      text: 'The failure reproduces with an empty queue.',
+      createdAt: new Date().toISOString(),
+    });
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+    const resumed = makeHarness(dir);
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+    expect(resumed.calls.filter((call) => call.kind === 'agent').map((call) => call.id))
+      .toEqual(['qualify', 'diagnose', 'implement', 'review']);
+    expect(loadLedger(first.host.dataDir, first.host.runId)?.pendingMessages[0])
+      .toMatchObject({ consumedByPhaseId: 'qualify', consumedAt: expect.any(String) });
+  });
+
+  it('resumes an unstaged high-assurance council with feedback after implementation completed', async () => {
+    const first = makeHarness(dir);
+    first.deps.loadAgentic = async () => highAssuranceAgentic();
+    first.setCouncilBehavior(() => ({ ok: false, stderr: 'review transport failed' }));
+    const packetInput = { ...input, profile: 'high-assurance' as const };
+    expect(await runHarnessDriver(first.host, packetInput, first.deps)).toMatch(/council|review/i);
+    const interrupted = loadLedger(first.host.dataDir, first.host.runId)!;
+    expect(interrupted.phases.find((phase) => phase.id === 'implement')?.status).toBe('done');
+    expect(interrupted.stage.status).not.toBe('staged');
+    interrupted.pendingMessages.push({
+      id: 'packet-feedback',
+      text: 'Check empty queues carefully when reviewing.',
+      createdAt: new Date().toISOString(),
+    });
+    saveLedger(first.host.dataDir, first.host.runId, interrupted);
+    const resumed = makeHarness(dir);
+    resumed.deps.loadAgentic = async () => highAssuranceAgentic();
+
+    expect(await runHarnessDriver(resumed.host, packetInput, resumed.deps)).toBeNull();
+    expect(resumed.ops.map((call) => call.id)).not.toContain('packet-run');
+    expect(loadLedger(first.host.dataDir, first.host.runId)?.pendingMessages[0]?.consumedAt).toBeTruthy();
+  });
+
   it('preserves a message authored mid-phase and delivers it only to the next phase', async () => {
     const h = makeHarness(dir);
     let diagnosePrompt = '';
@@ -2114,6 +2277,49 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(seen.find((s) => s.id === 'implement')?.runner).toBe('codex');
     expect(h.calls.filter((c) => c.kind === 'agent' && c.id === 'review')).toHaveLength(1);
     expect(h.ops.some((o) => o.id === 'review')).toBe(true);
+  });
+
+  it('runs a Codex and gateway lineup when the optional Claude sandbox is unavailable', async () => {
+    const guard = vi.spyOn(claudeGuard, 'createClaudeStageOnlySettings').mockImplementation(() => {
+      throw new Error('optional Claude sandbox is unavailable');
+    });
+    try {
+      const h = makeHarness(dir);
+      const error = await runHarnessDriver(h.host, {
+        ...input,
+        roles: {
+          orchestrator: { runner: 'codex', model: 'gpt-5.6-sol' },
+          implementer: roles.implementer,
+          reviewers: [
+            { runner: 'codex', model: 'gpt-5.6-sol' },
+            { runner: 'opencode', model: 'opencode/mimo-v2.5-free' },
+          ],
+        },
+      }, h.deps);
+
+      expect(error).toBeNull();
+      expect(guard).not.toHaveBeenCalled();
+      expect(loadLedger(h.host.dataDir, h.host.runId)?.stage.status).toBe('staged');
+    } finally {
+      guard.mockRestore();
+    }
+  });
+
+  it('fails the Claude phase cleanly before invoking an agent when its sandbox is unavailable', async () => {
+    const guard = vi.spyOn(claudeGuard, 'createClaudeStageOnlySettings').mockImplementation(() => {
+      throw new Error('optional Claude sandbox is unavailable');
+    });
+    try {
+      const h = makeHarness(dir);
+      await expect(runHarnessDriver(h.host, input, h.deps)).resolves.toMatch(
+        /Claude stage-only sandbox unavailable.*optional Claude sandbox is unavailable/,
+      );
+      expect(h.calls.filter((call) => call.kind === 'agent')).toHaveLength(0);
+      expect(loadLedger(h.host.dataDir, h.host.runId)?.phases.find((phase) => phase.id === 'qualify'))
+        .toMatchObject({ status: 'failed' });
+    } finally {
+      guard.mockRestore();
+    }
   });
 
   /**
@@ -2371,6 +2577,37 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(resumed).toBeNull();
     expect(councilCalls).toHaveLength(3);
     expect(loadLedger(h.host.dataDir, h.host.runId)?.outcome.status).toBe('ready');
+  });
+
+  it('requires a new quorum decision after feedback supersedes the accepted handoff', async () => {
+    const first = makeHarness(dir);
+    advisorsAlwaysFail(first);
+    expect(await runHarnessDriver(first.host, threeReviewerInput, first.deps)).toMatch(/quorum/);
+    const waived = loadLedger(first.host.dataDir, first.host.runId)!;
+    waived.decisions.push({
+      at: new Date().toISOString(),
+      kind: 'council.proceed',
+      by: 'user',
+      detail: 'implementation:1',
+    });
+    saveLedger(first.host.dataDir, first.host.runId, waived);
+    expect(await runHarnessDriver(first.host, threeReviewerInput, first.deps)).toBeNull();
+
+    const updated = loadLedger(first.host.dataDir, first.host.runId)!;
+    updated.pendingMessages.push({
+      id: 'feedback-after-waiver',
+      text: 'Change the implementation to preserve empty queues.',
+      createdAt: new Date().toISOString(),
+    });
+    saveLedger(first.host.dataDir, first.host.runId, updated);
+    const resumed = makeHarness(dir);
+    advisorsAlwaysFail(resumed);
+
+    expect(await runHarnessDriver(resumed.host, threeReviewerInput, resumed.deps)).toMatch(/quorum/);
+    expect(resumed.calls.map((call) => call.id)).toContain('implement');
+    expect(resumed.ops.map((call) => call.id)).not.toContain('stage');
+    expect(loadLedger(first.host.dataDir, first.host.runId)?.outcome)
+      .toMatchObject({ status: 'blocked', pendingDecision: { kind: 'council', canProceed: true } });
   });
 
   it('offers only retry when every reviewer failed', async () => {

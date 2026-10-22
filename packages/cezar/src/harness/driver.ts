@@ -308,7 +308,11 @@ function hashWorktreeContentVsHead(
     try {
       const stat = lstatSync(absolute);
       if (stat.isSymbolicLink()) hash.update(`symlink:${readlinkSync(absolute)}`);
-      else if (stat.isFile()) hash.update(readFileSync(absolute));
+      else if (stat.isFile()) {
+        // Git tracks the executable bit and file type as part of the reviewed change.
+        hash.update(`file:${stat.mode & 0o111 ? 'executable' : 'regular'}\0`);
+        hash.update(readFileSync(absolute));
+      }
       else hash.update(`mode:${stat.mode}`);
     } catch {
       hash.update('absent'); // deleted from the worktree
@@ -641,6 +645,9 @@ export async function runHarnessDriver(
   input: HarnessDriverInput,
   deps: HarnessDriverDeps = {},
 ): Promise<string | null> {
+  if (process.env.CEZ_DRY_RUN === '1') {
+    return 'Multi-model harness execution is unavailable with CEZ_DRY_RUN=1; dry-run mode does not perform live model calls or simulate completed reviews.';
+  }
   const resolveScript = deps.resolveScript ?? resolveHarnessScript;
   const sealRuntime = deps.sealRuntime ?? sealHarnessRuntime;
   const scriptDigest = deps.scriptDigest ?? harnessScriptDigest;
@@ -692,7 +699,7 @@ export async function runHarnessDriver(
     ].join('\n');
   const noGitHubAuthDir = join(artifactDir, 'no-github-auth');
   mkdirSync(noGitHubAuthDir, { recursive: true });
-  const claudeGuard = createClaudeStageOnlySettings(artifactDir, host.cwd, agentOutputDir);
+  let claudeGuard: ReturnType<typeof createClaudeStageOnlySettings> | undefined;
 
   const ledgerRead = readLedger(host.dataDir, host.runId);
   if (ledgerRead.status === 'corrupt') {
@@ -772,7 +779,14 @@ export async function runHarnessDriver(
         decisionKeys.add(key);
       }
     }
-    if (current.ledger.outcome.acceptedAt && !ledger.outcome.acceptedAt) {
+    if (
+      current.ledger.outcome.acceptedAt &&
+      !ledger.outcome.acceptedAt &&
+      ledger.outcome.status === 'contested' &&
+      current.ledger.outcome.status === 'contested' &&
+      JSON.stringify(current.ledger.outcome.blockingReasons) ===
+        JSON.stringify(ledger.outcome.blockingReasons)
+    ) {
       ledger.outcome.acceptedAt = current.ledger.outcome.acceptedAt;
       ledger.outcome.acceptedBy = current.ledger.outcome.acceptedBy;
       ledger.outcome.acceptanceReason = current.ledger.outcome.acceptanceReason;
@@ -990,10 +1004,19 @@ export async function runHarnessDriver(
       emitInvocation(invocation);
     }
   };
-  const runAgentInvocation = (
+  const runAgentInvocation = async (
     invocation: HarnessInvocation,
     request: HarnessAgentPhaseRequest,
   ): Promise<string | null> => {
+    let guardEnv: Record<string, string> = {};
+    if ((request.runner ?? 'claude') === 'claude') {
+      try {
+        claudeGuard ??= createClaudeStageOnlySettings(artifactDir, host.cwd, agentOutputDir);
+        guardEnv = claudeGuard.env;
+      } catch (error) {
+        return `Claude stage-only sandbox unavailable: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
     const token = randomUUID();
     const trustedPrompt =
       request.skillSystemPrompt ??
@@ -1003,7 +1026,7 @@ export async function runHarnessDriver(
       ...(trustedPrompt ? { skillSystemPrompt: trustedPrompt } : {}),
       env: {
         ...request.env,
-        ...claudeGuard.env,
+        ...guardEnv,
         CEZ_PROCESS_TOKEN: token,
         CEZ_HARNESS_STAGE_ONLY: '1',
         GIT_ALLOW_PROTOCOL: '',
@@ -1047,6 +1070,55 @@ export async function runHarnessDriver(
     ledger.stage = { status: 'pending' };
     ledger.outcome = { status: 'pending', blockingReasons: [] };
     persist();
+  };
+
+  const feedback = ledger.pendingMessages.filter(
+    (message) => !message.consumedAt && !message.assignedToPhaseId,
+  );
+  const feedbackPhase = ledger.outcome.status === 'no-action'
+    ? 'qualify'
+    : phaseDone('implement') &&
+        (ledger.effectiveProfile !== 'high-assurance' || ledger.stage.status === 'staged')
+      ? 'implement'
+      : undefined;
+  if (feedback.length > 0 && feedbackPhase) {
+    if (ledger.effectiveProfile === 'high-assurance' && feedbackPhase === 'implement') {
+      return 'completed high-assurance packet work requires a new task for feedback; packet leases cannot be reopened safely';
+    }
+    const phase = ledger.phases.find((entry) => entry.id === feedbackPhase);
+    if (!phase) {
+      return `harness feedback recovery blocked: the ledger has no ${feedbackPhase} phase to resume`;
+    }
+    const start = ledger.phases.indexOf(phase);
+    const invalidated = new Set(ledger.phases.slice(start).map((phase) => phase.id));
+    for (const invocation of ledger.invocations) {
+      if (!invalidated.has(invocation.phaseId)) continue;
+      invocation.status = 'interrupted';
+      invocation.inputSha256 = sha256(`superseded:${invocation.inputSha256}`);
+      invocation.error = 'superseded by operator feedback';
+    }
+    for (const message of feedback) message.assignedToPhaseId = feedbackPhase;
+    phase.status = 'pending';
+    ledger.councils = ledger.councils.filter((council) => council.kind !== 'implementation');
+    ledger.loops.fixRounds = 0;
+    ledger.decisions.push({
+      at: new Date().toISOString(),
+      kind: 'implementation.feedback',
+      by: 'driver',
+      detail: feedback.map((message) => message.id).join(', '),
+    });
+    invalidateFollowingPhases(feedbackPhase);
+    host.emit({
+      type: 'harness.feedback.applied',
+      stepId: feedbackPhase,
+      phaseId: feedbackPhase,
+      messageIds: feedback.map((message) => message.id),
+    });
+    host.emit({ type: 'note', message: 'applying operator feedback through the harness; implementation and its gates will run again' });
+  }
+  const implementationDecisions = (): HarnessLedger['decisions'] => {
+    const restart = ledger.decisions.map((decision) => decision.kind).lastIndexOf('implementation.feedback');
+    return ledger.decisions.slice(restart + 1);
   };
 
   const resultPathFor = (phaseId: string) =>
@@ -1183,17 +1255,12 @@ export async function runHarnessDriver(
     phaseId: string,
     wasDone: boolean,
   ): BoundaryMessage[] =>
-    wasDone
-      ? ledger.pendingMessages.filter(
-          (message) =>
-            message.assignedToPhaseId === phaseId ||
-            message.consumedByPhaseId === phaseId,
-        )
-      : ledger.pendingMessages.filter(
-          (message) =>
-            !message.consumedAt &&
-            (!message.assignedToPhaseId || message.assignedToPhaseId === phaseId),
-        );
+    ledger.pendingMessages.filter(
+      (message) =>
+        message.assignedToPhaseId === phaseId ||
+        message.consumedByPhaseId === phaseId ||
+        (!wasDone && !message.consumedAt && !message.assignedToPhaseId),
+    );
   const assignBoundaryMessages = (
     phaseId: string,
     messages: BoundaryMessage[],
@@ -2263,11 +2330,11 @@ export async function runHarnessDriver(
    *  more attempt beyond the automatic budget of 2 — recorded as a ledger
    *  decision, so a resumed process reaches the same bound deterministically. */
   const councilRetryAllowance = (council: CouncilKind, round: number): number =>
-    ledger.decisions.filter(
+    (council === 'implementation' ? implementationDecisions() : ledger.decisions).filter(
       (d) => d.kind === 'council.retry' && d.detail === councilDecisionKey(council, round),
     ).length;
   const councilProceedAccepted = (council: CouncilKind, round: number): boolean =>
-    ledger.decisions.some(
+    (council === 'implementation' ? implementationDecisions() : ledger.decisions).some(
       (d) => d.kind === 'council.proceed' && d.detail === councilDecisionKey(council, round),
     );
 
@@ -4157,7 +4224,7 @@ export async function runHarnessDriver(
     let validationRepairRounds = 0;
     const MAX_VALIDATION_REPAIR_ROUNDS = 2;
     const validationRepairPhases = new Set<string>();
-    const recordedClosingRepair = ledger.decisions.find(
+    const recordedClosingRepair = implementationDecisions().find(
       (decision) => decision.kind === 'review.closing-fixes',
     );
     const recordedClosingRound = recordedClosingRepair?.detail?.match(/^round:(\d+)$/)?.[1];
@@ -4925,7 +4992,7 @@ export async function runHarnessDriver(
       }
       if (round >= ledger.loops.maxFixRounds + validationRepairRounds) {
         closingRepairStartRound = round + 1;
-        if (!ledger.decisions.some((decision) => decision.kind === 'review.closing-fixes')) {
+        if (!implementationDecisions().some((decision) => decision.kind === 'review.closing-fixes')) {
           ledger.decisions.push({
             at: new Date().toISOString(),
             kind: 'review.closing-fixes',

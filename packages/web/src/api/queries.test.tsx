@@ -7,13 +7,14 @@ import { ApiError } from './client'
 import { createQueryClient } from './query-client'
 import { setApiScope } from '@open-mercato/cezar-api-client'
 import { ProjectScopeContext } from './project-scope-context'
-import type { GithubRefStatusData } from '@open-mercato/cezar-api-client'
+import type { GithubRefStatusData, HarnessInvocationRecord } from '@open-mercato/cezar-api-client'
 import {
   refStatusRecheckAfter,
   useReferenceProjectId,
   useProjectRepoBase,
   queryKeys,
   useAcceptContestedHarness,
+  useHarnessInvocation,
   useProviderStatus,
   useRefreshProviderStatus,
   useRetryProviderAuth,
@@ -71,6 +72,24 @@ function wrapper() {
     return <QueryClientProvider client={client}>{children}</QueryClientProvider>
   }
 }
+
+it('refreshes a reviewer conversation when feedback reuses its invocation id', async () => {
+  fetchMock.mockResolvedValueOnce(json({ result: 'old review' }))
+  const invocation: HarnessInvocationRecord = {
+    id: 'review-1-claude', phaseId: 'review', role: 'reviewer', reviewerId: 'claude',
+    binding: { runner: 'claude', model: 'sonnet' }, status: 'completed', attempt: 1,
+    inputSha256: 'original-input', artifactSha256: 'old-result',
+  }
+  const { result, rerender } = renderHook(
+    ({ revision }) => useHarnessInvocation('r1', invocation.id, revision),
+    { wrapper: wrapper(), initialProps: { revision: invocation } },
+  )
+  await waitFor(() => expect(result.current.data?.result).toBe('old review'))
+  fetchMock.mockResolvedValueOnce(json({ result: 'new review' }))
+  rerender({ revision: { ...invocation, inputSha256: 'feedback-input', artifactSha256: 'new-result' } })
+  await waitFor(() => expect(result.current.data?.result).toBe('new review'))
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+})
 
 const HEALTH = {
   version: '0.1.3',
@@ -265,6 +284,22 @@ describe('provider status workspace query', () => {
     expect(result.current.data).toBeUndefined()
     expect(result.current.error).toBeInstanceOf(ApiError)
     expect((result.current.error as ApiError).message).toBe('provider probe failed')
+  })
+
+  it('retries a transient transport failure on a background provider read', async () => {
+    fetchMock
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValueOnce(json(PROVIDERS))
+    const client = createQueryClient()
+    const { result } = renderHook(() => useProviderStatus(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true), { timeout: 5000 })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
   it('enters the query error state for a malformed successful response', async () => {

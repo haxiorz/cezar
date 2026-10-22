@@ -359,7 +359,7 @@ export async function resolveHarnessRuntimeInfo(
   repoRoot: string,
   opts: { bundledDir?: string | null } = {},
 ): Promise<HarnessRuntimeInfo> {
-  const catalog = await discoverSkills(repoRoot, opts).catch(() => [] as Skill[]);
+  const catalog = await discoverSkills(repoRoot, { ...opts, includeHarness: true }).catch(() => [] as Skill[]);
   const skill = catalog.find((s) => s.name === 'cez-harness');
   if (!skill || skill.source === 'builtin') return { installed: false, source: null, commit: null };
   if (skill.source === 'team') {

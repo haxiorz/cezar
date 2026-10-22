@@ -46,6 +46,35 @@ export const harnessRolesSchema = z.object({
 });
 export type HarnessRoles = z.infer<typeof harnessRolesSchema>;
 
+// Public inputs cannot grant internal adapter bindings or bypass council limits.
+const harnessRunnerInputSchema = z.object({
+  runner: harnessRunnerSchema,
+  model: z.string().max(200),
+  effort: harnessEffortSchema.optional(),
+});
+const harnessAdvisorInputSchema = z.object({
+  runner: z.literal('harness'),
+  model: z.string().min(1).max(200),
+  family: z.string().min(1).max(80).optional(),
+});
+export const harnessRolesInputSchema = z.object({
+  orchestrator: harnessRunnerInputSchema,
+  implementer: harnessRunnerInputSchema,
+  reviewers: z.array(z.union([harnessRunnerInputSchema, harnessAdvisorInputSchema]))
+    .min(2, 'pick at least 2 reviewers — multi-model means more than one voice')
+    .max(5, 'pick at most 5 reviewers'),
+}).superRefine((roles, ctx) => {
+  const seen = new Set<string>();
+  for (const reviewer of roles.reviewers) {
+    const key = `${reviewer.runner}::${reviewer.model}`;
+    if (seen.has(key)) {
+      ctx.addIssue({ code: 'custom', message: 'reviewers must be unique models' });
+      return;
+    }
+    seen.add(key);
+  }
+});
+
 export const harnessPresetSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -56,14 +85,15 @@ export type HarnessPreset = z.infer<typeof harnessPresetSchema>;
 export const harnessStartInputSchema = z.object({
   profile: harnessProfileSchema.optional(),
   skillProfile: harnessSkillProfileSchema.optional(),
-  roles: harnessRolesSchema.optional(),
-  issueId: z.string().optional(),
+  roles: harnessRolesInputSchema.optional(),
+  issueId: z.string().trim().min(1).max(200).optional(),
   baseAcknowledgement: z
     .object({
-      configuredBase: z.string(),
-      remoteDefault: z.string(),
-      reason: z.string(),
+      configuredBase: z.string().trim().min(1).max(200),
+      remoteDefault: z.string().trim().min(1).max(200),
+      reason: z.string().trim().min(3).max(2_000),
     })
+    .strict()
     .optional(),
 });
 export type HarnessStartInput = z.input<typeof harnessStartInputSchema>;
@@ -156,7 +186,9 @@ export type HarnessStatusResponse = z.infer<typeof harnessStatusResponseSchema>;
 
 export const harnessProbeInputSchema = z.object({
   profile: harnessProfileSchema.optional(),
-  roles: harnessRolesSchema.optional(),
+  roles: harnessRolesInputSchema.optional(),
+}).refine((value) => value.profile !== undefined || value.roles !== undefined, {
+  message: 'profile or roles is required',
 });
 export type HarnessProbeInput = z.input<typeof harnessProbeInputSchema>;
 
