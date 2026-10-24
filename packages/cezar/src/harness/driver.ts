@@ -2841,6 +2841,18 @@ export async function runHarnessDriver(
    * and the second failure still fails the run: something rewriting the
    * worktree CONTINUOUSLY is a real integrity problem, not a race.
    */
+  /** Settle both council groups before either failure propagates, so a rejected
+   *  runner pool never strands the advisor promise unhandled (PR #925 review). */
+  const settleCouncilGroups = async <A>(
+    runnerWork: Promise<unknown>,
+    advisorWork: Promise<A> | null,
+  ): Promise<A | null> => {
+    const [runner, advisor] = await Promise.allSettled([runnerWork, advisorWork]);
+    if (runner.status === 'rejected') throw runner.reason;
+    if (advisor.status === 'rejected') throw advisor.reason;
+    return advisor.value;
+  };
+
   const runAdvisorCouncilOpWithRetry = async (
     op: Parameters<typeof runAdvisorCouncilOp>[0],
   ): ReturnType<typeof runAdvisorCouncilOp> => {
@@ -3994,9 +4006,9 @@ export async function runHarnessDriver(
                   artifact: join(host.cwd, specPath),
                 })
               : null;
-          await specRunnerWork;
+          const specAdvisorRun = await settleCouncilGroups(specRunnerWork, specAdvisorWork);
           if (specAdvisorWork !== null) {
-            const advisorRun = await specAdvisorWork;
+            const advisorRun = specAdvisorRun;
             if (advisorRun === null) return null;
             if (advisorRun.error) {
               for (const member of specCouncilMembers) {
@@ -4883,9 +4895,9 @@ export async function runHarnessDriver(
                   ].join('\n')}${priorRoundsAppendix()}${councilBoundaryAppendix}`,
               })
             : null;
-        await runnerReviewerWork;
+        const settledAdvisorRun = await settleCouncilGroups(runnerReviewerWork, advisorWork);
         if (advisorWork !== null) {
-          const advisorRun = await advisorWork;
+          const advisorRun = settledAdvisorRun;
           if (advisorRun === null) return null;
           if (advisorRun.error) {
             for (const member of implCouncilMembers) {

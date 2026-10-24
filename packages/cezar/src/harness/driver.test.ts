@@ -2853,6 +2853,59 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
    *  (2026-07-29): the session reviewer here refuses to finish until the
    *  advisor op has been observed starting. Under the old sequential order
    *  that observation never happens and the flag stays false. */
+  // PR #925 review (D10): a rejected runner pool used to strand the advisor promise unhandled.
+  for (const workflow of [HARNESS_FIX_ISSUE, HARNESS_IMPLEMENT_FEATURE]) {
+    it(`settles the advisor council before a runner-pool failure propagates (${workflow})`, async () => {
+      const h = makeHarness(dir);
+      const strays: unknown[] = [];
+      const onStray = (reason: unknown) => strays.push(reason);
+      process.on('unhandledRejection', onStray);
+      const fakeRuntime = h.deps.createRuntime!;
+      h.deps.createRuntime = (opts) => {
+        const runtime = fakeRuntime(opts);
+        return {
+          kill: () => runtime.kill(),
+          run: async (op, args, runOpts) => {
+            if (op === 'review') throw new Error('council transport died');
+            return runtime.run(op, args, runOpts);
+          },
+        };
+      };
+      const emit = h.host.emit;
+      h.host.emit = (event) => {
+        const invocation = event.invocation as { id?: string; status?: string } | undefined;
+        if (invocation?.id?.startsWith('advisor:') && invocation.status === 'failed') {
+          throw new Error('advisor ledger write failed');
+        }
+        emit(event);
+      };
+      for (const phase of ['review', 'spec-review']) {
+        h.agentBehavior.set(phase, () => {
+          throw new Error('runner reviewer crashed');
+        });
+      }
+      h.agentBehavior.set('spec', (req) => {
+        mkdirSync(join(dir, '.ai', 'specs'), { recursive: true });
+        writeFileSync(join(dir, '.ai', 'specs', 'f.md'), '# spec\n', 'utf8');
+        writeFileSync(
+          req.resultPath,
+          JSON.stringify({ summary: 's', specPath: '.ai/specs/f.md', files: ['.ai/specs/f.md'] }),
+          'utf8',
+        );
+        return null;
+      });
+      try {
+        await expect(runHarnessDriver(h.host, { ...input, workflow }, h.deps)).rejects.toThrow(
+          'runner reviewer crashed',
+        );
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(strays).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', onStray);
+      }
+    });
+  }
+
   it('launches the advisor council alongside the runner reviewers', async () => {
     const h = makeHarness(dir);
     let advisorStartedDuringSessionReview = false;
