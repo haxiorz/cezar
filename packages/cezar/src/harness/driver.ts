@@ -824,6 +824,11 @@ export async function runHarnessDriver(
       council,
     ];
   };
+  // A block without a pending decision is re-derived by this entry; left in
+  // place it outlived a clean resume, and staging promotes only `pending` (PR #925 review).
+  if (ledger.outcome.status === 'blocked' && !ledger.outcome.pendingDecision) {
+    setOutcome({ status: 'pending', blockingReasons: [] });
+  }
   for (const invocation of ledger.invocations.filter((entry) => entry.status === 'running')) {
     if (invocation.process) {
       const reconciliation = await reconcileProcess(invocation.process);
@@ -5119,6 +5124,7 @@ export async function runHarnessDriver(
       phaseDone('stage') &&
       ledger.stage.status === 'staged'
     ) {
+      if (ledger.outcome.status === 'pending') setOutcome({ status: 'ready', blockingReasons: [] });
       host.emit({
         type: 'note',
         stepId: 'stage',

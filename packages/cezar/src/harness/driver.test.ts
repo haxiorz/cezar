@@ -2400,6 +2400,31 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(implementCalls).toBe(0);
   });
 
+  // PR #925 review (D3): staging promotes only a pending outcome, so a stale block meant publish 409'd forever.
+  it('clears a transient blocked outcome when a resume stages cleanly', async () => {
+    const first = makeHarness(dir);
+    const fakeRuntime = first.deps.createRuntime!;
+    first.deps.createRuntime = (opts) => {
+      const runtime = fakeRuntime(opts);
+      return {
+        kill: () => runtime.kill(),
+        run: async (op, args, runOpts) =>
+          op === 'stage'
+            ? { ok: false, exitCode: 1, stdout: '', stderr: 'index.lock exists', durationMs: 1 }
+            : runtime.run(op, args, runOpts),
+      };
+    };
+    expect(await runHarnessDriver(first.host, input, first.deps)).toMatch(/stage refused the handoff/);
+    expect(loadLedger(first.host.dataDir, first.host.runId)?.outcome.status).toBe('blocked');
+
+    const resumed = makeHarness(dir);
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+
+    const ledger = loadLedger(resumed.host.dataDir, resumed.host.runId);
+    expect(ledger?.stage.status).toBe('staged');
+    expect(ledger?.outcome).toMatchObject({ status: 'ready', blockingReasons: [] });
+  });
+
   it('returns null without staging when cancelled between phases', async () => {
     const h = makeHarness(dir);
     let cancelled = false;
