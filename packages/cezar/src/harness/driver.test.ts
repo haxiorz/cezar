@@ -3206,6 +3206,65 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(h.ops.map((o) => o.id)).not.toContain('review');
   });
 
+  // PR #925 review (D6): the spec path was rejected only after the phase completed, so every resume reused it.
+  it('retries the spec phase once, naming the rejected spec path', async () => {
+    const h = makeHarness(dir);
+    const specPrompts: string[] = [];
+    h.agentBehavior.set('spec', (req) => {
+      specPrompts.push(req.prompt);
+      const specPath = specPrompts.length === 1 ? '.ai/specs/ghost.md' : '.ai/specs/f.md';
+      if (specPrompts.length > 1) {
+        mkdirSync(join(dir, '.ai', 'specs'), { recursive: true });
+        writeFileSync(join(dir, specPath), '# spec\n', 'utf8');
+      }
+      writeFileSync(req.resultPath, JSON.stringify({ summary: 's', specPath, files: [specPath] }), 'utf8');
+      return null;
+    });
+
+    const error = await runHarnessDriver(h.host, { ...input, workflow: HARNESS_IMPLEMENT_FEATURE }, h.deps);
+
+    expect(error).toBeNull();
+    expect(specPrompts).toHaveLength(2);
+    expect(specPrompts[1]).toContain('RESULT-CONTRACT RETRY');
+    expect(specPrompts[1]).toContain('no such file exists in the run worktree');
+  });
+
+  it('re-runs a completed spec phase on resume when its spec file is no longer valid', async () => {
+    let cancelled = false;
+    let specCalls = 0;
+    const entry = () => {
+      const h = makeHarness(dir);
+      h.host.isCancelled = () => cancelled;
+      h.agentBehavior.set('spec', (req) => {
+        specCalls += 1;
+        mkdirSync(join(dir, '.ai', 'specs'), { recursive: true });
+        writeFileSync(join(dir, '.ai', 'specs', 'f.md'), '# spec\n', 'utf8');
+        writeFileSync(
+          req.resultPath,
+          JSON.stringify({ summary: 's', specPath: '.ai/specs/f.md', files: ['.ai/specs/f.md'] }),
+          'utf8',
+        );
+        return null;
+      });
+      return h;
+    };
+    const first = entry();
+    first.agentBehavior.set('spec-review', () => {
+      cancelled = true;
+      return null;
+    });
+    const feature = { ...input, workflow: HARNESS_IMPLEMENT_FEATURE };
+    expect(await runHarnessDriver(first.host, feature, first.deps)).toBeNull();
+    rmSync(join(dir, '.ai', 'specs', 'f.md'));
+
+    cancelled = false;
+    const resumed = entry();
+    expect(await runHarnessDriver(resumed.host, feature, resumed.deps)).toBeNull();
+
+    expect(specCalls).toBe(2);
+    expect(loadLedger(resumed.host.dataDir, resumed.host.runId)?.stage.status).toBe('staged');
+  });
+
   /* ---- readiness probing (2026-07-25) ---- */
 
   it('fails preflight with the upstream error when a bound model is unreachable', async () => {

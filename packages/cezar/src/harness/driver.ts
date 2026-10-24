@@ -1332,6 +1332,9 @@ export async function runHarnessDriver(
     schema: z.ZodType<T>,
     timeoutKey: string,
     ref?: HarnessRoleRef,
+    /** A semantic check on a schema-valid result; its violation is a contract
+     *  failure, so a reused result that fails it is re-run, never re-reused. */
+    accept?: (result: T) => string | null,
   ): Promise<T | { error: string } | { cancelled: true }> => {
     const wasDone = phaseDone(phaseId);
     host.upsertStep({ id: phaseId, name, kind: 'agent' });
@@ -1382,7 +1385,14 @@ export async function runHarnessDriver(
       }),
     );
     const reusable = reusableInvocation(invocationId, invocationInputSha256, schema);
-    if (reusable !== null) {
+    const reusedViolation = reusable !== null ? accept?.(reusable) ?? null : null;
+    if (reusedViolation !== null) {
+      const rejected = ledger.invocations.find((entry) => entry.id === invocationId)!;
+      rejected.status = 'failed';
+      rejected.error = `ended without a valid result file — ${reusedViolation}`;
+      persist();
+      emitInvocation(rejected);
+    } else if (reusable !== null) {
       if (!ledger.phases.some((phase) => phase.id === phaseId)) {
         startPhase(ledger, { id: phaseId, name, kind: 'agent', skill });
       }
@@ -1420,7 +1430,8 @@ export async function runHarnessDriver(
           Number.isFinite(endedAt) &&
           stat.mtimeMs >= startedAt - 5_000 &&
           stat.mtimeMs <= endedAt + 5_000;
-        const parsed = writtenDuringAttempt ? readResult(schema, phaseId) : null;
+        const read = writtenDuringAttempt ? readResult(schema, phaseId) : null;
+        const parsed = read !== null && !accept?.(read) ? read : null;
         const artifactSha256 = parsed === null ? null : hashFile(resultPath);
         if (parsed !== null && artifactSha256) {
           recoverableInvocation.status = 'completed';
@@ -1595,7 +1606,8 @@ export async function runHarnessDriver(
         return { error: `phase "${phaseId}" failed: ${failure}` };
       }
       const read = readContractResult(schema, resultPathFor(phaseId));
-      if (read.result !== null) {
+      const violation = read.result !== null ? accept?.(read.result) ?? null : null;
+      if (read.result !== null && violation === null) {
         if (read.salvaged) {
           host.emit({
             type: 'note',
@@ -1617,7 +1629,7 @@ export async function runHarnessDriver(
         emitBoundaryMessagesConsumed(phaseId, consumedMessageIds);
         return read.result;
       }
-      lastContractFailure = read.failure ?? 'ended without a valid result file';
+      lastContractFailure = violation ?? read.failure ?? 'ended without a valid result file';
       finishInvocation(invocation, 'failed', {
         error: `ended without a valid result file — ${lastContractFailure}`,
       });
@@ -3675,6 +3687,39 @@ export async function runHarnessDriver(
     let suggestedCommit: string | undefined;
     let implementSummary: string | undefined;
     let diagnosisSummary: string;
+    /**
+     * A returned path is a claim; verify the file is actually THERE before a
+     * council pays to review it (2026-07-25).
+     *
+     * cezar worktrees are nested inside the checkout and carry `.git` as a
+     * *file* (a `gitdir:` pointer), so any root detection that walks up
+     * looking for a `.git` DIRECTORY skips the worktree and resolves to the
+     * main checkout. A spec phase that does this writes a real file to a
+     * real spec directory — just not the one every reviewer reads. Left
+     * unchecked it surfaces as an ENOENT deep inside the advisor council,
+     * after a full review round has already been spent. Checked as the phase's
+     * result contract, so a rejected result is retried, never reused (PR #925 review).
+     */
+    const specPathViolation = (p: string): string | null => {
+      if (!p || p.startsWith('/') || p.split('/').includes('..')) {
+        return `returned an unsafe spec path: ${p}`;
+      }
+      if (!existsSync(join(host.cwd, p))) {
+        return existsSync(join(host.repoRoot, p))
+          ? `wrote "${p}" to the main checkout (${join(host.repoRoot, p)}) ` +
+              `instead of the run worktree (${host.cwd}). Reviewers read the worktree copy, so the ` +
+              `council would fail on a spec that looks present. Write the spec inside the worktree.`
+          : `reported "${p}" but no such file exists in the run worktree (${host.cwd})`;
+      }
+      if (!hashFile(join(host.cwd, p))) {
+        return `reported "${p}", which is not a regular file in the run worktree (symlinks are refused)`;
+      }
+      return null;
+    };
+    const acceptSpecResult =
+      roles && roles.reviewers.length > 0
+        ? (result: z.infer<typeof specResultSchema>) => specPathViolation(result.specPath)
+        : undefined;
     if (isFeature) {
       const spec = await agentPhase(
         'spec',
@@ -3701,6 +3746,7 @@ export async function runHarnessDriver(
         specResultSchema,
         'spec',
         roles?.orchestrator,
+        acceptSpecResult,
       );
       if ('cancelled' in (spec as object)) return null;
       if ('error' in (spec as object)) return (spec as { error: string }).error;
@@ -3731,39 +3777,13 @@ export async function runHarnessDriver(
       if (roles && roles.reviewers.length > 0) {
         const MAX_SPEC_ROUNDS = 3;
         let specPath = finalSpecPath;
-        /**
-         * A returned path is a claim; verify the file is actually THERE before a
-         * council pays to review it (2026-07-25).
-         *
-         * cezar worktrees are nested inside the checkout and carry `.git` as a
-         * *file* (a `gitdir:` pointer), so any root detection that walks up
-         * looking for a `.git` DIRECTORY skips the worktree and resolves to the
-         * main checkout. A spec phase that does this writes a real file to a
-         * real spec directory — just not the one every reviewer reads. Left
-         * unchecked it surfaces as an ENOENT deep inside the advisor council,
-         * after a full review round has already been spent.
-         */
-        const specMisplaced = (p: string): string | null => {
-          if (existsSync(join(host.cwd, p))) return null;
-          if (existsSync(join(host.repoRoot, p))) {
-            return (
-              `the spec phase wrote "${p}" to the main checkout (${join(host.repoRoot, p)}) ` +
-              `instead of the run worktree (${host.cwd}). Reviewers read the worktree copy, so the ` +
-              `council would fail on a spec that looks present. Re-run with the spec written inside the worktree.`
-            );
-          }
-          return `the spec phase reported "${p}" but no such file exists in the run worktree (${host.cwd})`;
-        };
         const specSplit = splitReviewers(roles.reviewers);
         const specRunnerReviewers = specSplit.sessions;
         const specCouncilMembers = specSplit.members;
         for (let sround = 1; sround <= MAX_SPEC_ROUNDS; sround += 1) {
           if (host.isCancelled()) return null;
-          if (!specPath || specPath.startsWith('/') || specPath.split('/').includes('..')) {
-            return `spec phase returned an unsafe spec path: ${specPath}`;
-          }
-          const misplaced = specMisplaced(specPath);
-          if (misplaced) return misplaced;
+          const specViolation = specPathViolation(specPath);
+          if (specViolation) return `the spec phase ${specViolation}`;
           const specSubjectSha256 = hashFile(join(host.cwd, specPath));
           if (!specSubjectSha256) {
             return `could not hash the specification before council round ${sround}: ${specPath}`;
@@ -4076,6 +4096,7 @@ export async function runHarnessDriver(
             specResultSchema,
             'spec',
             roles.orchestrator,
+            acceptSpecResult,
           );
           if ('cancelled' in (revise as object)) return null;
           if ('error' in (revise as object)) return (revise as { error: string }).error;
