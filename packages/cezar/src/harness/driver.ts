@@ -23,8 +23,9 @@ import {
   loadAgenticConfig,
   loadAgenticConfigFile,
   reconcileHarnessProcess,
+  copyTreeByValue,
   resolveHarnessScript,
-  sealHarnessRuntime,
+  sealHarnessRuntimeFrom,
   harnessScriptDigest,
   runValidationCommands,
   type AgenticConfig,
@@ -210,9 +211,9 @@ export interface HarnessDriverDeps {
    *  stale runtime into four consecutive runs). `null` disables the refresh and
    *  falls back to `host.ensureSkill` (tests). Undefined → the real bundled dir. */
   bundledSkillsRoot?: string | null;
-  /** Copy the materialized skill tree out of the model-writable worktree and
-   *  return the sealed runtime path + digest (2026-07-27). */
-  sealRuntime?: (cwd: string, destDir: string) => { script: string; sha256: string } | null;
+  /** Copy the preflight-pinned skill tree to the run's sealed runtime and
+   *  return its path + digest (2026-07-27; PR #925 review). */
+  sealRuntime?: (skillsRoot: string, destDir: string) => { script: string; sha256: string } | null;
   scriptDigest?: (script: string) => string | null;
   createRuntime?: (opts: { script: string; cwd: string; env?: Record<string, string> }) => RuntimeLike;
   loadAgentic?: (cwd: string) => Promise<AgenticConfig>;
@@ -649,7 +650,7 @@ export async function runHarnessDriver(
     return 'Multi-model harness execution is unavailable with CEZ_DRY_RUN=1; dry-run mode does not perform live model calls or simulate completed reviews.';
   }
   const resolveScript = deps.resolveScript ?? resolveHarnessScript;
-  const sealRuntime = deps.sealRuntime ?? sealHarnessRuntime;
+  const sealRuntime = deps.sealRuntime ?? sealHarnessRuntimeFrom;
   const scriptDigest = deps.scriptDigest ?? harnessScriptDigest;
   const createRuntime = deps.createRuntime ?? ((opts) => new HarnessRuntime(opts));
   const loadAgentic = deps.loadAgentic ?? loadAgenticConfig;
@@ -1810,7 +1811,8 @@ export async function runHarnessDriver(
       const pinned = join(trustedSkillsRoot, name);
       rmSync(pinned, { recursive: true, force: true });
       mkdirSync(trustedSkillsRoot, { recursive: true });
-      cpSync(materialized, pinned, { recursive: true });
+      // By value: a pinned symlink would stay live-editable under a stable hash (PR #925 review).
+      copyTreeByValue(materialized, pinned);
       const binding = loadTrustedHarnessSkill(trustedSkillsRoot, name);
       trustedSkillPrompts.set(name, binding.systemPrompt);
       trustedSkillHashes.set(name, binding.sha256);
@@ -2199,15 +2201,21 @@ export async function runHarnessDriver(
     persist();
   }
 
-  // The runtime is SEALED out of the worktree before anything can rewrite it
-  // (review 2026-07-27). Spawning `<worktree>/.claude/skills/.../harness.mjs`
-  // handed every later op — with the full provider credential env and no
-  // sandbox — to whatever the codex worker or an injected agent phase had
-  // written there since preflight.
-  const sealed = sealRuntime(host.cwd, artifactDir);
+  // The runtime is SEALED from the hash-verified preflight pin, never from the
+  // worktree (review 2026-07-27; PR #925 review): `.claude/skills` is
+  // git-excluded and agent-writable, and every op runs unsandboxed with credentials.
+  const sealed = sealRuntime(trustedSkillsRoot, artifactDir);
   if (!sealed) {
     releaseHeldIssueClaim();
-    return 'cez-harness runtime disappeared after preflight';
+    return 'harness recovery blocked: the preflight-pinned cez-harness runtime is missing — refusing to run an unpinned runtime';
+  }
+  if (ledger.runtimeScript && ledger.runtimeScript.sha256 !== sealed.sha256) {
+    host.emit({
+      type: 'note',
+      message:
+        `the runtime this run executed before (sha256 ${ledger.runtimeScript.sha256}) differs from ` +
+        `its preflight pin (sha256 ${sealed.sha256}); continuing with the pinned runtime`,
+    });
   }
   ledger.runtimeScript = { path: sealed.script, sha256: sealed.sha256 };
   persist();

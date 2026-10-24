@@ -271,7 +271,9 @@ export function resolveHarnessScript(cwd: string): string | null {
 
 const MAX_SEAL_DEPTH = 128;
 
-function copyTreeByValue(
+/** Copy a tree with every symlink replaced by the bytes it points at; throws on
+ *  a cycle, excessive depth, or an unreadable entry. */
+export function copyTreeByValue(
   source: string,
   dest: string,
   ancestors = new Set<string>(),
@@ -328,7 +330,15 @@ export function sealHarnessRuntime(
   cwd: string,
   destDir: string,
 ): { script: string; sha256: string } | null {
-  const source = join(cwd, '.claude', 'skills');
+  return sealHarnessRuntimeFrom(join(cwd, '.claude', 'skills'), destDir);
+}
+
+/** `sealHarnessRuntime` over an explicit skills root. The driver passes the
+ *  preflight-pinned `trusted-skills` copy, never the worktree (PR #925 review). */
+export function sealHarnessRuntimeFrom(
+  source: string,
+  destDir: string,
+): { script: string; sha256: string } | null {
   if (!existsSync(join(source, 'cez-harness', 'scripts', 'harness.mjs'))) return null;
   const skillsDest = join(destDir, 'skills');
   try {

