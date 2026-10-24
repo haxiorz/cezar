@@ -49,6 +49,8 @@ afterEach(() => {
 })
 
 const BUNDLED_RUNTIME = { installed: true, source: 'bundled' as const, commit: 'a'.repeat(40) }
+const NO_BASE_DRIFT = { configured: null, remoteDefault: null, stale: false }
+const UNCERTIFIED = { status: 'uncertified' as const }
 
 describe('Settings → Harness', () => {
   it('renders the model roster with bindings and roles', async () => {
@@ -58,9 +60,10 @@ describe('Settings → Harness', () => {
       profiles: ['standard', 'multi'],
       driven: ['standard'],
       runtime: BUNDLED_RUNTIME,
+      base: NO_BASE_DRIFT,
       models: [
-        { id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard', 'multi'] },
-        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', roles: ['worker', 'reviewer'], profiles: ['multi'] },
+        { id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard', 'multi'], certification: UNCERTIFIED },
+        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', roles: ['worker', 'reviewer'], profiles: ['multi'], certification: UNCERTIFIED },
       ],
     })
     mount()
@@ -77,7 +80,8 @@ describe('Settings → Harness', () => {
       profiles: ['standard'],
       driven: ['standard'],
       runtime: BUNDLED_RUNTIME,
-      models: [{ id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard'] }],
+      base: NO_BASE_DRIFT,
+      models: [{ id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard'], certification: UNCERTIFIED }],
     })
     mount()
     await waitFor(() => expect(screen.getByText(/no external models configured/i)).toBeTruthy())
@@ -91,7 +95,8 @@ describe('Settings → Harness', () => {
       profiles: ['standard'],
       driven: ['standard'],
       runtime: BUNDLED_RUNTIME,
-      models: [{ id: 'claude', roles: ['host', 'reviewer'], profiles: ['standard'] }],
+      base: NO_BASE_DRIFT,
+      models: [{ id: 'claude', roles: ['host', 'reviewer'], profiles: ['standard'], certification: UNCERTIFIED }],
     })
     mount()
     await waitFor(() => expect(screen.getByRole('link', { name: /configure models/i })).toBeTruthy())
@@ -109,6 +114,7 @@ describe('Settings → Harness', () => {
       profiles: ['standard', 'multi'],
       driven: ['standard'],
       runtime: BUNDLED_RUNTIME,
+      base: NO_BASE_DRIFT,
       models: [
         {
           id: 'deepseek', family: 'deepseek', model: 'deepseek-v4-pro', roles: ['reviewer'], profiles: ['multi'],
@@ -143,8 +149,9 @@ describe('Settings → Harness', () => {
       profiles: ['standard', 'multi'],
       driven: ['standard'],
       runtime: BUNDLED_RUNTIME,
+      base: NO_BASE_DRIFT,
       models: [
-        { id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard'] },
+        { id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard'], certification: UNCERTIFIED },
       ],
     })
     mount()

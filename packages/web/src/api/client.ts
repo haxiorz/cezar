@@ -85,6 +85,9 @@ import type {
   GithubPrMergeStateResponse,
   GithubPrChangesData,
   GroupResponse,
+  HarnessAcceptContestedResponse,
+  HarnessCouncilDecisionInput,
+  HarnessCouncilDecisionResponse,
   HarnessInvocationDetail,
   HarnessLedgerResponse,
   HarnessProbeResponse,
@@ -836,8 +839,8 @@ export async function getHarnessInvocation(
  *  and the run resumes immediately (council resilience 2026-07-29). */
 export async function councilDecision(
   id: string,
-  action: 'retry' | 'proceed',
-): Promise<{ resumed: boolean; decisions?: HarnessLedgerResponse['decisions'] }> {
+  action: HarnessCouncilDecisionInput['action'],
+): Promise<HarnessCouncilDecisionResponse> {
   return unwrap(
     await cez.api.v1.p[':projectId'].runs[':id'].harness['council-decision'].$post({
       param: { projectId: queryScope(), id },
@@ -852,11 +855,7 @@ export async function councilDecision(
 export async function acceptContestedHarness(
   id: string,
   reason: string,
-): Promise<{
-  outcome: HarnessLedgerResponse['outcome']
-  decisions?: HarnessLedgerResponse['decisions']
-  resumed?: boolean
-}> {
+): Promise<HarnessAcceptContestedResponse> {
   return unwrap(
     await cez.api.v1.p[':projectId'].runs[':id'].harness['accept-contested'].$post({
       param: { projectId: queryScope(), id },

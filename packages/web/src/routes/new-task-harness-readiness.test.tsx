@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { HarnessModel, HarnessRoles } from '@open-mercato/cezar-api-client'
+import type { HarnessProbeModel, HarnessRoles } from '@open-mercato/cezar-api-client'
 
 import { buildCreateRunBody } from './new-task-form'
 import { humanReadinessError } from './new-task-harness'
@@ -38,13 +38,13 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-function panel(models: HarnessModel[] = []) {
+function panel(models: HarnessProbeModel[] = []) {
   render(
     <HarnessPanel
       mode="implement-feature"
       onMode={() => {}}
       probe={{
-        profile: 'custom',
+        profile: 'multi-optimized',
         ready: models.length > 0 && models.every((model) => model.readiness === 'ready'),
         reason: models.some((model) => model.readiness !== 'ready')
           ? 'Every selected model must be verified.'
@@ -92,7 +92,7 @@ describe('multi-model start surface', () => {
         roles={roles}
         onRoles={() => {}}
         options={options}
-        probe={{ profile: 'custom', ready: false, reason: 'Provider login expired', models: [] }}
+        probe={{ profile: 'multi-optimized', ready: false, reason: 'Provider login expired', models: [] }}
         onRetryProbe={onRetryProbe}
       />,
     )
@@ -126,24 +126,31 @@ describe('multi-model start surface', () => {
     expect(screen.getByRole('button', { name: 'Reviewer 2 model' })).not.toBeNull()
   })
 
-  it('never paints unknown or missing model readiness as success', () => {
+  it('never paints unknown or failed model readiness as success', () => {
+    // `/harness/probe` reports ready, failed or unknown — a binding with no adapter fails.
     panel([
       {
         id: 'claude',
+        family: 'claude',
+        binding: 'claude · default model',
         roles: ['host', 'reviewer'],
         readiness: 'ready',
         readinessDetail: 'fresh round-trip',
       },
       {
         id: 'kimi',
+        family: 'moonshot',
+        binding: 'council · kimi',
         roles: ['reviewer'],
         readiness: 'unknown',
         readinessDetail: 'probe pending',
       },
       {
         id: 'mimo',
+        family: 'xiaomi',
+        binding: 'council · mimo',
         roles: ['reviewer'],
-        readiness: 'missing',
+        readiness: 'failed',
         readinessDetail: 'adapter missing',
       },
     ])
@@ -228,10 +235,19 @@ describe('harness setup dialog copy', () => {
  * Composer findings D1–D3 (review 2026-07-27).
  */
 describe('composer readiness surface', () => {
-  const failing: HarnessModel[] = [
-    { id: 'claude/sonnet', roles: ['orchestrator'], readiness: 'ready', readinessDetail: 'round-trip ok' },
+  const failing: HarnessProbeModel[] = [
+    {
+      id: 'claude/sonnet',
+      family: 'claude',
+      binding: 'claude · sonnet',
+      roles: ['orchestrator'],
+      readiness: 'ready',
+      readinessDetail: 'round-trip ok',
+    },
     {
       id: 'codex/auto',
+      family: 'codex',
+      binding: 'codex · default model',
       roles: ['implementer'],
       readiness: 'failed',
       readinessDetail:
@@ -263,7 +279,7 @@ describe('composer readiness surface', () => {
       <HarnessPanel
         mode="fix-issue"
         onMode={() => {}}
-        probe={{ profile: 'custom', ready: false, reason: 'not ready', models: failing }}
+        probe={{ profile: 'multi-optimized', ready: false, reason: 'not ready', models: failing }}
         roles={roles}
         onRoles={() => {}}
         options={options}

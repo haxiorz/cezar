@@ -195,6 +195,8 @@ import {
   harnessProbeInputSchema,
   harnessProfileSchema,
   harnessRolesInputSchema,
+  harnessAcceptContestedInputSchema,
+  harnessCouncilDecisionInputSchema,
 } from '@open-mercato/cezar-contract';
 import { toPastedContent, type PastedContent, type RunManager, type StartRunInput } from '../workflows/run.ts';
 import { createLedger, readLedger, saveLedger } from '../harness/ledger.ts';
@@ -215,6 +217,7 @@ import { opencodeSeatingError, runnerEquivalentOf } from '../harness/reviewer-bi
 import { releaseIssueClaim } from '../harness/issue-claim.ts';
 import {
   HARNESS_PROFILES,
+  type HarnessProfile,
 } from '../harness/types.ts';
 import { HARNESS_FIX_ISSUE, isHarnessWorkflow } from '../harness/workflows.ts';
 import { extractTaskRefs } from '../runs/task-refs.ts';
@@ -1079,12 +1082,6 @@ const createPrSchema = z.object({ draft: z.boolean().optional() });
 const gitCommitSchema = z.object({
   message: z.string().trim().min(1, 'must not be empty').max(5_000),
 });
-
-const acceptContestedHarnessSchema = z
-  .object({ reason: z.string().trim().min(3).max(2_000) })
-  .strict();
-
-const councilDecisionSchema = z.object({ action: z.enum(['retry', 'proceed']) }).strict();
 
 // "Open in…" (#open-in / #365): `target` selects the app; `path` (optional, worktree-relative)
 // narrows the target's own worktree/repo-root default to one file — used by the diff pane's
@@ -4848,10 +4845,10 @@ export function createApp(deps: ServerDeps) {
       const rawProfiles =
         (agentic.agentHarness?.profiles as Record<string, unknown> | undefined) ?? {};
       const configuredProfiles = Object.keys(rawProfiles);
-      const profiles = [...new Set(['standard', ...configuredProfiles])].filter((profile) =>
-        (HARNESS_PROFILES as readonly string[]).includes(profile),
+      const profiles = [...new Set(['standard', ...configuredProfiles])].filter(
+        (profile): profile is HarnessProfile => (HARNESS_PROFILES as readonly string[]).includes(profile),
       );
-      const profilesUsing = (id: string): string[] =>
+      const profilesUsing = (id: string): HarnessProfile[] =>
         profiles.filter((profileName) => {
           const profile = rawProfiles[profileName] as
             | { workers?: unknown; reviewers?: unknown }
@@ -4886,9 +4883,9 @@ export function createApp(deps: ServerDeps) {
           const sameAs = runnerEquivalentOf(raw);
           return {
             id,
-            family: typeof model.family === 'string' ? model.family : undefined,
-            model: typeof model.model === 'string' ? model.model : undefined,
-            adapter: typeof model.adapter === 'string' ? model.adapter : undefined,
+            ...(typeof model.family === 'string' ? { family: model.family } : {}),
+            ...(typeof model.model === 'string' ? { model: model.model } : {}),
+            ...(typeof model.adapter === 'string' ? { adapter: model.adapter } : {}),
             roles: Array.isArray(model.roles)
               ? model.roles.filter((role): role is string => typeof role === 'string')
               : [],
@@ -4984,14 +4981,14 @@ export function createApp(deps: ServerDeps) {
               ref.runner === 'harness'
                 ? `council · ${ref.model}`
                 : `${ref.runner} · ${ref.model || 'default model'}`,
-            roles: [],
+            roles: [] as string[],
             readiness:
               verdict?.status === 'ready'
                 ? ('ready' as const)
                 : verdict?.status === 'failed'
                   ? ('failed' as const)
                   : ('unknown' as const),
-            readinessDetail: verdict?.detail,
+            ...(verdict?.detail !== undefined ? { readinessDetail: verdict.detail } : {}),
           },
         ];
       });
@@ -5055,16 +5052,16 @@ export function createApp(deps: ServerDeps) {
 
       return c.json({
         id: invocation.id,
-        reviewerId: invocation.reviewerId,
+        ...(invocation.reviewerId !== undefined ? { reviewerId: invocation.reviewerId } : {}),
         role: invocation.role,
         phaseId: invocation.phaseId,
         status: invocation.status,
         attempt: invocation.attempt,
         binding: invocation.binding,
-        startedAt: invocation.startedAt,
-        endedAt: invocation.endedAt,
-        durationMs: invocation.durationMs,
-        error: invocation.error,
+        ...(invocation.startedAt !== undefined ? { startedAt: invocation.startedAt } : {}),
+        ...(invocation.endedAt !== undefined ? { endedAt: invocation.endedAt } : {}),
+        ...(invocation.durationMs !== undefined ? { durationMs: invocation.durationMs } : {}),
+        ...(invocation.error !== undefined ? { error: invocation.error } : {}),
         prompt: readArtifact(invocation.promptPath),
         result: readArtifact(invocation.artifactPath),
       });
@@ -5072,7 +5069,7 @@ export function createApp(deps: ServerDeps) {
 
     .post(
       '/runs/:id/harness/accept-contested',
-      jsonZodValidator(acceptContestedHarnessSchema),
+      jsonZodValidator(harnessAcceptContestedInputSchema),
       async (c) => {
         const { dataDir, store, manager } = c.get('project');
         const id = c.req.param('id');
@@ -5182,7 +5179,7 @@ export function createApp(deps: ServerDeps) {
 
     .post(
       '/runs/:id/harness/council-decision',
-      jsonZodValidator(councilDecisionSchema),
+      jsonZodValidator(harnessCouncilDecisionInputSchema),
       async (c) => {
         const { dataDir, store, manager } = c.get('project');
         const id = c.req.param('id');

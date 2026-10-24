@@ -160,27 +160,51 @@ export const harnessModelSchema = z.object({
 });
 export type HarnessModel = z.infer<typeof harnessModelSchema>;
 
+/** One `/harness/status` roster row: always its profiles and recorded certification, never a
+ *  live readiness (that is the probe's). Assignable to `HarnessModel`. */
+export const harnessStatusModelSchema = z.object({
+  id: z.string(),
+  family: z.string().optional(),
+  model: z.string().optional(),
+  adapter: z.string().optional(),
+  roles: z.array(z.string()),
+  profiles: z.array(harnessProfileSchema),
+  certification: harnessCertificationSchema,
+  sameAs: harnessModelSchema.shape.sameAs,
+});
+export type HarnessStatusModel = z.infer<typeof harnessStatusModelSchema>;
+
+/** One `/harness/probe` row: the binding as probed and its live readiness. Assignable to
+ *  `HarnessModel`. */
+export const harnessProbeModelSchema = z.object({
+  id: z.string(),
+  family: z.string(),
+  binding: z.string(),
+  roles: z.array(z.string()),
+  readiness: z.enum(['ready', 'failed', 'unknown']),
+  readinessDetail: z.string().optional(),
+});
+export type HarnessProbeModel = z.infer<typeof harnessProbeModelSchema>;
+
 export const harnessStatusResponseSchema = z.object({
   /** The `multiModel` feature flag (off by default). The status route stays readable when
    *  disabled so Settings can explain the gate; probe and run starts answer 409. */
   enabled: z.boolean(),
   configured: z.boolean(),
-  profiles: z.array(z.string()),
-  driven: z.array(z.string()),
-  models: z.array(harnessModelSchema),
+  profiles: z.array(harnessProfileSchema),
+  driven: z.array(harnessProfileSchema),
+  models: z.array(harnessStatusModelSchema),
   runtime: z.object({
     installed: z.boolean(),
     source: z.enum(['ai', 'cezar', 'agents', 'global', 'team', 'bundled']).nullable(),
     commit: z.string().nullable(),
   }),
-  base: z
-    .object({
-      configured: z.string().nullable(),
-      remoteDefault: z.string().nullable(),
-      stale: z.boolean(),
-      note: z.string().optional(),
-    })
-    .optional(),
+  base: z.object({
+    configured: z.string().nullable(),
+    remoteDefault: z.string().nullable(),
+    stale: z.boolean(),
+    note: z.string().optional(),
+  }),
 });
 export type HarnessStatusResponse = z.infer<typeof harnessStatusResponseSchema>;
 
@@ -193,10 +217,10 @@ export const harnessProbeInputSchema = z.object({
 export type HarnessProbeInput = z.input<typeof harnessProbeInputSchema>;
 
 export const harnessProbeResponseSchema = z.object({
-  profile: z.string(),
+  profile: harnessProfileSchema,
   ready: z.boolean(),
   reason: z.string().optional(),
-  models: z.array(harnessModelSchema),
+  models: z.array(harnessProbeModelSchema),
 });
 export type HarnessProbeResponse = z.infer<typeof harnessProbeResponseSchema>;
 
@@ -302,6 +326,14 @@ export const harnessInvocationRecordSchema = z.looseObject({
   endedAt: z.string().optional(),
   durationMs: z.number().optional(),
   error: z.string().optional(),
+  process: z
+    .looseObject({
+      pid: z.number(),
+      token: z.string(),
+      startedAt: z.string(),
+      group: z.boolean().optional(),
+    })
+    .optional(),
 });
 export type HarnessInvocationRecord = z.infer<typeof harnessInvocationRecordSchema>;
 
@@ -328,13 +360,14 @@ export const harnessPendingMessageRecordSchema = z.looseObject({
   createdAt: z.string(),
   assignedToPhaseId: z.string().optional(),
   consumedAt: z.string().optional(),
+  consumedByPhaseId: z.string().optional(),
 });
 export type HarnessPendingMessageRecord = z.infer<typeof harnessPendingMessageRecordSchema>;
 
-export const harnessDecisionRecordSchema = z.looseObject({
+export const harnessDecisionRecordSchema = z.object({
   at: z.string(),
   kind: z.string(),
-  by: z.string(),
+  by: z.enum(['user', 'driver']),
   detail: z.string().optional(),
 });
 export type HarnessDecisionRecord = z.infer<typeof harnessDecisionRecordSchema>;
@@ -380,11 +413,37 @@ export const harnessStageRecordSchema = z.looseObject({
 });
 export type HarnessStageRecord = z.infer<typeof harnessStageRecordSchema>;
 
+/** `POST /runs/:id/harness/accept-contested` — the user's reason for accepting the risk. */
+export const harnessAcceptContestedInputSchema = z
+  .object({ reason: z.string().trim().min(3).max(2_000) })
+  .strict();
+export type HarnessAcceptContestedInput = z.infer<typeof harnessAcceptContestedInputSchema>;
+
+/** `resumed` only when the acceptance was a paused spec gate's, which resumes the run. */
+export const harnessAcceptContestedResponseSchema = z.object({
+  outcome: harnessOutcomeRecordSchema,
+  decisions: z.array(harnessDecisionRecordSchema),
+  resumed: z.literal(true).optional(),
+});
+export type HarnessAcceptContestedResponse = z.infer<typeof harnessAcceptContestedResponseSchema>;
+
+/** `POST /runs/:id/harness/council-decision` — resolve a council paused below quorum. */
+export const harnessCouncilDecisionInputSchema = z
+  .object({ action: z.enum(['retry', 'proceed']) })
+  .strict();
+export type HarnessCouncilDecisionInput = z.infer<typeof harnessCouncilDecisionInputSchema>;
+
+export const harnessCouncilDecisionResponseSchema = z.object({
+  resumed: z.literal(true),
+  decisions: z.array(harnessDecisionRecordSchema),
+});
+export type HarnessCouncilDecisionResponse = z.infer<typeof harnessCouncilDecisionResponseSchema>;
+
 export const harnessLedgerResponseSchema = z.looseObject({
-  version: z.number(),
+  version: z.literal(2),
   workflow: z.string(),
-  requestedProfile: z.string(),
-  effectiveProfile: z.string(),
+  requestedProfile: harnessProfileSchema,
+  effectiveProfile: harnessProfileSchema,
   skillProfile: harnessSkillProfileSchema.optional(),
   phases: z.array(harnessPhaseRecordSchema),
   models: z.array(harnessModelRecordSchema),

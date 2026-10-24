@@ -936,7 +936,7 @@ export function HarnessPanel({
               </div>
             ) : null}
             {(probe?.models ?? []).map((model) => {
-              const failed = model.readiness === 'failed' || model.readiness === 'missing'
+              const failed = model.readiness === 'failed'
               const detail = model.readinessDetail ?? model.readiness ?? 'checking'
               return (
                 <div
@@ -954,7 +954,7 @@ export function HarnessPanel({
                   <span className="min-w-0 break-words font-semibold text-foreground">{model.id}</span>
                   <span className="min-w-0">
                     <span className="block break-all font-mono text-[10.5px] text-soft-foreground">
-                      {model.binding ?? model.model ?? 'default'}
+                      {model.binding}
                     </span>
                     {failed ? (
                       <>

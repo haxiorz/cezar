@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
 import { MODEL_DISCOVERY_RUNNERS, runnerDiscoversModels } from '@open-mercato/cezar-api-client'
-import type { BackendCheck, Skill, WorkflowDef } from '@open-mercato/cezar-api-client'
+import type {
+  BackendCheck,
+  HarnessProbeResponse,
+  HarnessStatusResponse,
+  Skill,
+  WorkflowDef,
+} from '@open-mercato/cezar-api-client'
 
 import {
   HARNESS_MODES,
@@ -565,22 +571,23 @@ describe('harness form rules (spec 2026-07-23-harness-orchestration)', () => {
   })
 
   it('advisorHarnessOptions turns configured reviewer bindings into council options (2026-07-24)', () => {
-    const status = {
+    const status: HarnessStatusResponse = {
       enabled: true,
       configured: true,
       profiles: ['standard', 'multi'],
       driven: ['standard'],
       runtime: { installed: true, source: 'bundled' as const, commit: 'a'.repeat(40) },
+      base: { configured: null, remoteDefault: null, stale: false },
       models: [
-        { id: 'claude', family: 'anthropic', model: 'host app', adapter: 'host', roles: ['host', 'reviewer'] },
-        { id: 'kimi', family: 'moonshot', model: 'kimi-code/k3', adapter: 'preset', roles: ['reviewer'] },
-        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', adapter: 'command', roles: ['worker', 'reviewer'] },
-        { id: 'mystery', roles: [] as string[] }, // no adapter → not an advisor binding
+        { id: 'claude', family: 'anthropic', model: 'host app', adapter: 'host', roles: ['host', 'reviewer'], profiles: [], certification: { status: 'uncertified' } },
+        { id: 'kimi', family: 'moonshot', model: 'kimi-code/k3', adapter: 'preset', roles: ['reviewer'], profiles: [], certification: { status: 'uncertified' } },
+        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', adapter: 'command', roles: ['worker', 'reviewer'], profiles: [], certification: { status: 'uncertified' } },
+        { id: 'mystery', roles: [] as string[], profiles: [], certification: { status: 'uncertified' } }, // no adapter → not an advisor binding
       ],
     }
     expect(advisorHarnessOptions(status)).toEqual([
-      { runner: 'harness', model: 'kimi', label: 'kimi · kimi-code/k3', family: 'moonshot' },
-      { runner: 'harness', model: 'codex', label: 'codex · gpt-5.6-sol', family: 'openai' },
+      { runner: 'harness', model: 'kimi', label: 'kimi · kimi-code/k3', family: 'moonshot', certification: { status: 'uncertified' } },
+      { runner: 'harness', model: 'codex', label: 'codex · gpt-5.6-sol', family: 'openai', certification: { status: 'uncertified' } },
     ])
     expect(advisorHarnessOptions(undefined)).toEqual([])
     expect(modelFamilyOf({ runner: 'harness', model: 'kimi', family: 'moonshot' })).toBe('moonshot')
@@ -621,13 +628,13 @@ describe('harness form rules (spec 2026-07-23-harness-orchestration)', () => {
   })
 
   it('probeReadinessFor finds the claude default under the id the probe gives it', () => {
-    const probe = {
-      profile: 'custom',
+    const probe: HarnessProbeResponse = {
+      profile: 'multi-optimized',
       ready: true,
       models: [
-        { id: 'claude', roles: [], readiness: 'ready' as const },
-        { id: 'codex/auto', roles: [], readiness: 'failed' as const },
-        { id: 'harness/deepseek', roles: [], readiness: 'ready' as const },
+        { id: 'claude', family: 'claude', binding: 'claude · default model', roles: [], readiness: 'ready' },
+        { id: 'codex/auto', family: 'codex', binding: 'codex · default model', roles: [], readiness: 'failed' },
+        { id: 'harness/deepseek', family: 'deepseek', binding: 'council · deepseek', roles: [], readiness: 'ready' },
       ],
     }
     expect(probeReadinessFor(probe, { runner: 'claude', model: '' })).toBe('ready')
@@ -1199,20 +1206,21 @@ describe('eval-gate certification helpers (spec 2026-08-06-eval-gated-model-rout
   it('advisorHarnessOptions lists each model once — a binding equivalent to a listed reviewer is dropped', () => {
     // 2026-09-29: a setup run bound every Zen model, and the reviewer picker showed each twice —
     // `harness · zen-glm-5.3` next to `opencode · opencode/glm-5.3`, the exact same call.
-    const status = {
+    const status: HarnessStatusResponse = {
       enabled: true,
       configured: true,
       profiles: ['standard'],
       driven: ['standard'],
       runtime: { installed: true, source: 'bundled' as const, commit: 'a'.repeat(40) },
+      base: { configured: null, remoteDefault: null, stale: false },
       models: [
-        { id: 'zen-glm-5.3', family: 'zhipu', model: 'glm-5.3', adapter: 'preset', roles: ['reviewer'],
+        { id: 'zen-glm-5.3', family: 'zhipu', model: 'glm-5.3', adapter: 'preset', roles: ['reviewer'], profiles: [], certification: { status: 'uncertified' },
           sameAs: { runner: 'opencode' as const, model: 'opencode/glm-5.3' } },
-        { id: 'deepseek', family: 'deepseek', model: 'deepseek-v4-pro', adapter: 'preset', roles: ['reviewer'],
+        { id: 'deepseek', family: 'deepseek', model: 'deepseek-v4-pro', adapter: 'preset', roles: ['reviewer'], profiles: [], certification: { status: 'uncertified' },
           sameAs: { runner: 'opencode' as const, model: 'deepseek/deepseek-v4-pro' } },
-        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', adapter: 'command', roles: ['worker', 'reviewer'],
+        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', adapter: 'command', roles: ['worker', 'reviewer'], profiles: [], certification: { status: 'uncertified' },
           sameAs: { runner: 'codex' as const, model: 'gpt-5.6-sol' } },
-        { id: 'kimi', family: 'moonshot', model: 'kimi-code/k3', adapter: 'preset', roles: ['reviewer'] },
+        { id: 'kimi', family: 'moonshot', model: 'kimi-code/k3', adapter: 'preset', roles: ['reviewer'], profiles: [], certification: { status: 'uncertified' } },
       ],
     }
     const listed = [
@@ -1259,16 +1267,17 @@ describe('eval-gate certification helpers (spec 2026-08-06-eval-gated-model-rout
   })
 
   it('advisorHarnessOptions carries certification through from /harness/status', () => {
-    const status = {
+    const status: HarnessStatusResponse = {
       enabled: true,
       configured: true,
       profiles: ['standard'],
       driven: ['standard'],
       runtime: { installed: true, source: 'bundled' as const, commit: 'a'.repeat(40) },
+      base: { configured: null, remoteDefault: null, stale: false },
       models: [
         {
           id: 'deepseek', family: 'deepseek', model: 'deepseek-v4-pro', adapter: 'preset',
-          roles: ['reviewer'], certification: cert('certified', 'reviewer', 27),
+          roles: ['reviewer'], profiles: [], certification: cert('certified', 'reviewer', 27),
         },
       ],
     }
