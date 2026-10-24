@@ -29,7 +29,6 @@ import {
   useProviderStatus,
   useProjects,
   useRepo,
-  useRunnerModelCatalogs,
   useRunnerModels,
   useSkills,
   useUiState,
@@ -348,9 +347,18 @@ export function NewTaskRoute() {
   const catalog = useRunnerModels(displayRunner)
   // A normal task only needs its selected runner. The multi-model surface needs every runner's
   // catalog at once to build the role lineup; disabled hooks remain inert while the feature is off.
-  const harnessCatalogs = useRunnerModelCatalogs(multiModelEnabled)
+  // Only the runners a lineup can seat: cursor/junie/pi/copilot catalogs would be fetched for nothing.
+  const harnessCatalogs = {
+    claude: useRunnerModels('claude', multiModelEnabled),
+    codex: useRunnerModels('codex', multiModelEnabled),
+    opencode: useRunnerModels('opencode', multiModelEnabled),
+  }
   const catalogFor = (candidate: Runner) =>
-    candidate === displayRunner ? catalog.data : harnessCatalogs[candidate].data
+    candidate === displayRunner
+      ? catalog.data
+      : isHarnessRunner(candidate)
+        ? harnessCatalogs[candidate].data
+        : undefined
   const modelsLocked = config.data?.modelsLocked === true
   const models = runner === null
     ? []

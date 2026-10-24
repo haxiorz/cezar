@@ -194,20 +194,30 @@ The harness never commits, pushes, or opens PRs. That's not a prompt instruction
 prompt instructions are how you get 8/10 worktree escapes. It's enforced in layers:
 
 1. **Sandbox.** Claude sessions run under an invocation-scoped settings file with
-   a `PreToolUse` hook that refuses `git commit`/`push` and mutating `gh` calls,
-   plus sandboxed Bash (sandbox-runtime on macOS, native sandbox elsewhere,
-   `failIfUnavailable`) with writes confined to the worktree. Credentials
-   (`ANTHROPIC_API_KEY`, OAuth, GitHub tokens) are denied to the sandbox.
-   Environment is hardened for every phase: `GIT_ASKPASS=/usr/bin/false`,
-   `SSH_AUTH_SOCK=''`, an empty `GH_CONFIG_DIR`.
-2. **Git integrity.** `capture` snapshots HEAD, refs and reflogs at start;
-   `verify` re-checks between phases; `stage` refuses if any ref or reflog moved —
-   including a commit that was made and then reset away, which the reflog still
-   shows.
+   a `PreToolUse` hook that refuses `git commit`/`push` and mutating `gh` calls
+   (defense in depth: it matches the command text, so the layers below are what
+   actually hold), plus sandboxed Bash (sandbox-runtime on macOS, native sandbox
+   elsewhere, `failIfUnavailable`) with writes confined to the worktree and the
+   phase-output directory. On macOS the sandbox also denies credentials
+   (`ANTHROPIC_API_KEY`, OAuth, GitHub tokens) to Bash. Codex phases get the
+   workspace-write sandbox with the phase-output directory as their only extra
+   writable root. Environment is hardened for every phase:
+   `GIT_ALLOW_PROTOCOL=''`, `GIT_ASKPASS=/usr/bin/false`, `SSH_AUTH_SOCK=''`, an
+   empty `GH_CONFIG_DIR`, and no GitHub token in the agent environment.
+2. **Git integrity.** `capture` snapshots HEAD, the task branch ref and their
+   reflogs at start; `verify` re-checks between phases; `stage` refuses if any of
+   them moved — including a commit that was made and then reset away, which the
+   reflog still shows. Other refs (tags, other branches) are not part of the
+   snapshot; nothing the harness publishes reads them.
 3. **Staging is git-derived.** The allowlist comes from the driver's own diff, the
    runtime stages exactly those paths, and the driver cross-checks the staged set
    for exact equality.
-4. **Server-side twin.** Push and PR routes 409 until the ledger proves
+4. **The validation gate is not sandboxed.** It runs the base ref's commands the
+   way CI would, in the worktree the implementer wrote — so the scripts behind
+   `npm test` are model-authored code. It gets no provider credentials
+   (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, advisor keys), but it does run as you,
+   with your home directory, like any other cezar task's agent.
+5. **Server-side twin.** Push and PR routes 409 until the ledger proves
    `stage.status === 'staged'` and the outcome is `ready` (or a `contested`
    outcome the human explicitly accepted).
 

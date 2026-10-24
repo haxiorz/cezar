@@ -856,7 +856,8 @@ export function HarnessPanel({
                   data-slot="harness-add-reviewer"
                   onClick={() => {
                     const used = new Set(roles.reviewers.map(refKey))
-                    const next = options.find((o) => !used.has(refKey(o)))
+                    // The picker's own filter: a non-gateway OpenCode model has no review path.
+                    const next = reviewerOptions(options).find((o) => !used.has(refKey(o)))
                     if (next) {
                       onRoles({
                         ...roles,
