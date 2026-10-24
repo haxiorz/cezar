@@ -525,6 +525,8 @@ describe('harness API', () => {
       git('add', 'README.md');
       git('commit', '-m', 'base');
       git('branch', 'develop');
+      // The remote default is read from the PR-target remote `resolveTaskRemotes` names.
+      git('remote', 'add', 'origin', 'https://example.invalid/owner/repo.git');
       git('update-ref', 'refs/remotes/origin/main', 'HEAD');
       git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main');
       mkdirSync(join(repoRoot, '.ai/cezar'), { recursive: true });

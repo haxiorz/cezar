@@ -1136,6 +1136,57 @@ describe('worktree off + newBranch switches the repo checkout to a branch off ba
 });
 
 /**
+ * PR #925 review: the stale-base note (run 9788d87f) belongs to harness runs, whose start already
+ * gates on it. An ordinary run keeps main's path — no extra git call, no note — even when the
+ * configured base is not the remote default.
+ */
+describe('an ordinary run with a non-default configured base', () => {
+  let repoRoot: string;
+  let store: RunStore;
+  let manager: RunManager;
+  const savedDryRun = process.env.CEZ_DRY_RUN;
+
+  beforeAll(async () => {
+    repoRoot = mkdtempSync(join(tmpdir(), 'cez-stale-note-'));
+    process.env.CEZ_DRY_RUN = '1';
+    await run('git', ['init', '-q', '-b', 'main'], { cwd: repoRoot });
+    writeFileSync(join(repoRoot, 'a.txt'), 'one\n');
+    await run('git', ['add', '-A'], { cwd: repoRoot });
+    await run('git', [...GIT_ID, 'commit', '-q', '-m', 'base'], { cwd: repoRoot });
+    await run('git', ['branch', 'develop'], { cwd: repoRoot });
+    await run('git', ['remote', 'add', 'origin', 'https://example.invalid/owner/repo.git'], { cwd: repoRoot });
+    await run('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repoRoot });
+    await run('git', ['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main'], { cwd: repoRoot });
+    store = RunStore.open(join(repoRoot, '.ai/cezar'));
+    writeFileSync(join(repoRoot, '.ai/cezar/config.json'), JSON.stringify({ baseBranch: 'develop' }));
+    manager = new RunManager(store, repoRoot);
+  });
+
+  afterAll(async () => {
+    manager.dispose();
+    if (savedDryRun === undefined) delete process.env.CEZ_DRY_RUN;
+    else process.env.CEZ_DRY_RUN = savedDryRun;
+    store.flush();
+    await removeTempDir(repoRoot);
+  });
+
+  it('emits no stale-base note', async () => {
+    const record = manager.startRun(
+      { name: 'quick-task', source: 'built-in', steps: [{ id: 'work', name: 'Work', prompt: '{{task}}' }] },
+      { task: 'mock:done tweak', worktree: true },
+    );
+    const deadline = Date.now() + 20_000;
+    while (!['done', 'review', 'failed', 'cancelled'].includes(store.getRun(record.id)?.status ?? '')) {
+      if (Date.now() > deadline) throw new Error('run did not finish in time');
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const events = readFileSync(join(repoRoot, '.ai/cezar/runs', `${record.id}.ndjson`), 'utf8');
+    expect(events).toContain('worktree on');
+    expect(events).not.toContain('is not the remote default');
+  }, 30_000);
+});
+
+/**
  * Regression for #1079: command steps can mutate tracked files, but those
  * mutations are verification residue rather than agent work. The agent's
  * checkpoint must remain recoverable while the check artifact stays available

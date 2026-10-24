@@ -4911,7 +4911,7 @@ export function createApp(deps: ServerDeps) {
         models,
         base: {
           configured: cezarConfig.baseBranch ?? null,
-          remoteDefault,
+          remoteDefault: remoteDefault?.branch ?? null,
           stale: Boolean(note),
           ...(note ? { note } : {}),
         },
@@ -5418,7 +5418,7 @@ export function createApp(deps: ServerDeps) {
           if (
             !acceptance ||
             acceptance.configuredBase !== cezarConfig.baseBranch ||
-            acceptance.remoteDefault !== remoteDefault
+            acceptance.remoteDefault !== remoteDefault.branch
           ) {
             return c.json(
               {
@@ -5426,7 +5426,7 @@ export function createApp(deps: ServerDeps) {
                   `harness start blocked before worktree creation: ${stale}. ` +
                   'Update the base branch or explicitly acknowledge this exact base/default pair with a reason.',
                 configuredBase: cezarConfig.baseBranch,
-                remoteDefault,
+                remoteDefault: remoteDefault.branch,
               },
               409,
             );

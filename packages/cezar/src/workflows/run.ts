@@ -5442,10 +5442,12 @@ export class RunManager {
       // from, shifting "what did this task change" under an existing task.
       const recordedRun = this.store.getRun(runId);
       const recorded = recordedRun?.baseBranch;
-      if (!recorded && config.baseBranch) {
+      if (!recorded && config.baseBranch && isHarnessWorkflow(workflow.name)) {
         // A configured base that is not the remote default is usually a
         // leftover from an old branching model — warn, don't override
         // (run 9788d87f forked from a base 11 days stale and "lost" files).
+        // Harness runs only, where start already gates on it: an ordinary run
+        // keeps main's path, with no extra git call and no note (PR #925 review).
         const remoteDefault = await remoteDefaultBranch(this.repoRoot).catch(() => null);
         const staleNote = staleBaseNote(config.baseBranch, remoteDefault);
         if (staleNote) emit({ type: 'note', message: staleNote });

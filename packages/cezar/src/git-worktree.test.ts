@@ -749,7 +749,7 @@ describe('remoteDefaultBranch + staleBaseNote (run 9788d87f: a stale configured 
     const work = mkdtempSync(join(tmpdir(), 'cez-work-'));
     worktreeRoots.push(work);
     await run('git', ['clone', '-q', origin, work], { cwd: tmpdir() });
-    expect(await remoteDefaultBranch(work)).toBe('main');
+    expect(await remoteDefaultBranch(work)).toEqual({ remote: 'origin', branch: 'main' });
 
     const lone = mkdtempSync(join(tmpdir(), 'cez-lone-'));
     worktreeRoots.push(lone);
@@ -757,10 +757,32 @@ describe('remoteDefaultBranch + staleBaseNote (run 9788d87f: a stale configured 
     expect(await remoteDefaultBranch(lone)).toBeNull();
   });
 
+  it('reads the PR-target remote, not a hard-coded origin (PR #925 review)', async () => {
+    // A contributor's fork clone: `gh repo set-default` names `upstream` as the base remote,
+    // whose default branch differs from the fork's.
+    const work = mkdtempSync(join(tmpdir(), 'cez-fork-'));
+    worktreeRoots.push(work);
+    await run('git', ['init', '-q', '-b', 'main'], { cwd: work });
+    writeFileSync(join(work, 'a.txt'), '1\n');
+    await run('git', ['add', '-A'], { cwd: work });
+    await run('git', [...GIT_ID, 'commit', '-q', '-m', 'c1'], { cwd: work });
+    for (const [remote, branch] of [['origin', 'main'], ['upstream', 'trunk']] as const) {
+      await run('git', ['remote', 'add', remote, `https://github.com/${remote}-owner/repo.git`], { cwd: work });
+      await run('git', ['update-ref', `refs/remotes/${remote}/${branch}`, 'HEAD'], { cwd: work });
+      await run('git', ['symbolic-ref', `refs/remotes/${remote}/HEAD`, `refs/remotes/${remote}/${branch}`], { cwd: work });
+    }
+    await run('git', ['config', 'remote.upstream.gh-resolved', 'base'], { cwd: work });
+
+    expect(await remoteDefaultBranch(work)).toEqual({ remote: 'upstream', branch: 'trunk' });
+  });
+
   it('staleBaseNote warns only when the configured base is not the remote default', () => {
-    expect(staleBaseNote('develop', 'main')).toContain('"develop" is not the remote default "main"');
-    expect(staleBaseNote('main', 'main')).toBeNull();
-    expect(staleBaseNote('origin/main', 'main')).toBeNull();
+    const origin = { remote: 'origin', branch: 'main' };
+    expect(staleBaseNote('develop', origin)).toContain('"develop" is not the remote default "main"');
+    expect(staleBaseNote('main', origin)).toBeNull();
+    expect(staleBaseNote('origin/main', origin)).toBeNull();
+    expect(staleBaseNote('upstream/trunk', { remote: 'upstream', branch: 'trunk' })).toBeNull();
+    expect(staleBaseNote('origin/trunk', { remote: 'upstream', branch: 'trunk' })).not.toBeNull();
     expect(staleBaseNote('develop', null)).toBeNull();
   });
 });

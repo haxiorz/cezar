@@ -154,14 +154,26 @@ export function branchFor(runId: string): string {
   return `cez/${runId.slice(0, 8)}`;
 }
 
-/** The branch `origin/HEAD` points at (`origin/main` → `main`), or null when
- *  the remote or its symref is absent. Used only for the stale-base warning —
- *  resolution still honors the configured base. */
-export async function remoteDefaultBranch(repoRoot: string): Promise<string | null> {
-  const head = await git(repoRoot, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']);
+/** A remote's default branch, as its `<remote>/HEAD` symref names it. */
+export interface RemoteDefault {
+  remote: string;
+  branch: string;
+}
+
+/** The branch the PR-target remote's HEAD points at (`upstream/HEAD` → `main`), or null when
+ *  there is no remote or no symref. The remote comes from `resolveTaskRemotes`, never a
+ *  hard-coded `origin` (PR #925 review). Used only for the stale-base warning — resolution
+ *  still honors the configured base. */
+export async function remoteDefaultBranch(repoRoot: string): Promise<RemoteDefault | null> {
+  const { base } = await taskRemotes(repoRoot);
+  if (!base) return null;
+  const head = await git(repoRoot, ['symbolic-ref', '--quiet', `refs/remotes/${base}/HEAD`]);
   if (!head.ok) return null;
-  const m = /^refs\/remotes\/origin\/(.+)$/.exec(head.stdout.trim());
-  return m?.[1] ?? null;
+  const prefix = `refs/remotes/${base}/`;
+  const ref = head.stdout.trim();
+  return ref.startsWith(prefix) && ref.length > prefix.length
+    ? { remote: base, branch: ref.slice(prefix.length) }
+    : null;
 }
 
 /**
@@ -171,10 +183,11 @@ export async function remoteDefaultBranch(repoRoot: string): Promise<string | nu
  * checked out a base from 11 days earlier and "lost" tracked files that were
  * simply newer than the branch. Pure so the wording stays pinned by tests.
  */
-export function staleBaseNote(configured: string, remoteDefault: string | null): string | null {
+export function staleBaseNote(configured: string, remoteDefault: RemoteDefault | null): string | null {
   if (!remoteDefault) return null;
-  if (configured === remoteDefault || configured === `origin/${remoteDefault}`) return null;
-  return `configured base branch "${configured}" is not the remote default "${remoteDefault}" — a stale base silently hides newer files from the run (config: .ai/cezar/config.json)`;
+  const { remote, branch } = remoteDefault;
+  if (configured === branch || configured === `${remote}/${branch}`) return null;
+  return `configured base branch "${configured}" is not the remote default "${branch}" — a stale base silently hides newer files from the run (config: .ai/cezar/config.json)`;
 }
 
 /**
