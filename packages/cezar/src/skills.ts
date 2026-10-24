@@ -42,6 +42,13 @@ export interface Skill {
   };
 }
 
+/** The bundled multi-model harness skills: hidden unless multi-model is on, and the only skills
+ *  a run copies into the user's own checkout — the harness setup runs in place by design and
+ *  needs the runtime beside it (spec 2026-07-24-vendored-cez-skills, PR #925 review). */
+export function isBundledHarnessSkill(skill: Pick<Skill, 'name' | 'source'>): boolean {
+  return skill.source === 'bundled' && (skill.name === 'cez-harness' || skill.name === 'cez-setup-harness');
+}
+
 /* Precedence order — earlier dirs win name collisions. `npx skills` writes
    the canonical copy to `.agents/skills/<name>/SKILL.md` and mirrors it into
    each agent's dir (often as symlinks) — scanning them all and deduping by
@@ -114,8 +121,7 @@ export async function discoverSkills(
   const seen = new Set<string>();
   for (const skills of layers) {
     for (const skill of skills) {
-      if (!includeHarness && skill.source === 'bundled' &&
-          (skill.name === 'cez-harness' || skill.name === 'cez-setup-harness')) continue;
+      if (!includeHarness && isBundledHarnessSkill(skill)) continue;
       if (seen.has(skill.name)) continue;
       seen.add(skill.name);
       merged.push(skill);

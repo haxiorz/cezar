@@ -3860,6 +3860,29 @@ describe("registry /skill expansion on a fresh run's opening prompt (#278)", () 
     expect(vi.mocked(track)).toHaveBeenCalledWith('skills_provisioned', { label: 'installed', value: 2 });
   }, 40_000);
 
+  it("copies no step-skill directory into the user's own checkout on an in-place run (PR #925 review)", async () => {
+    // A bundled directory skill: in a worktree its references/ must land beside the run; in place
+    // the copy would shadow the real skill and edit the user's info/exclude.
+    const STEP_SKILL: WorkflowDef = {
+      name: 'skill-step',
+      source: 'built-in',
+      steps: [{ id: 'task', name: 'Task', skill: 'cez-fix', prompt: '{{task}}' }],
+    };
+    const record = manager.startRun(STEP_SKILL, { task: 'fix it', worktree: false });
+    runId = record.id;
+    await waitFor(() => eventsOf(record.id).some((e) => e.stepId === 'task' && e.type === 'text'));
+    expect(existsSync(join(repoRoot, '.claude/skills/cez-fix'))).toBe(false);
+    const exclude = join(repoRoot, '.git', 'info', 'exclude');
+    expect(existsSync(exclude) ? readFileSync(exclude, 'utf8') : '').not.toContain('cez-fix');
+
+    manager.cancel(record.id);
+    const isolated = manager.startRun(STEP_SKILL, { task: 'fix it', worktree: true });
+    runId = isolated.id;
+    await waitFor(() => eventsOf(isolated.id).some((e) => e.stepId === 'task' && e.type === 'text'));
+    const wt = store.getRun(isolated.id)!.worktreePath!;
+    expect(existsSync(join(wt, '.claude/skills/cez-fix/references'))).toBe(true);
+  }, 60_000);
+
   it("writes no skill copies into the user's own checkout on an in-place run", async () => {
     // In place the cwd IS the checkout, whose skill dirs `discoverSkills` reads ahead of the
     // builtin — a written-out copy would shadow the real skill for good.

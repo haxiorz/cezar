@@ -60,7 +60,7 @@ import {
   storedAttachmentExtension,
 } from '@open-mercato/cezar-contract';
 import type { AgentEvent, AgentRunResult, ContentBlock } from '../core/agent-runner.ts';
-import { discoverSkills, type Skill } from '../skills.ts';
+import { discoverSkills, isBundledHarnessSkill, type Skill } from '../skills.ts';
 import { ensureSkillOnDisk } from '../skills-materialize.ts';
 import { automationsReachable } from '../automations/builtin-skill.ts';
 import { AUTOMATIONS_PROMPT } from '../automations/prompts.ts';
@@ -7053,9 +7053,13 @@ export class RunManager {
         // describe the work — and therefore derive a useful title (#432).
         systemPrompt = skillSystemPrompt(skill);
         // A directory skill also needs its companion files and `requires:` closure on disk (spec
-        // 2026-07-24-vendored-cez-skills, run 9788d87f) — in place too, where provisioning
-        // installs team skills only. Idempotent: a skill provisioning just placed is skipped.
-        const seeded = await ensureSkillOnDisk(state.cwd, skill, state.skills ?? skills).catch(() => false);
+        // 2026-07-24-vendored-cez-skills, run 9788d87f). In place the cwd is the user's checkout,
+        // where a copy shadows the real skill for good — the `provisionTaskSkills` refusal (PR #925
+        // review) — bar the opt-in harness setup. Idempotent: a placed skill is skipped.
+        const inPlace = resolvePath(state.cwd) === resolvePath(this.repoRoot);
+        const seeded =
+          (!inPlace || isBundledHarnessSkill(skill)) &&
+          (await ensureSkillOnDisk(state.cwd, skill, state.skills ?? skills).catch(() => false));
         if (seeded && !installed.includes(skill.name) && skill.path.endsWith('SKILL.md')) {
           emit({
             type: 'note',
