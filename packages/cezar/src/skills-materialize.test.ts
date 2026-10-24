@@ -41,7 +41,7 @@ function dirSkill(name: string, skillDir: string, overrides: Partial<Skill> = {}
 }
 
 describe('ensureSkillOnDisk', () => {
-  it('copies a directory skill (through a symlinked install) into <cwd>/.claude/skills and excludes it from git', async () => {
+  it('copies a directory skill (through a symlinked install) into <cwd>/.claude/skills and ignores it in this worktree only', async () => {
     const store = await tmp('cez-mat-store-');
     const real = await writeDirSkill(store, 'cez-harness');
     const linkRoot = await tmp('cez-mat-links-');
@@ -56,8 +56,37 @@ describe('ensureSkillOnDisk', () => {
     expect((await stat(join(copied, 'SKILL.md'))).isFile()).toBe(true);
     expect((await stat(join(copied, 'references', 'a.md'))).isFile()).toBe(true);
     expect((await stat(join(copied, 'scripts', 'x.mjs'))).isFile()).toBe(true);
-    const exclude = await readFile(join(cwd, '.git', 'info', 'exclude'), 'utf8');
-    expect(exclude).toContain('.claude/skills/cez-harness/');
+    // A self-ignoring .gitignore in the skills dir, never the shared info/exclude (PR #925 review).
+    const ignore = await readFile(join(cwd, '.claude', 'skills', '.gitignore'), 'utf8');
+    expect(ignore.split('\n')).toContain('/cez-harness');
+    const exclude = await readFile(join(cwd, '.git', 'info', 'exclude'), 'utf8').catch(() => '');
+    expect(exclude).not.toContain('cez-harness');
+    const { stdout } = await run('git', ['status', '--porcelain', '--untracked-files=all'], { cwd });
+    expect(stdout).toBe('');
+  });
+
+  // PR #925 review: the frontmatter name is joined into the target path.
+  it('refuses a skill whose name is not one safe path segment, writing nothing outside the worktree', async () => {
+    const store = await tmp('cez-mat-store-');
+    const parent = await tmp('cez-mat-parent-');
+    const cwd = join(parent, 'worktree');
+    await mkdir(cwd);
+    const unsafe = dirSkill('../../../escaped', await writeDirSkill(store, 'escaped'));
+    expect(await ensureSkillOnDisk(cwd, unsafe, [unsafe])).toBe(false);
+    await expect(stat(join(parent, 'escaped'))).rejects.toThrow(/ENOENT/);
+    await expect(stat(join(cwd, '.claude'))).rejects.toThrow(/ENOENT/);
+  });
+
+  it('refuses an unsafe name reached through requires', async () => {
+    const store = await tmp('cez-mat-store-');
+    const parent = await tmp('cez-mat-parent-');
+    const cwd = join(parent, 'worktree');
+    await mkdir(cwd);
+    const dep = dirSkill('../dep', await writeDirSkill(store, 'dep'));
+    const root = dirSkill('root-skill', await writeDirSkill(store, 'root-skill'), { requires: ['../dep'] });
+    expect(await ensureSkillOnDisk(cwd, root, [root, dep])).toBe(false);
+    await expect(stat(join(cwd, '.claude', 'dep'))).rejects.toThrow(/ENOENT/);
+    expect((await stat(join(cwd, '.claude', 'skills', 'root-skill', 'SKILL.md'))).isFile()).toBe(true);
   });
 
   it('materializes the requires closure from the catalog, cycle-safe', async () => {

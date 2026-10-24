@@ -2,6 +2,7 @@ import { cp, realpath, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import type { Skill } from './skills.js';
 import { excludeFromGit, materializeSkillDir } from './skills-remote.js';
+import { ignoreProvisioned, isSafeSkillName } from './skills-provision.js';
 
 /**
  * Put a skill's on-disk companion files (references/, scripts/, assets/,
@@ -46,6 +47,9 @@ export async function ensureSkillOnDisk(
 }
 
 async function materializeOne(cwd: string, skill: Skill): Promise<boolean> {
+  // Frontmatter verbatim, joined into the target path: `../x` would write outside the worktree
+  // from the host process, past every agent sandbox (PR #925 review). Covers `requires:` too.
+  if (!isSafeSkillName(skill.name)) return false;
   if (skill.source === 'team') {
     return skill.team?.dir ? materializeSkillDir(cwd, skill).catch(() => false) : true;
   }
@@ -62,7 +66,10 @@ async function materializeOne(cwd: string, skill: Skill): Promise<boolean> {
     const existing = await stat(target).catch(() => null);
     if (existing?.isDirectory()) return true; // idempotent across phases/restarts
     await cp(srcDir, target, { recursive: true, dereference: true });
-    await excludeFromGit(cwd, `.claude/skills/${skill.name}/`);
+    // Worktree-local: the shared info/exclude would hide the path in the user's checkout too.
+    await ignoreProvisioned(cwd, '.claude/skills', skill.name).catch(() =>
+      excludeFromGit(cwd, `.claude/skills/${skill.name}/`),
+    );
     return true;
   } catch {
     return false;
