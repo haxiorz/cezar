@@ -379,6 +379,7 @@ export const harnessCouncilPendingDecisionSchema = z.looseObject({
   failed: z.array(z.object({ label: z.string(), reason: z.string().optional() })),
   completedCount: z.number(),
   canProceed: z.boolean(),
+  subjectSha256: z.string().optional(),
 });
 export type HarnessCouncilPendingDecision = z.infer<typeof harnessCouncilPendingDecisionSchema>;
 

@@ -262,6 +262,15 @@ you never trust an artifact that changed underneath you. In-flight invocations a
 reconciled by process identity token before being marked interrupted. Mid-run
 operator messages queue in the ledger and fold into the next phase's prompt.
 
+The spec and implementation loops also record their round cursor (`ledger.rounds`):
+the round in progress, the findings it answers, the round history reviewers see, and
+the validation repair budget already spent. A resume re-enters that round; completed
+rounds are history and are never re-gated against a diff that already carries later
+fixes, and a finished spec loop is never audited again. A council decision (retry
+or proceed) is keyed to the subject its round reviewed, so it never carries over to
+an edited diff. Operator feedback clears the implementation cursor, restarting the
+loop at round 1.
+
 ## Work packages (high-assurance)
 
 Default profiles hand the implementer one phase brief — no decomposition. The

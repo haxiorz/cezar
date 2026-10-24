@@ -15,7 +15,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as claudeGuard from './claude-guard.js';
-import { loadLedger, saveLedger, createLedger, startPhase, finishPhase } from './ledger.js';
+import {
+  councilDecisionDetail,
+  loadLedger,
+  saveLedger,
+  createLedger,
+  startPhase,
+  finishPhase,
+} from './ledger.js';
 import { HARNESS_FIX_ISSUE, HARNESS_IMPLEMENT_FEATURE } from './workflows.js';
 import {
   harnessAgentOutputDir,
@@ -949,6 +956,163 @@ describe('harness driver — standard fix-issue graph', () => {
     };
     expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
     expect(resumedCalls).toBe(0);
+  });
+
+  /** A review subject that moves with the worktree, as the real snapshot does. The
+   *  constant stub hid a resume replaying round 1 against round 2's diff (PR #925 review). */
+  const trackSubject = (h: ReturnType<typeof makeHarness>) => {
+    const file = join(dir, 'src', 'runs', 'store.ts');
+    h.deps.snapshotReviewSubject = async () => {
+      try {
+        return createHash('sha256').update(readFileSync(file)).digest('hex');
+      } catch {
+        return 'untouched';
+      }
+    };
+    return (content: string) => {
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, content, 'utf8');
+    };
+  };
+
+  it('resumes at the first incomplete round instead of replaying round 1 against a later diff', async () => {
+    const first = makeHarness(dir);
+    const edit = trackSubject(first);
+    first.agentBehavior.set('implement', (req) => {
+      edit('round 1');
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify({ changedPaths: ['src/runs/store.ts'], suggestedCommit: 'fix(runs): guard replay' }),
+        'utf8',
+      );
+      return null;
+    });
+    first.agentBehavior.set('review', (req) => {
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify({ verdict: 'request_changes', findings: [{ severity: 'blocker', title: 'TOCTOU remains' }] }),
+        'utf8',
+      );
+      return null;
+    });
+    first.agentBehavior.set('fix-2', (req) => {
+      edit('round 2');
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify({ changedPaths: ['src/runs/store.ts'], summary: 'guarded the replay' }),
+        'utf8',
+      );
+      return null;
+    });
+    first.agentBehavior.set('review-2', () => 'claude exited before writing its review');
+    expect(await runHarnessDriver(first.host, input, first.deps)).toMatch(/review-2/);
+
+    const resumed = makeHarness(dir);
+    trackSubject(resumed);
+    let gates = 0;
+    resumed.deps.validate = async (commands: string[]) => {
+      gates += 1;
+      return commands.map((command) => ({ command, status: 'passed' as const, exitCode: 0, evidence: 'ok' }));
+    };
+    let reviewPrompt = '';
+    resumed.agentBehavior.set('review-2', (req) => {
+      reviewPrompt = req.prompt;
+      writeFileSync(req.resultPath, JSON.stringify({ verdict: 'approve', findings: [] }), 'utf8');
+      return null;
+    });
+
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+
+    expect(resumed.calls.filter((call) => call.kind === 'agent').map((call) => call.id)).toEqual(['review-2']);
+    expect(gates).toBe(0);
+    expect(reviewPrompt).toContain('Round 1 required:');
+    expect(reviewPrompt).toContain('TOCTOU remains');
+    expect(reviewPrompt).toContain('Round 1 response: guarded the replay');
+    const ledger = loadLedger(resumed.host.dataDir, resumed.host.runId);
+    expect(ledger?.stage).toMatchObject({ status: 'staged', suggestedCommit: 'fix(runs): guard replay' });
+    expect(ledger?.loops.fixRounds).toBe(1);
+    expect(ledger?.rounds?.implementation).toMatchObject({ round: 2, validationRepairRounds: 0 });
+  });
+
+  it('keeps the spent validation repair budget across a Continue', async () => {
+    const first = makeHarness(dir);
+    const edit = trackSubject(first);
+    let gate = 0;
+    first.deps.validate = async (commands: string[]) => {
+      gate += 1;
+      return commands.map((command) =>
+        gate === 1
+          ? { command, status: 'passed' as const, exitCode: 0, evidence: 'ok' }
+          : { command, status: 'failed' as const, exitCode: 1, evidence: `still red (gate ${gate})` },
+      );
+    };
+    for (const id of ['implement', 'fix-2', 'fix-3']) {
+      first.agentBehavior.set(id, (req) => {
+        edit(id);
+        writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/runs/store.ts'] }), 'utf8');
+        return null;
+      });
+    }
+    expect(await runHarnessDriver(first.host, input, first.deps)).toMatch(
+      /validation gate still failing after 3 repair rounds/,
+    );
+
+    const resumed = makeHarness(dir);
+    trackSubject(resumed);
+    let gates = 0;
+    resumed.deps.validate = async (commands: string[]) => {
+      gates += 1;
+      return commands.map((command) => ({
+        command,
+        status: 'failed' as const,
+        exitCode: 1,
+        evidence: 'still red after Continue',
+      }));
+    };
+
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toMatch(
+      /validation gate still failing after 3 repair rounds/,
+    );
+
+    expect(resumed.calls.filter((call) => call.kind === 'agent')).toEqual([]);
+    expect(gates).toBe(0);
+  });
+
+  it('restarts a multi-round loop at round 1 when operator feedback reopens implementation', async () => {
+    const first = makeHarness(dir);
+    let reviews = 0;
+    first.agentBehavior.set('review', (req) => {
+      reviews += 1;
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify(
+          reviews === 1
+            ? { verdict: 'request_changes', findings: [{ severity: 'blocker', title: 'TOCTOU remains' }] }
+            : { verdict: 'approve', findings: [] },
+        ),
+        'utf8',
+      );
+      return null;
+    });
+    first.agentBehavior.set('fix-2', (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/runs/store.ts'] }), 'utf8');
+      return null;
+    });
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    ledger.pendingMessages.push({
+      id: 'feedback-1',
+      text: 'Keep the queue order stable.',
+      createdAt: new Date().toISOString(),
+    });
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+
+    const resumed = makeHarness(dir);
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+
+    expect(resumed.calls.filter((call) => call.kind === 'agent').map((call) => call.id))
+      .toEqual(['implement', 'review']);
+    expect(loadLedger(first.host.dataDir, first.host.runId)?.loops.fixRounds).toBe(0);
   });
 
   /**
@@ -2705,6 +2869,13 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     return councilCalls;
   };
 
+  /** What the council-decision route records for the ledger's paused council. */
+  const recordedDecisionDetail = (ledger: NonNullable<ReturnType<typeof loadLedger>>): string => {
+    const pending = ledger.outcome.pendingDecision;
+    if (pending?.kind !== 'council') throw new Error('no council decision is pending');
+    return councilDecisionDetail(pending);
+  };
+
   it('pauses below quorum with a decision instead of just dying', async () => {
     const h = makeHarness(dir);
     advisorsAlwaysFail(h);
@@ -2778,7 +2949,7 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
       at: new Date().toISOString(),
       kind: 'council.proceed',
       by: 'user',
-      detail: 'implementation:1',
+      detail: recordedDecisionDetail(decided),
     });
     saveLedger(h.host.dataDir, h.host.runId, decided);
 
@@ -2825,7 +2996,7 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
       at: new Date().toISOString(),
       kind: 'council.retry',
       by: 'user',
-      detail: 'implementation:1',
+      detail: recordedDecisionDetail(decided),
     });
     saveLedger(h.host.dataDir, h.host.runId, decided);
 
@@ -2845,7 +3016,7 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
       at: new Date().toISOString(),
       kind: 'council.proceed',
       by: 'user',
-      detail: 'implementation:1',
+      detail: recordedDecisionDetail(waived),
     });
     saveLedger(first.host.dataDir, first.host.runId, waived);
     expect(await runHarnessDriver(first.host, threeReviewerInput, first.deps)).toBeNull();
@@ -2865,6 +3036,144 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(resumed.ops.map((call) => call.id)).not.toContain('stage');
     expect(loadLedger(first.host.dataDir, first.host.runId)?.outcome)
       .toMatchObject({ status: 'blocked', pendingDecision: { kind: 'council', canProceed: true } });
+  });
+
+  it('applies a council decision only to the diff the paused round reviewed', async () => {
+    let subject = 'the-diff-the-user-saw';
+    const first = makeHarness(dir);
+    first.deps.snapshotReviewSubject = async () => subject;
+    advisorsAlwaysFail(first);
+    expect(await runHarnessDriver(first.host, threeReviewerInput, first.deps)).toMatch(/quorum/);
+    const decided = loadLedger(first.host.dataDir, first.host.runId)!;
+    decided.decisions.push({
+      at: new Date().toISOString(),
+      kind: 'council.proceed',
+      by: 'user',
+      detail: recordedDecisionDetail(decided),
+    });
+    saveLedger(first.host.dataDir, first.host.runId, decided);
+
+    subject = 'edited-after-the-decision';
+    const resumed = makeHarness(dir);
+    resumed.deps.snapshotReviewSubject = async () => subject;
+    advisorsAlwaysFail(resumed);
+
+    expect(await runHarnessDriver(resumed.host, threeReviewerInput, resumed.deps)).toMatch(/quorum/);
+
+    expect(resumed.ops.map((call) => call.id)).not.toContain('stage');
+    expect(loadLedger(first.host.dataDir, first.host.runId)?.outcome.pendingDecision).toMatchObject({
+      kind: 'council',
+      council: 'implementation',
+      round: 1,
+      subjectSha256: 'edited-after-the-decision',
+    });
+  });
+
+  /** Spec council round 1 objects through the structured reviewer, every later council approves. */
+  const featureRun = (h: ReturnType<typeof makeHarness>) => {
+    const specFile = join(dir, '.ai', 'specs', 'feat.md');
+    let councils = 0;
+    h.setCouncilBehavior((ids) => {
+      councils += 1;
+      const objecting = councils === 1;
+      return {
+        ok: true,
+        result: {
+          verdict: objecting ? 'request_changes' : 'approve',
+          reviewers: ids.map((id) => ({
+            id,
+            status: 'completed',
+            review: objecting
+              ? { verdict: 'request_changes', findings: [{ severity: 'major', title: 'no rollback plan' }] }
+              : { verdict: 'approve', findings: [] },
+          })),
+        },
+      };
+    });
+    h.agentBehavior.set('spec', (req) => {
+      mkdirSync(dirname(specFile), { recursive: true });
+      writeFileSync(specFile, '# feat\n', 'utf8');
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify({ summary: 'original summary', specPath: '.ai/specs/feat.md', files: ['.ai/specs/feat.md'] }),
+        'utf8',
+      );
+      return null;
+    });
+    const revise = (req: HarnessAgentPhaseRequest) => {
+      writeFileSync(specFile, '# feat\n\n## Rollback\n', 'utf8');
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify({ summary: 'revised summary', specPath: '.ai/specs/feat.md', files: [] }),
+        'utf8',
+      );
+      return null;
+    };
+    h.agentBehavior.set('spec-2', revise);
+    return { specFile, revise };
+  };
+  const featureInput = { ...input, workflow: HARNESS_IMPLEMENT_FEATURE, roles };
+
+  it('resumes after the spec loop without re-auditing the revised spec or re-running implement', async () => {
+    const first = makeHarness(dir);
+    featureRun(first);
+    let gate = 0;
+    first.deps.validate = async (commands: string[]) => {
+      gate += 1;
+      if (gate === 2) throw new Error('validation host went away');
+      return commands.map((command) => ({ command, status: 'passed' as const, exitCode: 0, evidence: 'ok' }));
+    };
+    expect(await runHarnessDriver(first.host, featureInput, first.deps)).toMatch(/validation host went away/);
+    expect(first.calls.map((call) => call.id)).toContain('spec-2');
+
+    const resumed = makeHarness(dir);
+    const councilCalls: string[][] = [];
+    resumed.setCouncilBehavior((ids) => {
+      councilCalls.push(ids);
+      return undefined;
+    });
+
+    expect(await runHarnessDriver(resumed.host, featureInput, resumed.deps)).toBeNull();
+
+    expect(resumed.calls.filter((call) => call.kind === 'agent').map((call) => call.id)).toEqual(['review']);
+    expect(councilCalls).toHaveLength(1);
+    const ledger = loadLedger(resumed.host.dataDir, resumed.host.runId);
+    expect(ledger?.rounds?.spec).toMatchObject({ done: true, summary: 'revised summary' });
+    expect(ledger?.stage.prBody).toContain('revised summary');
+  });
+
+  it('resumes an interrupted spec revision without re-auditing the half-revised spec', async () => {
+    const first = makeHarness(dir);
+    const { specFile, revise } = featureRun(first);
+    first.agentBehavior.set('spec-2', () => {
+      writeFileSync(specFile, '# feat\n\n## Rollb', 'utf8');
+      return 'claude exited mid-revision';
+    });
+    expect(await runHarnessDriver(first.host, featureInput, first.deps)).toMatch(/spec-2/);
+
+    const resumed = makeHarness(dir);
+    featureRun(resumed);
+    let revisePrompt = '';
+    resumed.agentBehavior.set('spec-2', (req) => {
+      revisePrompt = req.prompt;
+      return revise(req);
+    });
+    const councilCalls: string[][] = [];
+    resumed.setCouncilBehavior((ids) => {
+      councilCalls.push(ids);
+      return undefined;
+    });
+
+    expect(await runHarnessDriver(resumed.host, featureInput, resumed.deps)).toBeNull();
+
+    expect(resumed.calls.filter((call) => call.kind === 'agent').map((call) => call.id)).toEqual([
+      'spec-2',
+      'spec-review-2',
+      'implement',
+      'review',
+    ]);
+    expect(revisePrompt).toContain('no rollback plan');
+    expect(councilCalls).toHaveLength(2);
   });
 
   it('offers only retry when every reviewer failed', async () => {

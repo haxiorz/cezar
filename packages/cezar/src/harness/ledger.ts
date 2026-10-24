@@ -38,6 +38,17 @@ export function createLedger(init: {
   });
 }
 
+/** A `council.retry`/`council.proceed` decision's detail, keyed to the subject its round
+ *  reviewed so it never applies to another diff of that round (PR #925 review). */
+export function councilDecisionDetail(target: {
+  council: string;
+  round: number;
+  subjectSha256?: string;
+}): string {
+  const key = `${target.council}:${target.round}`;
+  return target.subjectSha256 ? `${key}:${target.subjectSha256}` : key;
+}
+
 export type HarnessLedgerRead =
   | { status: 'missing'; path: string }
   | { status: 'valid'; path: string; ledger: HarnessLedger; migrated: boolean }

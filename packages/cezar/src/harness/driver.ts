@@ -13,7 +13,14 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
-import { createLedger, finishPhase, readLedger, saveLedger, startPhase } from './ledger.js';
+import {
+  councilDecisionDetail,
+  createLedger,
+  finishPhase,
+  readLedger,
+  saveLedger,
+  startPhase,
+} from './ledger.js';
 import {
   HarnessRuntime,
   computeGateRegressions,
@@ -1116,6 +1123,7 @@ export async function runHarnessDriver(
     phase.status = 'pending';
     ledger.councils = ledger.councils.filter((council) => council.kind !== 'implementation');
     ledger.loops.fixRounds = 0;
+    if (ledger.rounds) delete ledger.rounds.implementation;
     ledger.decisions.push({
       at: new Date().toISOString(),
       kind: 'implementation.feedback',
@@ -2365,17 +2373,28 @@ export async function runHarnessDriver(
   /* ---- council decisions (user-resolvable quorum failures) ---------------- */
 
   type CouncilKind = 'spec' | 'implementation';
-  const councilDecisionKey = (council: CouncilKind, round: number) => `${council}:${round}`;
   /** Each explicit user retry grants every failed reviewer of that round ONE
    *  more attempt beyond the automatic budget of 2 — recorded as a ledger
    *  decision, so a resumed process reaches the same bound deterministically. */
-  const councilRetryAllowance = (council: CouncilKind, round: number): number =>
+  const councilRetryAllowance = (
+    council: CouncilKind,
+    round: number,
+    subjectSha256: string,
+  ): number =>
     (council === 'implementation' ? implementationDecisions() : ledger.decisions).filter(
-      (d) => d.kind === 'council.retry' && d.detail === councilDecisionKey(council, round),
+      (d) =>
+        d.kind === 'council.retry' &&
+        d.detail === councilDecisionDetail({ council, round, subjectSha256 }),
     ).length;
-  const councilProceedAccepted = (council: CouncilKind, round: number): boolean =>
+  const councilProceedAccepted = (
+    council: CouncilKind,
+    round: number,
+    subjectSha256: string,
+  ): boolean =>
     (council === 'implementation' ? implementationDecisions() : ledger.decisions).some(
-      (d) => d.kind === 'council.proceed' && d.detail === councilDecisionKey(council, round),
+      (d) =>
+        d.kind === 'council.proceed' &&
+        d.detail === councilDecisionDetail({ council, round, subjectSha256 }),
     );
 
   /**
@@ -2394,6 +2413,7 @@ export async function runHarnessDriver(
     round: number,
     outcomes: readonly CouncilOutcome[],
     phaseId: string,
+    subjectSha256: string,
   ): { proceed: true; waived: boolean } | { proceed: false; error: string } => {
     // A resolved pause must not shadow the eventual result: staging only
     // promotes a PENDING outcome to ready, so the stored blocked-for-decision
@@ -2424,7 +2444,7 @@ export async function runHarnessDriver(
     }
     const completed = outcomes.filter((o) => o.status === 'completed');
     const failed = outcomes.filter((o) => o.status === 'failed');
-    if (completed.length > 0 && councilProceedAccepted(council, round)) {
+    if (completed.length > 0 && councilProceedAccepted(council, round, subjectSha256)) {
       clearCouncilPause();
       host.emit({
         type: 'note',
@@ -2451,6 +2471,7 @@ export async function runHarnessDriver(
         })),
         completedCount: completed.length,
         canProceed: completed.length > 0,
+        subjectSha256,
       },
     });
     host.emit({
@@ -3788,12 +3809,111 @@ export async function runHarnessDriver(
       // keeps one standalone pre-implementation audit.
       if (roles && roles.reviewers.length > 0) {
         const MAX_SPEC_ROUNDS = 3;
-        let specPath = finalSpecPath;
+        const specOrchestrator = roles.orchestrator;
+        const specBasis = sha256(JSON.stringify(specResult));
+        const recordedSpecRounds =
+          ledger.rounds?.spec?.basis === specBasis ? ledger.rounds.spec : undefined;
+        let specPath = recordedSpecRounds?.specPath ?? finalSpecPath;
+        const revisedFiles = new Set(recordedSpecRounds?.files ?? []);
+        if (recordedSpecRounds) {
+          finalSpecPath = specPath;
+          diagnosisSummary = recordedSpecRounds.summary;
+          for (const f of revisedFiles) allowlist.add(f);
+        }
+        const saveSpecRounds = (
+          round: number,
+          extra: { findings?: AttributedFinding[]; done?: true } = {},
+        ): void => {
+          ledger.rounds = {
+            ...ledger.rounds,
+            spec: {
+              round,
+              basis: specBasis,
+              specPath,
+              summary: diagnosisSummary,
+              files: [...revisedFiles],
+              ...extra,
+            },
+          };
+          persist();
+        };
+        /** Answer a council's findings in the spec; `undefined` once revised,
+         *  otherwise what the driver returns. */
+        const reviseSpec = async (
+          sround: number,
+          specFindings: AttributedFinding[],
+        ): Promise<string | null | undefined> => {
+          const revise = await agentPhase(
+            `spec-${sround + 1}`,
+            `Revise spec (round ${sround} feedback)`,
+            phaseSkills.specWriting,
+            [
+              `The spec council requested changes on the specification at ${specPath}. Address every finding, update the spec file in place, and keep it implementation-accurate.`,
+              ``,
+              `Findings:`,
+              ...specFindings.map(
+                (f) =>
+                  `- [${f.severity}] ${f.title}${f.location ? ` @ ${f.location}` : ''} (raised by ${f.by})${f.evidence ? ` — ${f.evidence}` : ''}`,
+              ),
+              ``,
+              `When you are done write a JSON result file at the path in $CEZ_HARNESS_RESULT_FILE of the shape:`,
+              `{"summary": "<one-paragraph summary of the revision>", "specPath": "<repo-relative spec path>", "files": ["<spec file>"]}`,
+            ].join('\n'),
+            specResultSchema,
+            'spec',
+            specOrchestrator,
+            acceptSpecResult,
+          );
+          if ('cancelled' in (revise as object)) return null;
+          if ('error' in (revise as object)) return (revise as { error: string }).error;
+          const revised = revise as z.infer<typeof specResultSchema>;
+          specPath = revised.specPath;
+          finalSpecPath = specPath;
+          diagnosisSummary = revised.summary;
+          for (const f of revised.files ?? []) {
+            allowlist.add(f);
+            revisedFiles.add(f);
+          }
+          if (sround === MAX_SPEC_ROUNDS) {
+            if (!ledger.decisions.some((decision) => decision.kind === 'spec.closing-fixes')) {
+              ledger.decisions.push({
+                at: new Date().toISOString(),
+                kind: 'spec.closing-fixes',
+                by: 'driver',
+                detail: `round:${sround}`,
+              });
+            }
+            persist();
+            host.emit({
+              type: 'note',
+              stepId: `spec-${sround + 1}`,
+              message:
+                `applied the findings from pre-implementation audit ${sround}/${MAX_SPEC_ROUNDS}; ` +
+                `the audit budget is exhausted, so implementation continues without buying a fourth audit`,
+            });
+          }
+          saveSpecRounds(sround + 1, sround === MAX_SPEC_ROUNDS ? { done: true } : {});
+          return undefined;
+        };
         const specSplit = splitReviewers(roles.reviewers);
         const specRunnerReviewers = specSplit.sessions;
         const specCouncilMembers = specSplit.members;
-        for (let sround = 1; sround <= MAX_SPEC_ROUNDS; sround += 1) {
+        const firstSpecRound = recordedSpecRounds?.round ?? 1;
+        // A finished loop is history: implementation already built on its spec.
+        for (
+          let sround = firstSpecRound;
+          sround <= MAX_SPEC_ROUNDS && !recordedSpecRounds?.done;
+          sround += 1
+        ) {
           if (host.isCancelled()) return null;
+          // A council that already asked for changes is not paid for again.
+          const pendingRevision =
+            sround === firstSpecRound ? recordedSpecRounds?.findings : undefined;
+          if (pendingRevision) {
+            const stop = await reviseSpec(sround, pendingRevision);
+            if (stop !== undefined) return stop;
+            continue;
+          }
           const specViolation = specPathViolation(specPath);
           if (specViolation) return `the spec phase ${specViolation}`;
           const specSubjectSha256 = hashFile(join(host.cwd, specPath));
@@ -3880,7 +4000,7 @@ export async function runHarnessDriver(
             for (
               let attempt = priorAttempts + 1;
               // A recorded `council.retry` decision extends the budget of 2.
-              attempt <= 2 + councilRetryAllowance('spec', sround) && parsed === null;
+              attempt <= 2 + councilRetryAllowance('spec', sround, specSubjectSha256) && parsed === null;
               attempt += 1
             ) {
               const attemptPrompt =
@@ -3994,7 +4114,7 @@ export async function runHarnessDriver(
                   kindTag: 'spec',
                   round: sround,
                   members: specCouncilMembers,
-                  retryAllowance: councilRetryAllowance('spec', sround),
+                  retryAllowance: councilRetryAllowance('spec', sround, specSubjectSha256),
                   criteriaText: `${[
                       `Spec council criteria (run ${host.runId}).`,
                       ``,
@@ -4037,7 +4157,7 @@ export async function runHarnessDriver(
               }
             }
           }
-          const gate = resolveCouncilGate('spec', sround, outcomes, councilId);
+          const gate = resolveCouncilGate('spec', sround, outcomes, councilId, specSubjectSha256);
           if (!gate.proceed) {
             finishPhase(ledger, councilId, 'failed', gate.error);
             upsertCouncil('spec', sround, {
@@ -4088,53 +4208,13 @@ export async function runHarnessDriver(
             stepId: councilId,
             council: { round: sround, kind: 'spec', reviewers: councilReviewers, verdict: specVerdict, findings: specFindings },
           });
-          if (specVerdict === 'approve') break;
-          const revise = await agentPhase(
-            `spec-${sround + 1}`,
-            `Revise spec (round ${sround} feedback)`,
-            phaseSkills.specWriting,
-            [
-              `The spec council requested changes on the specification at ${specPath}. Address every finding, update the spec file in place, and keep it implementation-accurate.`,
-              ``,
-              `Findings:`,
-              ...specFindings.map(
-                (f) =>
-                  `- [${f.severity}] ${f.title}${f.location ? ` @ ${f.location}` : ''} (raised by ${f.by})${f.evidence ? ` — ${f.evidence}` : ''}`,
-              ),
-              ``,
-              `When you are done write a JSON result file at the path in $CEZ_HARNESS_RESULT_FILE of the shape:`,
-              `{"summary": "<one-paragraph summary of the revision>", "specPath": "<repo-relative spec path>", "files": ["<spec file>"]}`,
-            ].join('\n'),
-            specResultSchema,
-            'spec',
-            roles.orchestrator,
-            acceptSpecResult,
-          );
-          if ('cancelled' in (revise as object)) return null;
-          if ('error' in (revise as object)) return (revise as { error: string }).error;
-          const revised = revise as z.infer<typeof specResultSchema>;
-          specPath = revised.specPath;
-          finalSpecPath = specPath;
-          diagnosisSummary = revised.summary;
-          for (const f of revised.files ?? []) allowlist.add(f);
-          if (sround === MAX_SPEC_ROUNDS) {
-            if (!ledger.decisions.some((decision) => decision.kind === 'spec.closing-fixes')) {
-              ledger.decisions.push({
-                at: new Date().toISOString(),
-                kind: 'spec.closing-fixes',
-                by: 'driver',
-                detail: `round:${sround}`,
-              });
-            }
-            persist();
-            host.emit({
-              type: 'note',
-              stepId: `spec-${sround + 1}`,
-              message:
-                `applied the findings from pre-implementation audit ${sround}/${MAX_SPEC_ROUNDS}; ` +
-                `the audit budget is exhausted, so implementation continues without buying a fourth audit`,
-            });
+          if (specVerdict === 'approve') {
+            saveSpecRounds(sround, { done: true });
+            break;
           }
+          saveSpecRounds(sround, { findings: specFindings });
+          const stop = await reviseSpec(sround, specFindings);
+          if (stop !== undefined) return stop;
         }
       }
 
@@ -4265,6 +4345,35 @@ export async function runHarnessDriver(
         : `fix: ${input.task.split('\n')[0]}`;
     }
 
+    const firstImplementPrompt = [
+      isFeature
+        ? `Implement this feature in the current worktree, following the specification summary below.`
+        : `Fix this issue in the current worktree with the ${phaseSkills.fix} skill. Add the mandatory regression test and prove the complete fix through its validation workflow.`,
+      ``,
+      `Task:`,
+      input.task,
+      ``,
+      `${isFeature ? 'Specification' : 'Diagnosis'}: ${diagnosisSummary}`,
+      ``,
+      `Hard boundaries: edit only this worktree; create NO commit; perform NO push, PR, or other remote write; do not weaken or delete tests.`,
+      `When you are done write a JSON result file at the path in $CEZ_HARNESS_RESULT_FILE of the shape:`,
+      `{"changedPaths": ["<every repo-relative file you changed or created>"], "summary": "<what changed and why>", "suggestedCommit": "<conventional commit subject>"}`,
+    ].join('\n');
+    // A resume continues the loop this brief started (PR #925 review); feedback clears it.
+    const implementationBasis = sha256(firstImplementPrompt);
+    const recordedRounds =
+      ledger.rounds?.implementation?.basis === implementationBasis
+        ? ledger.rounds.implementation
+        : undefined;
+    if (recordedRounds) {
+      reviewFindings = structuredClone(recordedRounds.findings);
+      for (const [path, phaseId] of Object.entries(recordedRounds.allowlist)) {
+        addToAllowlist(path, phaseId);
+      }
+      suggestedCommit = recordedRounds.suggestedCommit ?? suggestedCommit;
+      implementSummary = recordedRounds.summary ?? implementSummary;
+    }
+
     /**
      * Rounds spent repairing the validation gate rather than answering a review.
      *
@@ -4278,9 +4387,9 @@ export async function runHarnessDriver(
      * Validation repair gets its own small budget on top. It is capped
      * separately so a permanently red gate still terminates.
      */
-    let validationRepairRounds = 0;
+    let validationRepairRounds = recordedRounds?.validationRepairRounds ?? 0;
     const MAX_VALIDATION_REPAIR_ROUNDS = 2;
-    const validationRepairPhases = new Set<string>();
+    const validationRepairPhases = new Set<string>(recordedRounds?.repairPhases);
     const recordedClosingRepair = implementationDecisions().find(
       (decision) => decision.kind === 'review.closing-fixes',
     );
@@ -4343,7 +4452,8 @@ export async function runHarnessDriver(
      * are never told what verdict to reach. They are only denied the ability to
      * reverse an accepted fix without noticing they are doing it.
      */
-    const roundHistory: Array<{ round: number; demanded: string[]; response: string }> = [];
+    const roundHistory: Array<{ round: number; demanded: string[]; response: string }> =
+      structuredClone(recordedRounds?.history ?? []);
 
     /** Prior rounds — and any open spec question — rendered for a reviewer. */
     const priorRoundsAppendix = (): string => {
@@ -4386,7 +4496,27 @@ export async function runHarnessDriver(
         (closingRepairStartRound ?? 0) + validationRepairRounds,
       );
 
-    for (let round = 1; round <= implementationLoopLimit(); round += 1) {
+    /** The loop's state entering `round` — everything a resume needs to continue there. */
+    const saveImplementationRounds = (round: number): void => {
+      ledger.rounds = {
+        ...ledger.rounds,
+        implementation: {
+          round,
+          basis: implementationBasis,
+          validationRepairRounds,
+          repairPhases: [...validationRepairPhases],
+          findings: structuredClone(reviewFindings),
+          history: structuredClone(roundHistory),
+          allowlist: Object.fromEntries(allowlistOrigin),
+          ...(suggestedCommit !== undefined ? { suggestedCommit } : {}),
+          ...(implementSummary !== undefined ? { summary: implementSummary } : {}),
+        },
+      };
+      persist();
+    };
+
+    for (let round = recordedRounds?.round ?? 1; round <= implementationLoopLimit(); round += 1) {
+      saveImplementationRounds(round);
       const isFirst = round === 1;
       const isClosingRepair =
         closingRepairStartRound !== undefined && round >= closingRepairStartRound;
@@ -4398,20 +4528,7 @@ export async function runHarnessDriver(
       const reviewId = isFirst ? 'review' : `review-${round}`;
 
       const implementPrompt = isFirst
-        ? [
-            isFeature
-              ? `Implement this feature in the current worktree, following the specification summary below.`
-              : `Fix this issue in the current worktree with the ${phaseSkills.fix} skill. Add the mandatory regression test and prove the complete fix through its validation workflow.`,
-            ``,
-            `Task:`,
-            input.task,
-            ``,
-            `${isFeature ? 'Specification' : 'Diagnosis'}: ${diagnosisSummary}`,
-            ``,
-            `Hard boundaries: edit only this worktree; create NO commit; perform NO push, PR, or other remote write; do not weaken or delete tests.`,
-            `When you are done write a JSON result file at the path in $CEZ_HARNESS_RESULT_FILE of the shape:`,
-            `{"changedPaths": ["<every repo-relative file you changed or created>"], "summary": "<what changed and why>", "suggestedCommit": "<conventional commit subject>"}`,
-          ].join('\n')
+        ? firstImplementPrompt
         : [
             `A fresh code review of your project's uncommitted diff confirmed blocking findings. Fix them in the current worktree.`,
             ``,
@@ -4763,7 +4880,7 @@ export async function runHarnessDriver(
           for (
             let attempt = priorAttempts + 1;
             // A recorded `council.retry` decision extends the budget of 2.
-            attempt <= 2 + councilRetryAllowance('implementation', round) && parsed === null;
+            attempt <= 2 + councilRetryAllowance('implementation', round, implementationSubjectSha256) && parsed === null;
             attempt += 1
           ) {
             const attemptPrompt =
@@ -4879,7 +4996,7 @@ export async function runHarnessDriver(
                 kindTag: 'impl',
                 round,
                 members: implCouncilMembers,
-                retryAllowance: councilRetryAllowance('implementation', round),
+                retryAllowance: councilRetryAllowance('implementation', round, implementationSubjectSha256),
                 criteriaText: `${[
                     `Role-based cezar council criteria (run ${host.runId}).`,
                     ``,
@@ -4931,7 +5048,7 @@ export async function runHarnessDriver(
             });
           }
         }
-        const gate = resolveCouncilGate('implementation', round, outcomes, reviewId);
+        const gate = resolveCouncilGate('implementation', round, outcomes, reviewId, implementationSubjectSha256);
         if (!gate.proceed) {
           finishPhase(ledger, reviewId, 'failed', gate.error);
           upsertCouncil('implementation', round, {

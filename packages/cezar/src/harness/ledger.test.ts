@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  councilDecisionDetail,
   createLedger,
   ledgerPath,
   loadLedger,
@@ -106,6 +107,42 @@ describe('harness ledger', () => {
     expect(read.ledger.version).toBe(2);
     expect(read.ledger.invocations).toEqual([]);
     expect(readFileSync(path, 'utf8')).toBe(JSON.stringify(v1));
+  });
+
+  it('loads a v2 ledger written before the round cursor, and round-trips one that has it', () => {
+    const legacy = createLedger({
+      workflow: 'harness-fix-issue',
+      requestedProfile: 'standard',
+      subject: { kind: 'brief', text: 'x' },
+    });
+    saveLedger(dataDir, runId, legacy);
+    expect(readFileSync(ledgerPath(dataDir, runId), 'utf8')).not.toContain('"rounds"');
+    const read = readLedger(dataDir, runId);
+    expect(read.status).toBe('valid');
+    if (read.status !== 'valid') throw new Error('expected valid ledger');
+    expect(read.ledger.rounds).toBeUndefined();
+
+    read.ledger.rounds = {
+      implementation: {
+        round: 2,
+        basis: 'b'.repeat(64),
+        validationRepairRounds: 1,
+        repairPhases: ['fix-2'],
+        findings: [{ severity: 'blocker', title: 'validation gate failed', evidence: 'exit 1' }],
+        history: [],
+        allowlist: { 'src/a.ts': 'implement' },
+        suggestedCommit: 'fix: x',
+      },
+    };
+    saveLedger(dataDir, runId, read.ledger);
+    expect(loadLedger(dataDir, runId)?.rounds).toEqual(read.ledger.rounds);
+  });
+
+  it('keys a council decision to the subject its round reviewed', () => {
+    expect(councilDecisionDetail({ council: 'implementation', round: 2, subjectSha256: 'abc' })).toBe(
+      'implementation:2:abc',
+    );
+    expect(councilDecisionDetail({ council: 'spec', round: 1 })).toBe('spec:1');
   });
 
   it('writes atomically — no .tmp file remains after save', () => {

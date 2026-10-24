@@ -199,7 +199,7 @@ import {
   harnessCouncilDecisionInputSchema,
 } from '@open-mercato/cezar-contract';
 import { toPastedContent, type PastedContent, type RunManager, type StartRunInput } from '../workflows/run.ts';
-import { createLedger, readLedger, saveLedger } from '../harness/ledger.ts';
+import { councilDecisionDetail, createLedger, readLedger, saveLedger } from '../harness/ledger.ts';
 import { loadAgenticConfig, resolveHarnessRuntimeInfo } from '../harness/runtime.ts';
 import {
   createModelProber,
@@ -5215,7 +5215,7 @@ export function createApp(deps: ServerDeps) {
           at: new Date().toISOString(),
           kind: `council.${body.action}`,
           by: 'user',
-          detail: `${pending.council}:${pending.round}`,
+          detail: councilDecisionDetail(pending),
         });
         saveLedger(dataDir, id, read.ledger);
         const resumed = manager.continueRun(id);

@@ -187,6 +187,9 @@ const harnessOutcomeSchema = z
           completedCount: z.number().int().min(0),
           /** False when every reviewer failed — there is nothing to proceed WITH. */
           canProceed: z.boolean(),
+          /** What this round's council reviewed; the decision is keyed to it
+           *  (`councilDecisionDetail`). Absent on pauses recorded before it was. */
+          subjectSha256: z.string().min(1).optional(),
         }),
         z.object({
           kind: z.literal('spec'),
@@ -195,6 +198,60 @@ const harnessOutcomeSchema = z
           findings: z.array(z.string().min(1).max(4_000)).max(50),
         }),
       ])
+      .optional(),
+  })
+  .passthrough();
+
+const roundFindingSchema = z
+  .object({
+    severity: z.enum(['blocker', 'major', 'minor', 'nit']),
+    title: z.string(),
+    location: z.string().optional(),
+    evidence: z.string().optional(),
+    by: z.string().optional(),
+  })
+  .passthrough();
+
+/** Where the spec and implementation loops stand, so a resume re-enters the open round
+ *  instead of re-gating round 1 against a later diff (PR #925 review). A cursor whose
+ *  `basis` (what started the loop) no longer matches is ignored. */
+const harnessRoundsSchema = z
+  .object({
+    spec: z
+      .object({
+        round: z.number().int().min(1),
+        basis: z.string().min(1),
+        specPath: z.string().min(1),
+        summary: z.string(),
+        files: z.array(z.string()),
+        /** The council of `round` asked for these changes; its revision is next. */
+        findings: z.array(roundFindingSchema).optional(),
+        /** The loop finished; a resume never re-audits a spec the build already used. */
+        done: z.boolean().optional(),
+      })
+      .passthrough()
+      .optional(),
+    implementation: z
+      .object({
+        round: z.number().int().min(1),
+        basis: z.string().min(1),
+        validationRepairRounds: z.number().int().min(0),
+        repairPhases: z.array(z.string()),
+        /** What the fix phase of `round` answers. */
+        findings: z.array(roundFindingSchema),
+        history: z.array(
+          z.object({
+            round: z.number().int().min(1),
+            demanded: z.array(z.string()),
+            response: z.string(),
+          }),
+        ),
+        /** Changed paths earlier rounds reported, by the phase that first did. */
+        allowlist: z.record(z.string(), z.string()),
+        suggestedCommit: z.string().optional(),
+        summary: z.string().optional(),
+      })
+      .passthrough()
       .optional(),
   })
   .passthrough();
@@ -255,6 +312,7 @@ const harnessLedgerBaseShape = {
   loops: z
     .object({ fixRounds: z.number().int().min(0), maxFixRounds: z.number().int().min(1) })
     .default({ fixRounds: 0, maxFixRounds: 3 }),
+  rounds: harnessRoundsSchema.optional(),
   claim: z
     .object({
       held: z.boolean(),
