@@ -29,7 +29,7 @@ export const KNOWN_PRESETS_BY_RUNNER: Record<RunnerId, readonly string[]> = {
   // Tier aliases only. The dated ids that used to sit here (`claude-opus-4-8` and friends) came
   // off the picker when Claude gained host discovery (#784) — a guard that names a specific
   // vendor release goes stale the same way the picker did, and this list mirrors the picker.
-  claude: ['opus', 'sonnet', 'haiku'],
+  claude: ['fable', 'opus', 'sonnet', 'haiku'],
   codex: ['gpt-5.1-codex', 'gpt-5.1-codex-mini', 'gpt-5-codex'],
   opencode: [],
   // Cursor models are discovered from the CLI / Settings — no hard-coded presets
@@ -106,4 +106,22 @@ export function modelConflictsWithRunner(model: string, runner: RunnerId): boole
       ([other, prefix]) => other !== runner && prefix.test(model),
     )
   );
+}
+
+/**
+ * True when `model` provably belongs to `runner`: one of its presets, its vendor's bare id shape,
+ * a `provider/model` naming its own default provider, or a bare id on a runner that has one.
+ * Stricter than {@link modelConflictsWithRunner} on purpose: it judges a pin INHERITED across a
+ * runner switch, which nobody picked for the target — Claude's open gateway support otherwise
+ * lets OpenCode's `openai/gpt-5.1` through to `claude --model` (telemetry 8e1173b1). Spanning
+ * runners (OpenCode, pi) only take `provider/model`, so a bare pin is never theirs.
+ */
+export function modelNativeToRunner(model: string, runner: RunnerId): boolean {
+  if (!model || modelConflictsWithRunner(model, runner)) return false;
+  if (KNOWN_PRESETS_BY_RUNNER[runner]?.includes(model)) return true;
+  if (NATIVE_MODEL_ID_PREFIX[runner]?.test(model)) return true;
+  const defaultProvider = BACKEND_MODEL_MAP[runner]?.defaultProvider;
+  const explicit = parseModelIdentity(model);
+  if (explicit) return defaultProvider === undefined || explicit.provider === defaultProvider;
+  return defaultProvider !== undefined && !model.includes('/');
 }
