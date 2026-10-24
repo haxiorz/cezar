@@ -485,26 +485,31 @@ export const runRecordSchema = z.object({
   /** cez-harness run stub (spec 2026-07-23-harness-orchestration): presence
    *  marks a harness-driven run for the list surfaces, the publish guards and
    *  recovery; the full state lives in the sibling `<id>.harness.json` ledger.
-   *  Kept loose (plain strings) so the store never imports harness types. */
+   *  Kept loose (plain strings) so the store never imports harness types.
+   *  Every level degrades (`.catch`) like `workflowDef`: runs.json parses as one
+   *  array, so a value this cezar does not know (newer writer, rollback) must not
+   *  make the whole task index unavailable (PR #925 review). */
   harness: z
     .object({
       profile: z.string(),
       workflow: z.string(),
       /** Optional on runs created before selectable phase-skill profiles. */
-      skillProfile: z.enum(['generic', 'open-mercato']).optional(),
-      issueId: z.string().optional(),
+      skillProfile: z.enum(['generic', 'open-mercato']).optional().catch(undefined),
+      issueId: z.string().optional().catch(undefined),
       /** Role-based selection (2026-07-24). This copy makes recovery re-queues
        *  conduct the same roles while keeping the run API fully typed. */
-      roles: harnessRolesSchema.optional(),
+      roles: harnessRolesSchema.optional().catch(undefined),
       baseAcknowledgement: z
         .object({
           configuredBase: z.string(),
           remoteDefault: z.string(),
           reason: z.string(),
         })
-        .optional(),
+        .optional()
+        .catch(undefined),
     })
-    .optional(),
+    .optional()
+    .catch(undefined),
   /** Where a graph workflow's walk has been (spec 2026-09-30-workflow-node-editor, phase 3):
    *  per-loop counters and every edge taken, in order, as `<node>.<port>-><target>` (`to` empty
    *  when an unwired port ended the run). Written by `executeGraph` for the task view's live
@@ -2021,6 +2026,10 @@ export class RunStore extends EventEmitter {
         rmSync(this.eventsPath(id), { force: true });
         rmSync(this.handoffPath(id), { force: true }); // spec 007: the journal goes with the task
         rmSync(this.imagesDir(id), { recursive: true, force: true }); // agent screenshots
+        // The harness ledger and its artifact tree (prompts, reviewer outputs, guard files) are
+        // cezar-owned state of this task too (PR #925 review).
+        rmSync(this.harnessLedgerPath(id), { force: true });
+        rmSync(this.harnessArtifactDir(id), { recursive: true, force: true });
         // Unsent drafts go with the task (#939): a draft for a run that no longer exists is
         // unreachable by definition, and it may be holding megabytes of pasted screenshots.
         deleteRunDrafts(this.dataDir, id);
@@ -2140,6 +2149,16 @@ export class RunStore extends EventEmitter {
   /** Agent screenshots persisted by the run manager (see persistImage). */
   private imagesDir(runId: string): string {
     return join(this.dataDir, 'runs', `${runId}-images`);
+  }
+
+  /** Same locations as `ledgerPath()` (harness/ledger.ts) and `harnessArtifactDir()`
+   *  (harness/driver.ts) — inlined so the store never imports harness code. */
+  private harnessLedgerPath(runId: string): string {
+    return join(this.dataDir, 'runs', `${runId}.harness.json`);
+  }
+
+  private harnessArtifactDir(runId: string): string {
+    return join(this.dataDir, 'runs', `${runId}-harness`);
   }
 
   private touch(run: RunRecord): void {

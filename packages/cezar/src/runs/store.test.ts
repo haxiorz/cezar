@@ -252,6 +252,62 @@ describe('RunStore — titleSummary + diffStat (#389)', () => {
     expect(run?.worktreeReclaimedAt).toBeUndefined();
   });
 
+  it('degrades a harness stub with values this cezar does not know instead of losing the index (PR #925 review)', () => {
+    // runs.json parses as ONE array: a single unknown enum (a newer cezar, or a rollback) used
+    // to make the whole task index unavailable.
+    const harnessRun = {
+      ...LEGACY_RUN,
+      id: 'harness-1',
+      workflow: 'cez-harness-fix-issue',
+      harness: {
+        profile: 'standard',
+        workflow: 'cez-harness-fix-issue',
+        skillProfile: 'from-the-future',
+        issueId: '642',
+        roles: {
+          orchestrator: { runner: 'claude', model: '' },
+          implementer: { runner: 'some-new-runner', model: 'x' },
+          reviewers: [],
+        },
+        baseAcknowledgement: { configuredBase: 'develop', remoteDefault: 'main', reason: 7 },
+      },
+    };
+    const broken = { ...LEGACY_RUN, id: 'harness-2', harness: { profile: 42 } };
+    writeFileSync(join(dataDir, 'runs.json'), JSON.stringify([LEGACY_RUN, harnessRun, broken]), 'utf8');
+
+    const store = RunStore.open(dataDir);
+
+    expect(store.getIndexReadHealth().state).toBe('complete');
+    expect(store.getRun('legacy-1')?.title).toBe('fix the login bug');
+    // The harness marker survives; only what this cezar cannot read is dropped.
+    expect(store.getRun('harness-1')?.harness).toEqual({
+      profile: 'standard',
+      workflow: 'cez-harness-fix-issue',
+      issueId: '642',
+    });
+    expect(store.getRun('harness-2')?.title).toBe('fix the login bug');
+    expect(store.getRun('harness-2')?.harness).toBeUndefined();
+  });
+
+  it('deleting a task removes its harness ledger and artifact tree, and nobody else\'s (PR #925 review)', () => {
+    const store = RunStore.open(dataDir);
+    const doomed = store.createRun({ title: 'd', workflow: 'cez-harness-fix-issue', task: 'd', steps: [] });
+    const kept = store.createRun({ title: 'k', workflow: 'cez-harness-fix-issue', task: 'k', steps: [] });
+    const runsDir = join(dataDir, 'runs');
+    for (const id of [doomed.id, kept.id]) {
+      writeFileSync(join(runsDir, `${id}.harness.json`), '{}', 'utf8');
+      mkdirSync(join(runsDir, `${id}-harness`, 'agent-output'), { recursive: true });
+      writeFileSync(join(runsDir, `${id}-harness`, 'agent-output', 'reviewer.md'), 'verdict', 'utf8');
+    }
+
+    expect(store.deleteRun(doomed.id)).toBe(true);
+
+    expect(existsSync(join(runsDir, `${doomed.id}.harness.json`))).toBe(false);
+    expect(existsSync(join(runsDir, `${doomed.id}-harness`))).toBe(false);
+    expect(existsSync(join(runsDir, `${kept.id}.harness.json`))).toBe(true);
+    expect(existsSync(join(runsDir, `${kept.id}-harness`, 'agent-output', 'reviewer.md'))).toBe(true);
+  });
+
   it('round-trips worktreeReclaimedAt and lets updateRun clear it (retention #483)', () => {
     const store = RunStore.open(dataDir);
     const run = store.createRun({ title: 't', workflow: 'w', task: 'task', steps: [] });
