@@ -147,6 +147,21 @@ describe('harness lifecycle boundaries', () => {
     expect(store.getRun(run.id)?.steps).toEqual([]);
   });
 
+  // PR #925 review: text after an HA run's implement phase could never be consumed.
+  it('refuses Continue text once high-assurance packet work is implemented, but still resumes', () => {
+    manager.dispose();
+    manager = new RunManager(store, root, { semaphore: new WorkspaceSemaphore({ initial: { maxParallel: 0 } }) });
+    const run = store.createRun({ title: 't', workflow: workflow.name, task: 'Fix issue #642', steps: [] });
+    store.updateRun(run.id, { status: 'failed', workflowDef: workflow, harness: { profile: 'high-assurance', workflow: workflow.name } });
+    const ledger = createLedger({ workflow: workflow.name, requestedProfile: 'high-assurance', subject: { kind: 'issue', id: '642', text: 'Fix issue #642' } });
+    ledger.phases.push({ id: 'implement', name: 'Implement', kind: 'agent', status: 'done', attempts: 1, artifacts: {} });
+    saveLedger(join(root, '.ai/cezar'), run.id, ledger);
+
+    expect(manager.continueRun(run.id, { text: 'Also rename the helper.' })).toMatchObject({ ok: false, error: expect.stringContaining('new task') });
+    expect(loadLedger(join(root, '.ai/cezar'), run.id)?.pendingMessages).toEqual([]);
+    expect(manager.continueRun(run.id)).toEqual({ ok: true });
+  });
+
   it('reconsiders high-assurance no-action outcomes before packet leases exist', () => {
     manager.dispose();
     manager = new RunManager(store, root, { semaphore: new WorkspaceSemaphore({ initial: { maxParallel: 0 } }) });

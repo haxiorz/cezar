@@ -12,12 +12,13 @@ import {
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as claudeGuard from './claude-guard.js';
 import {
   councilDecisionDetail,
   loadLedger,
+  readLedger,
   saveLedger,
   createLedger,
   startPhase,
@@ -1219,6 +1220,49 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(readFileSync(ledger!.runtimeScript!.path, 'utf8')).toBe(pinnedRuntime);
   });
 
+  // PR #925 review: preflight rm+cp'd over a tracked `.claude/skills/<name>`, and the handoff,
+  // derived from git, staged cezar's copy as part of the user's change.
+  it('never rewrites a skill directory the repository tracks', async () => {
+    const git = (...args: string[]) =>
+      execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd: dir, encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    const trackedSkill = join(dir, '.claude', 'skills', 'cez-harness', 'SKILL.md');
+    mkdirSync(dirname(trackedSkill), { recursive: true });
+    const repoCopy = '---\nname: cez-harness\n---\n# the repository copy\n';
+    writeFileSync(trackedSkill, repoCopy, 'utf8');
+    git('add', '-A');
+    git('commit', '-q', '-m', 'track a skill');
+    const bundledRoot = join(dir, '..', `${basename(dir)}-bundled`);
+    writeTestSkill(bundledRoot, 'cez-harness');
+    mkdirSync(join(bundledRoot, 'cez-harness', 'scripts'), { recursive: true });
+    const bundledRuntime = '// bundled runtime\n';
+    writeFileSync(join(bundledRoot, 'cez-harness', 'scripts', 'harness.mjs'), bundledRuntime, 'utf8');
+    const h = makeHarness(dir);
+    h.deps.bundledSkillsRoot = bundledRoot;
+    delete h.deps.sealRuntime;
+    delete h.deps.scriptDigest;
+    h.deps.resolveScript = () => join(bundledRoot, 'cez-harness', 'scripts', 'harness.mjs');
+    h.host.ensureSkill = async (name) => {
+      materializeTestSkill(dir, name);
+      return true;
+    };
+    const executed: string[] = [];
+    const fakeRuntime = h.deps.createRuntime!;
+    h.deps.createRuntime = (opts) => {
+      executed.push(readFileSync(opts.script, 'utf8'));
+      return fakeRuntime(opts);
+    };
+
+    try {
+      expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+      expect(readFileSync(trackedSkill, 'utf8')).toBe(repoCopy);
+      expect(git('status', '--porcelain', '--', '.claude/skills/cez-harness')).toBe('');
+      expect(executed).toEqual([bundledRuntime]);
+    } finally {
+      rmSync(bundledRoot, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed when the pinned runtime is gone instead of sealing the worktree copy', async () => {
     const bundledRoot = join(dir, 'pinned-bundled');
     writeTestSkill(bundledRoot, 'cez-harness');
@@ -1718,6 +1762,33 @@ describe('harness driver — standard fix-issue graph', () => {
         (invocation) => invocation.id === 'packet-release:PK-01:1',
       ),
     ).toMatchObject({ status: 'completed', artifactSha256: expect.any(String) });
+  });
+
+  // PR #925 review: an HA message left unassigned after implement blocked stage on every resume.
+  it('rejects a message stranded after high-assurance implementation instead of blocking stage forever', async () => {
+    const first = makeHarness(dir);
+    first.deps.loadAgentic = async () => highAssuranceAgentic();
+    expect(await runHarnessDriver(first.host, { ...input, profile: 'high-assurance' }, first.deps)).toBeNull();
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    ledger.stage = { status: 'pending' };
+    ledger.outcome = { status: 'pending', blockingReasons: [] };
+    const stagePhase = ledger.phases.find((phase) => phase.id === 'stage');
+    if (stagePhase) stagePhase.status = 'pending';
+    ledger.pendingMessages.push({ id: 'late', text: 'Also rename the helper.', createdAt: new Date().toISOString() });
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+
+    const resumed = makeHarness(dir);
+    resumed.deps.loadAgentic = async () => highAssuranceAgentic();
+    expect(await runHarnessDriver(resumed.host, { ...input, profile: 'high-assurance' }, resumed.deps)).toBeNull();
+
+    const after = loadLedger(resumed.host.dataDir, resumed.host.runId)!;
+    expect(after.stage.status).toBe('staged');
+    expect(after.pendingMessages).toEqual([
+      expect.objectContaining({ id: 'late', consumedByPhaseId: 'rejected' }),
+    ]);
+    expect(after.decisions).toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: 'implementation.feedback.rejected', detail: 'late' })]),
+    );
   });
 
   it('rejects parent/child path overlap across high-assurance packets before a worker runs', async () => {
@@ -2875,6 +2946,46 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     if (pending?.kind !== 'council') throw new Error('no council decision is pending');
     return councilDecisionDetail(pending);
   };
+
+  // PR #925 review: a stopped reviewer records no outcome, so the survivors alone looked
+  // "below quorum" and a cancelled run was parked on a decision, still holding its claim.
+  it('does not park a run stopped mid-council on a below-quorum decision', async () => {
+    let cancelled = false;
+    const h = makeHarness(dir);
+    h.host.isCancelled = () => cancelled;
+    // One council member completes and the rest fail, so the session reviewer's outcome
+    // decides quorum — and Stop lands after the council finished, while that session still runs.
+    let councilFinished!: () => void;
+    const councilRan = new Promise<void>((resolve) => {
+      councilFinished = resolve;
+    });
+    h.setCouncilBehavior((ids) => {
+      councilFinished();
+      return {
+        ok: true,
+        result: {
+          verdict: 'approve',
+          reviewers: ids.map((id, index) =>
+            index === 0
+              ? { id, status: 'completed', review: { verdict: 'approve', findings: [] } }
+              : { id, status: 'failed' },
+          ),
+        },
+      };
+    });
+    h.agentBehavior.set('review', async () => {
+      await councilRan;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      cancelled = true;
+      return null;
+    });
+
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toBeNull();
+    const ledger = loadLedger(h.host.dataDir, h.host.runId);
+    expect(ledger?.outcome.pendingDecision).toBeUndefined();
+    expect(ledger?.outcome.status).not.toBe('blocked');
+    expect(h.calls.map((call) => call.id)).not.toContain('stage');
+  });
 
   it('pauses below quorum with a decision instead of just dying', async () => {
     const h = makeHarness(dir);
@@ -4335,6 +4446,76 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
       kind: 'spec',
       gate: 'pre-implement',
     });
+  });
+
+  // PR #925 review: the decision's findings outgrew the ledger schema, so the next read was corrupt.
+  it('keeps a pre-implementation decision with oversized findings readable', async () => {
+    const h = makeHarness(dir);
+    h.agentBehavior.set('spec', (req) => {
+      mkdirSync(join(dir, '.ai', 'specs'), { recursive: true });
+      writeFileSync(join(dir, '.ai', 'specs', 'feat.md'), '# feature\n', 'utf8');
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify({ summary: 'feature spec', specPath: '.ai/specs/feat.md', files: ['.ai/specs/feat.md'] }),
+      );
+      return null;
+    });
+    h.agentBehavior.set('pre-implement', (req) => {
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify({
+          status: 'blocked',
+          summary: 's'.repeat(19_000),
+          reportPath: 'pre-implement.md',
+          findings: Array.from({ length: 50 }, (_, i) => ({
+            severity: 'major',
+            title: `t${i} ${'x'.repeat(480)}`,
+            evidence: 'e'.repeat(3_990),
+          })),
+        }),
+      );
+      return null;
+    });
+
+    const error = await runHarnessDriver(
+      h.host,
+      { ...input, workflow: HARNESS_IMPLEMENT_FEATURE, roles: undefined },
+      h.deps,
+    );
+
+    expect(error).toMatch(/explicit acceptance is required/);
+    const read = readLedger(h.host.dataDir, h.host.runId);
+    expect(read.status).toBe('valid');
+    if (read.status !== 'valid') return;
+    const decision = read.ledger.outcome.pendingDecision;
+    expect(decision?.kind).toBe('spec');
+    if (decision?.kind !== 'spec') return;
+    expect(decision.findings).toHaveLength(50);
+    expect(Math.max(...decision.findings.map((f) => f.length))).toBe(4_000);
+  });
+
+  it('keeps a blocked pre-implementation audit with only an oversized summary readable', async () => {
+    const h = makeHarness(dir);
+    h.agentBehavior.set('spec', (req) => {
+      mkdirSync(join(dir, '.ai', 'specs'), { recursive: true });
+      writeFileSync(join(dir, '.ai', 'specs', 'feat.md'), '# feature\n', 'utf8');
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify({ summary: 'feature spec', specPath: '.ai/specs/feat.md', files: ['.ai/specs/feat.md'] }),
+      );
+      return null;
+    });
+    h.agentBehavior.set('pre-implement', (req) => {
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify({ status: 'blocked', summary: 'z'.repeat(9_000), reportPath: 'r.md', findings: [] }),
+      );
+      return null;
+    });
+
+    await runHarnessDriver(h.host, { ...input, workflow: HARNESS_IMPLEMENT_FEATURE, roles: undefined }, h.deps);
+
+    expect(readLedger(h.host.dataDir, h.host.runId).status).toBe('valid');
   });
 
   it('preflights an unbound advisor to a clean setup hint, before any op runs', async () => {

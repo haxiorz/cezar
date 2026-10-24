@@ -830,6 +830,29 @@ describe('harness API', () => {
       ]);
     });
 
+    // PR #925 review: a message queued after an HA run's last agent boundary blocked stage forever.
+    it('refuses a message for implemented high-assurance packet work', async () => {
+      const run = store.createRun({ title: 't', workflow: HARNESS_FIX_ISSUE, task: 'x', steps: [] });
+      store.updateRun(run.id, {
+        status: 'running',
+        harness: { profile: 'high-assurance', workflow: HARNESS_FIX_ISSUE },
+      });
+      const ledger = createLedger({
+        workflow: HARNESS_FIX_ISSUE,
+        requestedProfile: 'high-assurance',
+        subject: { kind: 'brief', text: 'x' },
+      });
+      ledger.phases.push({ id: 'implement', name: 'Implement', kind: 'agent', status: 'done', attempts: 1, artifacts: {} });
+      saveLedger(dataDir, run.id, ledger);
+
+      const res = await post(`/api/v1/runs/${run.id}/messages`, { text: 'Also rename the helper.' });
+
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as { error: string }).error).toMatch(/new task/);
+      const after = readLedger(dataDir, run.id);
+      expect(after.status === 'valid' ? after.ledger.pendingMessages : null).toEqual([]);
+    });
+
     it('durably queues text for the next harness phase when no session is open', async () => {
       const run = store.createRun({
         title: 't',

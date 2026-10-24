@@ -17,6 +17,7 @@ import {
   councilDecisionDetail,
   createLedger,
   finishPhase,
+  harnessFeedbackClosedReason,
   readLedger,
   saveLedger,
   startPhase,
@@ -60,7 +61,11 @@ import {
 import { providerFamilyOf } from './model-family.js';
 import { createLiveTransport } from './probe-transports.js';
 import { resolveHarnessPlan } from './profile-plan.js';
-import { validationCheckSchema } from './types.js';
+import {
+  HARNESS_DECISION_FINDING_MAX,
+  HARNESS_DECISION_FINDINGS_MAX,
+  validationCheckSchema,
+} from './types.js';
 import { canonicalizeAdvisorRefs } from './advisor-identity.js';
 import {
   HARNESS_RESULT_LIMITS,
@@ -809,6 +814,19 @@ export async function runHarnessDriver(
     persist();
     host.emit({ type: 'harness.outcome.updated', outcome: ledger.outcome });
   };
+  // A model's findings fit the result contract, not the ledger's decision bounds; one over-long
+  // entry used to leave a ledger its own reader rejected (PR #925 review).
+  const decisionFindings = (findings: readonly string[], fallback: string): string[] => {
+    const bounded = (findings.length > 0 ? findings : [fallback])
+      .slice(0, HARNESS_DECISION_FINDINGS_MAX)
+      .map((finding) =>
+        finding.length > HARNESS_DECISION_FINDING_MAX
+          ? `${finding.slice(0, HARNESS_DECISION_FINDING_MAX - 1)}…`
+          : finding,
+      )
+      .filter((finding) => finding.trim().length > 0);
+    return bounded.length > 0 ? bounded : ['the pre-implementation audit reported unresolved risks'];
+  };
   const releaseHeldIssueClaim = (): void => {
     if (!ledger.claim?.held || !ledger.claim.path) return;
     const released = releaseClaim(ledger.claim.path, host.runId);
@@ -1103,6 +1121,21 @@ export async function runHarnessDriver(
         (ledger.effectiveProfile !== 'high-assurance' || ledger.stage.status === 'staged')
       ? 'implement'
       : undefined;
+  // Both entry points refuse such feedback (`harnessFeedbackClosedReason`); one that got queued
+  // anyway is rejected loudly here rather than blocking stage on every resume (PR #925 review).
+  const feedbackClosed = harnessFeedbackClosedReason(ledger);
+  if (feedback.length > 0 && feedbackClosed && ledger.stage.status !== 'staged') {
+    const at = new Date().toISOString();
+    const ids = feedback.map((message) => message.id);
+    for (const message of feedback) {
+      message.consumedAt = at;
+      message.consumedByPhaseId = 'rejected';
+    }
+    ledger.decisions.push({ at, kind: 'implementation.feedback.rejected', by: 'driver', detail: ids.join(',') });
+    persist();
+    host.emit({ type: 'note', message: `${feedbackClosed} Not applied: ${ids.join(', ')}` });
+    feedback.length = 0;
+  }
   if (feedback.length > 0 && feedbackPhase) {
     if (ledger.effectiveProfile === 'high-assurance' && feedbackPhase === 'implement') {
       return 'completed high-assurance packet work requires a new task for feedback; packet leases cannot be reopened safely';
@@ -1839,8 +1872,26 @@ export async function runHarnessDriver(
      */
     const bundledRoot =
       deps.bundledSkillsRoot === undefined ? bundledSkillsDir() : deps.bundledSkillsRoot;
-    const pinMaterializedSkill = (name: string): void => {
-      const materialized = join(host.cwd, '.claude', 'skills', name);
+    // A skill dir the repository tracks is the user's: cezar's copy over it would be staged into
+    // the handoff, which is derived from git (PR #925 review). Such skills pin from their source.
+    const tracksSkillDir = (name: string): boolean => {
+      try {
+        return (
+          execFileSync('git', ['ls-files', '-z', '--', `.claude/skills/${name}`], {
+            cwd: host.cwd,
+            encoding: 'utf8',
+            env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+          }).length > 0
+        );
+      } catch {
+        return false;
+      }
+    };
+    const composedSkillSources = new Map<string, string>();
+    const pinMaterializedSkill = (
+      name: string,
+      materialized = join(host.cwd, '.claude', 'skills', name),
+    ): void => {
       const pinned = join(trustedSkillsRoot, name);
       rmSync(pinned, { recursive: true, force: true });
       mkdirSync(trustedSkillsRoot, { recursive: true });
@@ -1878,13 +1929,16 @@ export async function runHarnessDriver(
       }
       const baseRoot = realpathSync(dirname(base.path));
       const baseRaw = readFileSync(join(baseRoot, 'SKILL.md'), 'utf8');
-      rmSync(target, { recursive: true, force: true });
-      cpSync(baseRoot, target, { recursive: true });
+      const tracked = tracksSkillDir(phaseSkills.codeReview);
+      const composed = tracked ? join(artifactDir, 'composed-skills', phaseSkills.codeReview) : target;
+      rmSync(composed, { recursive: true, force: true });
+      cpSync(baseRoot, composed, { recursive: true });
+      if (tracked) composedSkillSources.set(phaseSkills.codeReview, composed);
       if (baseRaw !== extensionRaw) {
         const extension = parseFrontmatter(extensionRaw).body.trim();
         if (extension) {
           writeFileSync(
-            join(target, 'SKILL.md'),
+            join(composed, 'SKILL.md'),
             [
               baseRaw.trimEnd(),
               '',
@@ -1899,18 +1953,22 @@ export async function runHarnessDriver(
           );
         }
       }
-      await excludeFromGit(host.cwd, `.claude/skills/${phaseSkills.codeReview}/`);
+      if (!tracked) await excludeFromGit(host.cwd, `.claude/skills/${phaseSkills.codeReview}/`);
       return null;
     };
     for (const name of needed) {
       const bundledSkill = bundledRoot === null ? null : join(bundledRoot, name);
       if (bundledSkill && existsSync(join(bundledSkill, 'SKILL.md'))) {
         try {
-          const target = join(host.cwd, '.claude', 'skills', name);
-          rmSync(target, { recursive: true, force: true });
-          cpSync(bundledSkill, target, { recursive: true });
-          await excludeFromGit(host.cwd, `.claude/skills/${name}/`);
-          pinMaterializedSkill(name);
+          if (tracksSkillDir(name)) {
+            pinMaterializedSkill(name, bundledSkill);
+          } else {
+            const target = join(host.cwd, '.claude', 'skills', name);
+            rmSync(target, { recursive: true, force: true });
+            cpSync(bundledSkill, target, { recursive: true });
+            await excludeFromGit(host.cwd, `.claude/skills/${name}/`);
+            pinMaterializedSkill(name);
+          }
           continue;
         } catch {
         }
@@ -1935,7 +1993,7 @@ export async function runHarnessDriver(
         if (compositionError) return { ok: false, error: compositionError };
       }
       try {
-        pinMaterializedSkill(name);
+        pinMaterializedSkill(name, composedSkillSources.get(name));
       } catch {
         if (bundledRoot === null) continue;
         return {
@@ -1961,7 +2019,8 @@ export async function runHarnessDriver(
         'scripts',
         'harness.mjs',
       );
-      const running = hashFile(runtimeScript);
+      const pinnedRuntime = join(trustedSkillsRoot, 'cez-harness', 'scripts', 'harness.mjs');
+      const running = hashFile(existsSync(pinnedRuntime) ? pinnedRuntime : runtimeScript);
       const shipped = hashFile(bundledRuntime);
       if (running && shipped && running !== shipped) {
         host.emit({
@@ -4127,6 +4186,9 @@ export async function runHarnessDriver(
                 })
               : null;
           const specAdvisorRun = await settleCouncilGroups(specRunnerWork, specAdvisorWork);
+          // A cancelled reviewer records no outcome: gating on the survivors would park a
+          // stopped run on a false "below quorum" decision (PR #925 review).
+          if (host.isCancelled()) return null;
           if (specAdvisorWork !== null) {
             const advisorRun = specAdvisorRun;
             if (advisorRun === null) return null;
@@ -4252,17 +4314,20 @@ export async function runHarnessDriver(
             (decision) => decision.kind === 'spec.accept' && decision.detail === 'pre-implement:1',
           )
         ) {
-          const findings = preImplementBlockers.map(
-            (finding) => `[${finding.severity}] ${finding.title}: ${finding.evidence}`,
+          const findings = decisionFindings(
+            preImplementBlockers.map(
+              (finding) => `[${finding.severity}] ${finding.title}: ${finding.evidence}`,
+            ),
+            preImplementResult.summary,
           );
           setOutcome({
             status: 'contested',
-            blockingReasons: findings.length > 0 ? findings : [preImplementResult.summary],
+            blockingReasons: findings,
             pendingDecision: {
               kind: 'spec',
               gate: 'pre-implement',
               round: 1,
-              findings: findings.length > 0 ? findings : [preImplementResult.summary],
+              findings,
             },
           });
           return 'pre-implementation audit found unresolved specification risks; explicit acceptance is required before implementation';
@@ -5013,6 +5078,8 @@ export async function runHarnessDriver(
               })
             : null;
         const settledAdvisorRun = await settleCouncilGroups(runnerReviewerWork, advisorWork);
+        // See the spec council: a stop is not a reviewer failure (PR #925 review).
+        if (host.isCancelled()) return null;
         if (advisorWork !== null) {
           const advisorRun = settledAdvisorRun;
           if (advisorRun === null) return null;

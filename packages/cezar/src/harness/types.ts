@@ -164,6 +164,10 @@ const harnessPendingMessageSchema = z
   })
   .passthrough();
 
+/** Bounds on a spec decision's findings; the writer truncates to them (`decisionFindings`). */
+export const HARNESS_DECISION_FINDING_MAX = 4_000;
+export const HARNESS_DECISION_FINDINGS_MAX = 50;
+
 const harnessOutcomeSchema = z
   .object({
     status: z.enum(['pending', 'ready', 'blocked', 'contested', 'no-action']).default('pending'),
@@ -195,7 +199,9 @@ const harnessOutcomeSchema = z
           kind: z.literal('spec'),
           gate: z.enum(['council', 'pre-implement']),
           round: z.number().int().min(1),
-          findings: z.array(z.string().min(1).max(4_000)).max(50),
+          findings: z
+            .array(z.string().min(1).max(HARNESS_DECISION_FINDING_MAX))
+            .max(HARNESS_DECISION_FINDINGS_MAX),
         }),
       ])
       .optional(),

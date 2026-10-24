@@ -155,7 +155,7 @@ import {
   type HarnessDriverHost,
   type HarnessRolesInput,
 } from '../harness/driver.ts';
-import { createLedger, readLedger, saveLedger } from '../harness/ledger.ts';
+import { createLedger, harnessFeedbackClosedReason, readLedger, saveLedger } from '../harness/ledger.ts';
 import { HARNESS_FIX_ISSUE, isHarnessWorkflow } from '../harness/workflows.ts';
 import {
   HARNESS_PROFILES,
@@ -4429,6 +4429,9 @@ export class RunManager {
         };
       }
       const continuationText = opts.text?.trim();
+      // A plain Continue still resumes an implemented high-assurance run; text cannot reach it.
+      const feedbackClosed = continuationText ? harnessFeedbackClosedReason(ledger) : null;
+      if (feedbackClosed) return { ok: false, error: feedbackClosed };
       let queuedBoundaryMessage:
         | { id: string; text: string; createdAt: string }
         | undefined;

@@ -199,7 +199,13 @@ import {
   harnessCouncilDecisionInputSchema,
 } from '@open-mercato/cezar-contract';
 import { toPastedContent, type PastedContent, type RunManager, type StartRunInput } from '../workflows/run.ts';
-import { councilDecisionDetail, createLedger, readLedger, saveLedger } from '../harness/ledger.ts';
+import {
+  councilDecisionDetail,
+  createLedger,
+  harnessFeedbackClosedReason,
+  readLedger,
+  saveLedger,
+} from '../harness/ledger.ts';
 import { loadAgenticConfig, resolveHarnessRuntimeInfo } from '../harness/runtime.ts';
 import {
   createModelProber,
@@ -5797,6 +5803,8 @@ export function createApp(deps: ServerDeps) {
             409,
           );
         }
+        const feedbackClosed = harnessFeedbackClosedReason(read.ledger);
+        if (feedbackClosed) return c.json({ error: feedbackClosed }, 409);
         const pending = read.ledger.pendingMessages.filter((message) => !message.consumedAt);
         if (pending.length >= MAX_QUEUED_MESSAGES) {
           return c.json(

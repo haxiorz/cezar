@@ -51,6 +51,26 @@ describe('harness ledger', () => {
     expect(loaded?.loops).toEqual({ fixRounds: 0, maxFixRounds: 3 });
   });
 
+  // PR #925 review: an over-long decision finding was written fine and then read back as corrupt.
+  it('refuses to write a ledger its reader would reject, leaving the previous one intact', () => {
+    const ledger = createLedger({
+      workflow: 'harness-implement-feature',
+      requestedProfile: 'standard',
+      skillProfile: 'generic',
+      subject: { kind: 'brief', text: 'x' },
+    });
+    saveLedger(dataDir, runId, ledger);
+    ledger.outcome = {
+      status: 'contested',
+      blockingReasons: ['x'],
+      pendingDecision: { kind: 'spec', gate: 'pre-implement', round: 1, findings: ['f'.repeat(4_001)] },
+    };
+    expect(() => saveLedger(dataDir, runId, ledger)).toThrow(/reader would reject/);
+    const read = readLedger(dataDir, runId);
+    expect(read.status).toBe('valid');
+    if (read.status === 'valid') expect(read.ledger.outcome.status).toBe('pending');
+  });
+
   it('returns null for a missing ledger', () => {
     expect(loadLedger(dataDir, 'nope')).toBeNull();
   });
