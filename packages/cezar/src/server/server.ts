@@ -5911,7 +5911,9 @@ export function createApp(deps: ServerDeps) {
       if (!store.getRun(id)) return c.json({ error: 'not found' }, 404);
       const finished = manager.finish(id);
       if (!finished) return c.json({ error: 'no open session' }, 409);
-      releaseHarnessIssueClaim(dataDir, id);
+      // Finishing a harness phase session leaves the driver conducting the run, and the driver
+      // releases its own claim (PR #925 review) — as archive/remove-worktree/delete check too.
+      if (!manager.isActive(id)) releaseHarnessIssueClaim(dataDir, id);
       return c.json({ finished: true });
     })
 

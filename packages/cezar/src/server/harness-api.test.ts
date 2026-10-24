@@ -717,6 +717,44 @@ describe('harness API', () => {
       );
     });
 
+    it('keeps the issue claim when Finish closes a phase session of a still-running harness run', async () => {
+      // PR #925 review: Finish answers true for an open phase session, but the driver keeps
+      // conducting the run afterwards — a freed claim lets a second run take the same issue.
+      execFileSync('git', ['init', '-b', 'main'], { cwd: repoRoot, stdio: 'ignore' });
+      const run = store.createRun({ title: 't', workflow: HARNESS_FIX_ISSUE, task: 'Fix issue #642', steps: [] });
+      store.updateRun(run.id, {
+        status: 'waiting',
+        harness: { profile: 'standard', workflow: HARNESS_FIX_ISSUE, issueId: '642' },
+      });
+      const held = acquireIssueClaim(repoRoot, run.id, '642');
+      if (!held.ok) throw new Error(held.error);
+      const ledger = createLedger({
+        workflow: HARNESS_FIX_ISSUE,
+        requestedProfile: 'standard',
+        subject: { kind: 'issue', id: '642', text: 'Fix issue #642' },
+      });
+      ledger.claim = held.claim;
+      saveLedger(dataDir, run.id, ledger);
+      let active = true;
+      const activeApp = createApp({
+        repoRoot,
+        store,
+        manager: { finish: () => true, isActive: () => active } as unknown as RunManager,
+        version: '0.0.0-test',
+        providerAuth: connectedProviderAuth(),
+      });
+
+      const finished = await apiRequest(activeApp, `/api/v1/runs/${run.id}/finish`, { method: 'POST' });
+
+      expect(finished.status).toBe(200);
+      expect(acquireIssueClaim(repoRoot, 'next-run', '642')).toMatchObject({ ok: false });
+
+      // Once the run is no longer active, Finish (accepting the review) frees it as before.
+      active = false;
+      expect((await apiRequest(activeApp, `/api/v1/runs/${run.id}/finish`, { method: 'POST' })).status).toBe(200);
+      expect(acquireIssueClaim(repoRoot, 'next-run', '642')).toMatchObject({ ok: true });
+    });
+
     it('releases an issue claim when an inactive harness run is archived', async () => {
       execFileSync('git', ['init', '-b', 'main'], { cwd: repoRoot, stdio: 'ignore' });
       const run = store.createRun({
