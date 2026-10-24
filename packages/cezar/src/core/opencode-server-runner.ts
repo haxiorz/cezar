@@ -17,6 +17,7 @@ import { disclaimedCommand } from './disclaim-spawn.ts';
 import {
   AGENT_PROCESS_DETACHED,
   terminateAgentProcessTree,
+  trackAgentProcessTree,
 } from './process-tree.ts';
 import { AUTO_END_DELAY_MS, DEFAULT_RUN_TIMEOUT_MS } from './claude-cli-runner.ts';
 import { parseModelIdentity } from './model-identity.ts';
@@ -373,6 +374,7 @@ class OpencodeSession implements AgentSession {
       }
       const [file, argv] = disclaimedCommand(this.bin, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], env);
       child = nodeSpawn(file, argv, { cwd: this.spec.cwd, env, detached: AGENT_PROCESS_DETACHED });
+      trackAgentProcessTree(child);
     } catch (err) {
       throw wrapSpawnError(err, this.bin);
     }

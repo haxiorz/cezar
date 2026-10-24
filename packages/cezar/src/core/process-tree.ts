@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { ChildProcess, spawn } from 'node:child_process';
 
 /** Agent backends are process-tree owners: every Unix runner is a process
  * group leader and Windows termination uses taskkill /t. */
@@ -10,9 +10,19 @@ export function signalAgentProcessTree(
 ): void {
   if (!child.pid) return;
   if (process.platform === 'win32') {
-    const args = ['/pid', String(child.pid), '/t'];
-    if (signal === 'SIGKILL') args.push('/f');
-    const killer = spawn('taskkill', args, { stdio: 'ignore', windowsHide: true });
+    // Always `/f` (PR #925 review): windowless console CLIs refuse a plain taskkill, so the
+    // "graceful" step only waited out the grace window. main's `child.kill` was immediate too.
+    const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    // An unhandled spawn 'error' (ENOENT) is an uncaught exception that takes the server down.
+    killer.once('error', () => {
+      try {
+        child.kill(signal);
+      } catch {
+      }
+    });
     killer.unref();
     return;
   }
@@ -77,4 +87,44 @@ export function terminateAgentProcessTree(
   });
   timer.unref?.();
   return timer;
+}
+
+const liveTrees = new Set<ChildProcess>();
+let exitHooksInstalled = false;
+
+/**
+ * Register a detached agent so cezar's own exit takes its process group down.
+ * A detached agent leaves the terminal's process group, so Ctrl-C or a closed
+ * terminal no longer reaches it, and the next boot would `recover()` the run
+ * while the orphan kept writing the worktree (PR #925 review). Only a real
+ * `ChildProcess` is tracked: a test double's made-up pid must never be signalled.
+ */
+export function trackAgentProcessTree(child: ChildProcess): void {
+  if (!AGENT_PROCESS_DETACHED || !(child instanceof ChildProcess) || child.pid === undefined) return;
+  liveTrees.add(child);
+  child.once('exit', () => liveTrees.delete(child));
+  installExitHooks();
+}
+
+/** SIGTERM every tracked agent group still running. Synchronous: it runs from `exit`. */
+export function terminateLiveAgentProcessTrees(): void {
+  for (const child of liveTrees) signalAgentProcessTree(child, 'SIGTERM');
+  liveTrees.clear();
+}
+
+function installExitHooks(): void {
+  if (exitHooksInstalled) return;
+  exitHooksInstalled = true;
+  // After `serve`/`run` flushed their state, so the next boot still resumes the run.
+  process.once('exit', terminateLiveAgentProcessTrees);
+  for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM'] as const) {
+    const onSignal = (): void => {
+      // A command with its own handler owns shutdown; its `process.exit` reaches the hook above.
+      if (process.listenerCount(signal) > 1) return;
+      terminateLiveAgentProcessTrees();
+      process.removeListener(signal, onSignal);
+      process.kill(process.pid, signal);
+    };
+    process.on(signal, onSignal);
+  }
 }

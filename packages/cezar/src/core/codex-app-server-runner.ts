@@ -143,7 +143,6 @@ class CodexSession implements AgentSession {
   private ready!: Promise<void>;
   private autoEndTimer: NodeJS.Timeout | undefined;
   private eofTermTimer: NodeJS.Timeout | undefined;
-  private eofKillTimer: NodeJS.Timeout | undefined;
   private spawnFailed: Error | null = null;
   private timedOut = false;
   /** Set the moment WE signal the child (EOF watchdog, cancel, kill switch).
@@ -252,8 +251,8 @@ class CodexSession implements AgentSession {
       }
 
       const exitCode = await waitForCodexAppServerExit(this.child);
+      // Only the pre-signal timer: the group escalation must outlive the leader (PR #925 review).
       if (this.eofTermTimer) clearTimeout(this.eofTermTimer);
-        if (this.eofKillTimer) clearTimeout(this.eofKillTimer);
       this.rpc.rejectPending();
 
       if (this.spawnFailed) throw this.spawnFailed;
@@ -383,9 +382,8 @@ class CodexSession implements AgentSession {
     try {
       endCodexAppServer(
         this.child,
-        (term, kill) => {
+        (term) => {
           this.eofTermTimer = term;
-          this.eofKillTimer = kill;
         },
         () => {
           this.terminatedByCezar = true;

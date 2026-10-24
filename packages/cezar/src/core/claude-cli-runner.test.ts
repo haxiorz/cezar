@@ -40,6 +40,8 @@ vi.mock('node:child_process', async (importOriginal) => {
 const treeHook = vi.hoisted(() => ({
   recording: false,
   calls: [] as Array<[unknown, number]>,
+  /** Children whose group escalation timer actually fired. */
+  escalations: [] as unknown[],
 }));
 
 vi.mock('./process-tree.ts', async (importOriginal) => {
@@ -49,7 +51,7 @@ vi.mock('./process-tree.ts', async (importOriginal) => {
     terminateAgentProcessTree: (child: never, graceMs: number) => {
       if (!treeHook.recording) return actual.terminateAgentProcessTree(child, graceMs);
       treeHook.calls.push([child, graceMs]);
-      return setTimeout(() => {}, 0);
+      return setTimeout(() => treeHook.escalations.push(child), graceMs);
     },
   };
 });
@@ -267,6 +269,39 @@ describe('teardown for a CLI that survives SIGTERM', () => {
       expect(fake.child.exitCode).toBeNull();
       expect(treeHook.calls).toEqual([[fake.child, EOF_KILL_GRACE_MS]]);
     });
+  });
+
+  it('keeps the group escalation armed after the leader exits on the EOF path (PR #925 review)', async () => {
+    const fake = signallableChild();
+    spawnHook.override = () => fake.child;
+    treeHook.calls.length = 0;
+    treeHook.escalations.length = 0;
+    treeHook.recording = true;
+    vi.useFakeTimers();
+    try {
+      const session = new ClaudeCliRunner({ bin: 'claude', timeoutMs: 0 }).startSession({
+        userPrompt: 'do it',
+        cwd: process.cwd(),
+      });
+      session.end();
+      await vi.advanceTimersByTimeAsync(EOF_TERM_GRACE_MS);
+      expect(treeHook.calls).toEqual([[fake.child, EOF_KILL_GRACE_MS]]);
+
+      // The leader honours SIGTERM; a SIGTERM-ignoring MCP child in its group would not, and
+      // only the escalation still reaches it.
+      (fake.child.stdout as unknown as PassThrough).end();
+      (fake.child.stderr as unknown as PassThrough).end();
+      fake.exit(143);
+      fake.child.emit('close', 143, null);
+      await session.result;
+
+      await vi.advanceTimersByTimeAsync(EOF_KILL_GRACE_MS);
+      expect(treeHook.escalations).toEqual([fake.child]);
+    } finally {
+      vi.useRealTimers();
+      treeHook.recording = false;
+      spawnHook.override = null;
+    }
   });
 
   it('tears the tree down on the wall-clock timeout path as well', () => {

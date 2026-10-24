@@ -29,6 +29,7 @@ import { claudeMcpAllowRules, toClaudeMcpConfig, type PrivateMcpServer } from '.
 import {
   AGENT_PROCESS_DETACHED,
   terminateAgentProcessTree,
+  trackAgentProcessTree,
 } from './process-tree.ts';
 import {
   claudeTurnStarted,
@@ -143,6 +144,7 @@ export class ClaudeCliRunner implements AgentRunner {
       const env = buildChildEnv({ backend: this.backend, extraEnv: { ...spec.env, ...effortEnv } });
       const [file, argv] = disclaimedCommand(this.bin, args, env);
       child = nodeSpawn(file, argv, { cwd: spec.cwd, env, detached: AGENT_PROCESS_DETACHED });
+      trackAgentProcessTree(child);
     } catch (err) {
       mcpConfig?.cleanup();
       throw wrapSpawnError(err, this.bin);
@@ -154,7 +156,6 @@ export class ClaudeCliRunner implements AgentRunner {
     let stdinOpen = true;
     let autoEndTimer: NodeJS.Timeout | undefined;
     let eofTermTimer: NodeJS.Timeout | undefined;
-    let eofKillTimer: NodeJS.Timeout | undefined;
     let eofKilled = false;
     let hardKillTimer: NodeJS.Timeout | undefined;
 
@@ -237,7 +238,7 @@ export class ClaudeCliRunner implements AgentRunner {
       eofTermTimer = setTimeout(() => {
         if (!hasExited()) {
           eofKilled = true;
-          eofKillTimer = terminateChild(EOF_KILL_GRACE_MS);
+          terminateChild(EOF_KILL_GRACE_MS);
         }
       }, EOF_TERM_GRACE_MS);
       eofTermTimer.unref?.();
@@ -345,8 +346,9 @@ export class ClaudeCliRunner implements AgentRunner {
       }
 
       const exitCode = await waitForExit(child);
+      // The group escalation armed by the EOF watchdog stays armed (PR #925 review): it outlives
+      // the leader on purpose, and clears itself once the group is empty.
       if (eofTermTimer) clearTimeout(eofTermTimer);
-      if (eofKillTimer) clearTimeout(eofKillTimer);
 
       if (spawnFailed) throw spawnFailed;
 

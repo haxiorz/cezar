@@ -6,6 +6,7 @@ import { EOF_KILL_GRACE_MS, EOF_TERM_GRACE_MS, KILL_GRACE_MS } from './claude-cl
 import {
   AGENT_PROCESS_DETACHED,
   terminateAgentProcessTree,
+  trackAgentProcessTree,
 } from './process-tree.ts';
 
 export interface CodexAppServerMessage {
@@ -41,7 +42,9 @@ export function spawnCodexAppServer(
   try {
     const env = buildCodexAppServerEnv(extraEnv);
     const [file, argv] = disclaimedCommand(bin, ['app-server', ...configArgs], env);
-    return nodeSpawn(file, argv, { cwd, env, detached: AGENT_PROCESS_DETACHED });
+    const child = nodeSpawn(file, argv, { cwd, env, detached: AGENT_PROCESS_DETACHED });
+    trackAgentProcessTree(child);
+    return child;
   } catch (error) {
     throw codexSpawnError(error, bin);
   }

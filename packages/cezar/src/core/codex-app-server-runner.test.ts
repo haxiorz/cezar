@@ -7,7 +7,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import type { AgentEvent } from './agent-runner.js';
-import { KILL_GRACE_MS } from './claude-cli-runner.js';
+import { EOF_KILL_GRACE_MS, EOF_TERM_GRACE_MS, KILL_GRACE_MS } from './claude-cli-runner.js';
 import { CodexAppServerRunner, userInputAnswers } from './codex-app-server-runner.js';
 import { RunStore } from '../runs/store.ts';
 
@@ -32,6 +32,8 @@ vi.mock('node:child_process', async (importOriginal) => {
 const treeHook = vi.hoisted(() => ({
   recording: false,
   calls: [] as Array<[unknown, number]>,
+  /** Children whose group escalation timer actually fired. */
+  escalations: [] as unknown[],
 }));
 
 vi.mock('./process-tree.ts', async (importOriginal) => {
@@ -41,7 +43,7 @@ vi.mock('./process-tree.ts', async (importOriginal) => {
     terminateAgentProcessTree: (child: never, graceMs: number) => {
       if (!treeHook.recording) return actual.terminateAgentProcessTree(child, graceMs);
       treeHook.calls.push([child, graceMs]);
-      return setTimeout(() => {}, 0);
+      return setTimeout(() => treeHook.escalations.push(child), graceMs);
     },
   };
 });
@@ -506,6 +508,42 @@ describe('teardown for an app-server that survives SIGTERM', () => {
       expect(treeHook.calls).toEqual([]);
       expect(fake.signals).toEqual([]);
     });
+  });
+
+  it('keeps the group escalation armed after the leader exits on the EOF path (PR #925 review)', async () => {
+    const fake = signallableChild();
+    spawnHook.override = () => fake.child;
+    treeHook.calls.length = 0;
+    treeHook.escalations.length = 0;
+    treeHook.recording = true;
+    vi.useFakeTimers();
+    try {
+      const session = new CodexAppServerRunner({ bin: 'codex', timeoutMs: 0 }).startSession({
+        userPrompt: 'do it',
+        cwd: process.cwd(),
+      });
+      const settled = session.result.catch(() => undefined);
+      session.end();
+      await vi.advanceTimersByTimeAsync(EOF_TERM_GRACE_MS);
+      expect(treeHook.calls).toEqual([[fake.child, EOF_KILL_GRACE_MS]]);
+
+      // The leader exits on SIGTERM (answering the pending handshake with an error on the way
+      // out); a SIGTERM-ignoring child in its group would not, and only the escalation reaches it.
+      const stdout = fake.child.stdout as unknown as PassThrough;
+      stdout.write(`${JSON.stringify({ id: 1, error: { code: -1, message: 'shutting down' } })}\n`);
+      stdout.end();
+      (fake.child.stderr as unknown as PassThrough).end();
+      fake.exit(143);
+      fake.child.emit('close', 143, null);
+      await settled;
+
+      await vi.advanceTimersByTimeAsync(EOF_KILL_GRACE_MS);
+      expect(treeHook.escalations).toEqual([fake.child]);
+    } finally {
+      vi.useRealTimers();
+      treeHook.recording = false;
+      spawnHook.override = null;
+    }
   });
 
   it('hard-stops a SIGTERM-ignoring app-server within the bounded grace', () => {
