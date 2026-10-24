@@ -5342,7 +5342,8 @@ export async function runHarnessDriver(
     });
     return null;
   } finally {
-    if (ledger.stage.status !== 'staged') releaseHeldIssueClaim();
+    // A run parked on a decision resumes under the same lease (PR #925 review).
+    if (ledger.stage.status !== 'staged' && !ledger.outcome.pendingDecision) releaseHeldIssueClaim();
     offInterrupt();
   }
 }

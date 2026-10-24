@@ -2731,6 +2731,40 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(notes.some((n) => n.includes('paused for your decision'))).toBe(true);
   });
 
+  // PR #925 review (D9): releasing on a decision park let another run claim the issue.
+  it('keeps the issue claim while the run is parked on a council decision', async () => {
+    const h = makeHarness(dir);
+    advisorsAlwaysFail(h);
+    const released: string[] = [];
+    h.deps.releaseClaim = (path) => {
+      released.push(path);
+      return { ok: true };
+    };
+
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toMatch(/did not reach quorum/);
+
+    expect(released).toEqual([]);
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.claim).toMatchObject({ held: true, issueId: '642' });
+  });
+
+  it('still releases the issue claim when a run fails without a decision to make', async () => {
+    const h = makeHarness(dir);
+    const released: string[] = [];
+    h.deps.releaseClaim = (path) => {
+      released.push(path);
+      return { ok: true };
+    };
+    h.agentBehavior.set('implement', (req) => {
+      writeFileSync(req.resultPath, '{"not":"the contract"}', 'utf8');
+      return null;
+    });
+
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toMatch(/produced no valid result/);
+
+    expect(released).toHaveLength(1);
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.claim?.held).toBe(false);
+  });
+
   it('a recorded proceed decision continues with the survivors, loudly', async () => {
     const h = makeHarness(dir);
     const councilCalls = advisorsAlwaysFail(h);
