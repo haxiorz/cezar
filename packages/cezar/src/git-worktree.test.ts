@@ -14,6 +14,7 @@ import {
   resolveBaseRef,
   staleBaseNote,
   uniqueBranchName,
+  worktreeChangedFiles,
   worktreeChangedPaths,
   worktreeDiff,
   worktreeDiffStat,
@@ -645,6 +646,96 @@ describe('worktreeShortstat (real git)', () => {
       });
     });
   });
+});
+
+/**
+ * PR #925 review: the scratch index the diff readers build was seeded with `read-tree HEAD`,
+ * which carries no stat data, so every call re-hashed every tracked file. Seeding from a copy of
+ * the real index restores the stat cache; these pin that the answer did not change with it.
+ */
+describe('diff readers seed their scratch index from the real one', () => {
+  const pastTime = new Date(Date.now() - 60_000);
+
+  /** Every kind of worktree state a task leaves: staged, unstaged, staged-new, removed from the
+   *  index, deleted on disk, untracked, renamed. Committed files are backdated so the index
+   *  written after them holds trustworthy (not racily clean) stat data. */
+  async function busyRepo(prefix: string): Promise<string> {
+    const r = mkdtempSync(join(tmpdir(), prefix));
+    worktreeRoots.push(r);
+    await run('git', ['init', '-q', '-b', 'main'], { cwd: r });
+    await run('git', ['config', 'core.trustctime', 'false'], { cwd: r });
+    for (const name of ['a', 'b', 'c', 'd', 'e', 'g', 'locked']) {
+      writeFileSync(join(r, `${name}.txt`), `${name}\n`);
+      utimesSync(join(r, `${name}.txt`), pastTime, pastTime);
+    }
+    await run('git', ['add', '-A'], { cwd: r });
+    await run('git', [...GIT_ID, 'commit', '-q', '-m', 'base'], { cwd: r });
+    writeFileSync(join(r, 'a.txt'), 'a\nstaged\n');
+    await run('git', ['add', 'a.txt'], { cwd: r });
+    writeFileSync(join(r, 'a.txt'), 'a\nstaged\nunstaged\n');
+    writeFileSync(join(r, 'n.txt'), 'staged new\n');
+    await run('git', ['add', 'n.txt'], { cwd: r });
+    await run('git', ['rm', '-q', 'c.txt'], { cwd: r });
+    rmSync(join(r, 'd.txt'));
+    await run('git', ['rm', '-q', '--cached', 'e.txt'], { cwd: r });
+    writeFileSync(join(r, 'g.txt'), 'g\nunstaged\n');
+    writeFileSync(join(r, 'u.txt'), 'untracked\n');
+    mkdirSync(join(r, 'sub'));
+    writeFileSync(join(r, 'sub', 'x.txt'), 'nested untracked\n');
+    await run('git', ['mv', 'b.txt', 'b2.txt'], { cwd: r });
+    return r;
+  }
+
+  /** The output the previous HEAD-seeded scratch index produced. */
+  async function headSeeded(r: string, args: string[]): Promise<string> {
+    const index = join(tmpdir(), `cez-test-head-seeded-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    const env = { ...process.env, GIT_INDEX_FILE: index };
+    try {
+      await run('git', ['read-tree', 'HEAD'], { cwd: r, env });
+      await run('git', ['add', '-N', '.'], { cwd: r, env });
+      return (await run('git', args, { cwd: r, env })).stdout;
+    } finally {
+      rmSync(index, { force: true });
+    }
+  }
+
+  it('reports exactly what a HEAD-seeded scratch index reported', async () => {
+    const r = await busyRepo('cez-scratch-equal-');
+    const base = (await run('git', ['merge-base', 'main', 'HEAD'], { cwd: r })).stdout.trim();
+    const indexBefore = readFileSync(join(r, '.git', 'index'));
+
+    expect(await worktreeDiff(r, 'main')).toBe(await headSeeded(r, ['diff', base]));
+    expect(await worktreeDiffStat(r, 'main')).toBe((await headSeeded(r, ['diff', '--stat', base])).trim());
+    expect(await worktreeShortstat(r, 'main')).toEqual(
+      parseShortstat(await headSeeded(r, ['diff', '--shortstat', base])),
+    );
+    expect(await worktreeChangedFiles(r, 'main')).toEqual(
+      (await headSeeded(r, ['diff', '--name-only', base])).split('\n').filter(Boolean),
+    );
+    expect(await worktreeChangedFiles(r, 'main')).toEqual(
+      expect.arrayContaining(['a.txt', 'b2.txt', 'c.txt', 'd.txt', 'g.txt', 'n.txt', 'sub/x.txt', 'u.txt']),
+    );
+    expect(readFileSync(join(r, '.git', 'index'))).toEqual(indexBefore);
+  });
+
+  // Root reads any file regardless of its mode, so the probe below proves nothing there.
+  it.runIf(process.platform !== 'win32' && process.getuid?.() !== 0)(
+    'trusts the real index stat cache instead of re-reading every tracked file',
+    async () => {
+      const r = await busyRepo('cez-scratch-stat-');
+      // Unchanged and stat-clean in the real index, but unreadable: only a reader that re-hashes
+      // tracked files ever opens it.
+      chmodSync(join(r, 'locked.txt'), 0o000);
+      try {
+        expect(await worktreeDiff(r, 'main')).not.toMatch(/^\(diff failed/);
+        expect(await worktreeDiffStat(r, 'main')).toContain('g.txt');
+        expect(await worktreeShortstat(r, 'main')).not.toBeNull();
+        expect(await worktreeChangedFiles(r, 'main')).toContain('g.txt');
+      } finally {
+        chmodSync(join(r, 'locked.txt'), 0o644);
+      }
+    },
+  );
 });
 
 describe('remoteDefaultBranch + staleBaseNote (run 9788d87f: a stale configured base hid tracked files)', () => {

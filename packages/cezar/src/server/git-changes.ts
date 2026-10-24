@@ -7,7 +7,7 @@ import { CEZAR_DATA_EXCLUDE } from '../data-gitignore.ts';
 import { resolveTaskDiffBase, type RepointedHead } from '../git-diff-base.ts';
 import { isSafeGitRef } from '../git-refs.ts';
 import { resolveTaskRemotes, splitRemoteRef } from '../git-remotes.ts';
-import { branchesCheckedOutElsewhere, gitHasIdentity, unresolvedConflicts } from '../git-worktree.ts';
+import { branchesCheckedOutElsewhere, gitHasIdentity, seedScratchIndex, unresolvedConflicts } from '../git-worktree.ts';
 
 /**
  * Session git plumbing for the cockpit's Changes & Files tabs (redesign spec
@@ -291,15 +291,15 @@ export async function collectChanges(
   // index. That was long treated as "fine in a task worktree cezar owns" — until run 5f6fe8ae,
   // where this exact write raced the harness's subject-integrity checks and voided a whole
   // review council. Read paths must not write ANY index, worktree or not: the scratch-index
-  // path (GIT_INDEX_FILE seeded from HEAD + intent-to-add) is the default now, and
-  // `intentToAdd: true` remains only as an explicit legacy opt-in.
+  // path (GIT_INDEX_FILE seeded from a copy of the real index + intent-to-add) is the default
+  // now, and `intentToAdd: true` remains only as an explicit legacy opt-in.
   let env: Record<string, string> | undefined;
   let scratchIndex: string | undefined;
   try {
     if (opts.intentToAdd !== true) {
       scratchIndex = join(tmpdir(), `cez-scratch-index-${process.pid}-${scratchSeq++}`);
       env = { GIT_INDEX_FILE: scratchIndex };
-      await git(dir, ['read-tree', 'HEAD'], env); // seed with tracked files; harmless if no HEAD
+      await seedScratchIndex(dir, scratchIndex); // tracked files + stat cache; harmless if no HEAD
       await git(dir, ['add', '-N', '.'], env);
     } else {
       await git(dir, ['add', '-N', '.']);

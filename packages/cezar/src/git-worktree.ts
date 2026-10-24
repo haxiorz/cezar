@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { existsSync, realpathSync, type Dirent } from 'node:fs';
-import { readdir, readFile, rm, stat } from 'node:fs/promises';
+import { copyFile, readdir, readFile, rm, stat, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { resolveTaskDiffBase } from './git-diff-base.ts';
@@ -83,7 +83,31 @@ async function fetchBase(repoRoot: string, remote: string, base: string): Promis
 let scratchSeq = 0;
 
 /**
- * A throwaway index seeded from HEAD with every untracked file intent-to-added,
+ * Seed a scratch index at `target` from a COPY of `dir`'s real index. The copy keeps the stat
+ * cache, so a diff need not re-hash every tracked file the way a `read-tree HEAD` seed made it
+ * (PR #925 review: ~14 ms became ~730 ms per call on a 2.5k-file repo, at every turn end and
+ * Changes read). `read-tree HEAD` remains the fallback when there is no index to copy.
+ */
+export async function seedScratchIndex(dir: string, target: string): Promise<boolean> {
+  const where = await git(dir, ['rev-parse', '--git-path', 'index']);
+  if (where.ok && where.stdout.trim()) {
+    const source = resolve(dir, where.stdout.trim());
+    try {
+      const { atime, mtime } = await stat(source);
+      await copyFile(source, target);
+      // Racy-git judges entries against the index file's own mtime; keep the real one.
+      await utimes(target, atime, mtime);
+      return true;
+    } catch {
+      // No index yet (a fresh repo): seed from HEAD below.
+    }
+  }
+  const seeded = await git(dir, ['read-tree', 'HEAD'], { env: { ...process.env, GIT_INDEX_FILE: target } });
+  return seeded.ok;
+}
+
+/**
+ * A throwaway index seeded from the real one with every untracked file intent-to-added,
  * so diffs show the whole worktree WITHOUT touching the real index.
  *
  * The bare `git add -N .` these helpers used to run is a WRITE, and it raced
@@ -109,14 +133,13 @@ async function scratchIndex(worktreePath: string): Promise<ScratchIndex | null> 
   const env = { ...process.env, GIT_INDEX_FILE: path };
   let ready = false;
   try {
-    const seed = await git(worktreePath, ['read-tree', 'HEAD'], { env });
-    if (!seed.ok) return null;
+    if (!(await seedScratchIndex(worktreePath, path))) return null;
     const ita = await git(worktreePath, ['add', '-N', '.'], { env });
     if (!ita.ok) return null;
     ready = true;
     return { env, path };
   } finally {
-    // `read-tree` can create the file before failing. A failed setup has no
+    // Seeding can create the file before failing. A failed setup has no
     // caller-owned handle, so dispose it here; successful handles are removed
     // after the last diff that uses them.
     if (!ready) await rm(path, { force: true }).catch(() => {});
