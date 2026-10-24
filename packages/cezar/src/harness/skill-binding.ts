@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, readdirSync, readFileSync, readlinkSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { parseFrontmatter } from '../skills.js';
+import { readHarnessFsEntry } from './fs-read.js';
 
 export interface TrustedHarnessSkillBinding {
   name: string;
@@ -13,22 +14,22 @@ function hashSkillTree(root: string): string {
   const hash = createHash('sha256');
   const visit = (relative: string): void => {
     const path = relative ? join(root, relative) : root;
-    const stat = lstatSync(path);
+    const entry = readHarnessFsEntry(path);
     hash.update(`\0${relative}\0`);
-    if (stat.isSymbolicLink()) {
+    if (entry.kind === 'symlink') {
       hash.update('symlink\0');
-      hash.update(readlinkSync(path));
+      hash.update(entry.target);
       return;
     }
-    if (stat.isDirectory()) {
+    if (entry.kind === 'other' && entry.stat.isDirectory()) {
       hash.update('directory\0');
-      for (const entry of readdirSync(path).sort()) {
-        visit(relative ? join(relative, entry) : entry);
+      for (const child of readdirSync(path).sort()) {
+        visit(relative ? join(relative, child) : child);
       }
       return;
     }
     hash.update('file\0');
-    hash.update(readFileSync(path));
+    if (entry.kind === 'file') hash.update(entry.content!);
   };
   visit('');
   return hash.digest('hex');

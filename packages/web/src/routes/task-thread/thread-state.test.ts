@@ -633,6 +633,21 @@ describe('reduceThread — provider authorization recovery', () => {
     }])
   })
 
+  it('keeps step-divider ids unique when a retry loop re-enters an earlier step', () => {
+    const { turns } = reduceThread([
+      line(1, 'note', { message: 'setting up', stepId: 'setup' }),
+      line(2, 'note', { message: 'testing', stepId: 'test' }),
+      line(3, 'note', { message: 'setting up again', stepId: 'setup' }),
+    ])
+    const ids = turns.flatMap((turn) => turn.items.map((item) => item.id))
+    expect(ids.filter((id) => id.startsWith('step-start:'))).toEqual([
+      'step-start:setup',
+      'step-start:test',
+      'step-start:setup#2',
+    ])
+    expect(new Set(ids).size).toBe(ids.length)
+  })
+
   it.each([
     ['an unknown provider', { provider: 'future', authFailureId: 'incident-1' }],
     ['a blank incident id', { provider: 'claude', authFailureId: '' }],

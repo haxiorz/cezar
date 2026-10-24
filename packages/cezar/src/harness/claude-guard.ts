@@ -56,7 +56,10 @@ const gitWrite =
   /(?:^|[^A-Za-z0-9_.-])git(?:\\.exe)?(?=$|[^A-Za-z0-9_.-])[^;&|()\\n]{0,1000}\\b(?:commit|push)\\b/i.test(command)
 const ghWrite =
   /(?:^|[^A-Za-z0-9_.-])gh(?:\\.exe)?(?=$|[^A-Za-z0-9_.-])[^;&|()\\n]{0,1000}\\b(?:issue\\s+(?:close|comment|create|delete|develop|edit|lock|pin|reopen|transfer|unlock|unpin)|pr\\s+(?:checkout|close|comment|create|edit|lock|merge|ready|reopen|review|unlock))\\b/i.test(command)
-if (command && (gitWrite || ghWrite)) {
+// \`gh api\` writes whenever it sends a body or a non-GET method (PR #925 review).
+const ghApiWrite =
+  /(?:^|[^A-Za-z0-9_.-])gh(?:\\.exe)?(?=$|[^A-Za-z0-9_.-])[^;&|()\\n]{0,1000}\\bapi\\b[^;&|()\\n]{0,1000}(?:(?:-X|--method)[\\s=]*['"]?(?:POST|PUT|PATCH|DELETE)\\b|\\bmutation\\b|(?:^|\\s)(?:-[fF]|--field|--raw-field|--input)(?=[\\s=]|$))/i.test(command)
+if (command && (gitWrite || ghWrite || ghApiWrite)) {
   refuse('stage-only boundary: git ref and GitHub tracker writes are disabled')
 }
 if (filePath) {

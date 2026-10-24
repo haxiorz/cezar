@@ -170,14 +170,14 @@ class CodexSession implements AgentSession {
     try {
       // Stage-only harness phases run under the workspace-write sandbox, whose
       // write boundary is the worktree — but the phase-result contract lives in
-      // the run's agent-output dir OUTSIDE it. Grant exactly the declared extra
-      // directories as writable roots, mirroring what claude's `--add-dir`
-      // already does; without this a codex implementer finishes the work and
-      // then EPERMs on the one file the driver requires (eval run d6ebd27c).
-      const writableRoots =
-        spec.env?.CEZ_HARNESS_STAGE_ONLY === '1' && spec.additionalDirectories?.length
-          ? ['-c', `sandbox_workspace_write.writable_roots=${JSON.stringify(spec.additionalDirectories)}`]
-          : [];
+      // the run's agent-output dir OUTSIDE it (eval run d6ebd27c). Grant that
+      // one directory, as claude's guard does: never the `additionalDirectories`
+      // runs tree, which holds the guard script and the run ledger (PR #925).
+      const stageOnlyOutput =
+        spec.env?.CEZ_HARNESS_STAGE_ONLY === '1' ? spec.env.CEZ_HARNESS_OUTPUT_DIR : undefined;
+      const writableRoots = stageOnlyOutput
+        ? ['-c', `sandbox_workspace_write.writable_roots=${JSON.stringify([stageOnlyOutput])}`]
+        : [];
       this.child = spawnCodexAppServer(bin, spec.cwd, spec.env, writableRoots);
       this.rpc = new CodexAppServerRpc(this.child);
     } catch (err) {

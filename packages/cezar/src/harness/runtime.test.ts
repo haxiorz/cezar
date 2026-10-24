@@ -10,7 +10,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   HarnessRuntime,
   computeGateRegressions,
@@ -223,6 +223,21 @@ describe('harness runtime bridge', () => {
     expect(checks[0]).toMatchObject({ command: 'echo ok', status: 'passed', exitCode: 0 });
     expect(checks[1]).toMatchObject({ command: 'exit 2', status: 'failed', exitCode: 2 });
     expect(checks[2]).toMatchObject({ command: 'echo never', status: 'skipped', exitCode: null });
+  });
+
+  // PR #925 security review: `npm test` runs model-written scripts unsandboxed.
+  it('runValidationCommands never hands provider credentials to the validated code', async () => {
+    vi.stubEnv('ANTHROPIC_API_KEY', 'sk-ant-test');
+    vi.stubEnv('OPENAI_API_KEY', 'sk-openai-test');
+    try {
+      const [check] = await runValidationCommands(
+        ['test -z "$ANTHROPIC_API_KEY" && test -z "$OPENAI_API_KEY" && test -n "$PATH"'],
+        dir,
+      );
+      expect(check).toMatchObject({ status: 'passed', exitCode: 0 });
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it.skipIf(process.platform === 'win32')(

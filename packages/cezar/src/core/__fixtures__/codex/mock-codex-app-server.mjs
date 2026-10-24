@@ -125,14 +125,12 @@ rl.on('line', (line) => {
       emit({ id: msg.id, error: { code: -32602, message: 'workspace-write override is obsolete in full-access mode' } });
       return;
     }
-    // Opt-in assertion for the stage-only writable-roots grant: the phase-result
-    // dir must arrive as spawn-time sandbox config or the thread must not start.
+    // Opt-in assertion for the stage-only writable-roots grant: exactly the
+    // phase-result dir must arrive as spawn-time sandbox config, or the thread must not start.
     const requiredRoot = process.env.MOCK_CODEX_REQUIRE_WRITABLE_ROOTS;
     if (
       requiredRoot &&
-      !process.argv.some(
-        (arg) => arg.startsWith('sandbox_workspace_write.writable_roots=') && arg.includes(requiredRoot),
-      )
+      !process.argv.includes(`sandbox_workspace_write.writable_roots=${JSON.stringify([requiredRoot])}`)
     ) {
       emit({ id: msg.id, error: { code: -32602, message: `expected writable_roots config carrying ${requiredRoot}` } });
       return;

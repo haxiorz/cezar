@@ -101,11 +101,11 @@ describe('a teardown cezar initiated (codex app-server)', () => {
     await expect(session.result).resolves.toMatchObject({ sessionId: 'th_mock_1' });
   }, 15_000);
 
-  it('grants additional directories as writable roots under the stage-only sandbox', async () => {
+  it('grants only the phase-output directory as a writable root under the stage-only sandbox', async () => {
     // The phase-result contract writes OUTSIDE the worktree (the run's
-    // agent-output dir). Claude gets it via --add-dir; codex must get it as
-    // sandbox_workspace_write.writable_roots or the implementer finishes the
-    // work and then EPERMs on the one file the driver requires (run d6ebd27c).
+    // agent-output dir); codex must get it as sandbox_workspace_write.writable_roots
+    // or the implementer EPERMs on the one file the driver requires (run d6ebd27c).
+    // The wider runs tree must NOT be writable: it holds the guard and the ledger (PR #925).
     const runner = new CodexAppServerRunner({ bin: mockBin, timeoutMs: 0 });
     const session = runner.startSession(
       {
@@ -113,9 +113,10 @@ describe('a teardown cezar initiated (codex app-server)', () => {
         cwd: process.cwd(),
         env: {
           CEZ_HARNESS_STAGE_ONLY: '1',
+          CEZ_HARNESS_OUTPUT_DIR: '/data/runs/x-harness/agent-output',
           MOCK_CODEX_REQUIRE_WRITABLE_ROOTS: '/data/runs/x-harness/agent-output',
         },
-        additionalDirectories: ['/data/runs/x-harness/agent-output'],
+        additionalDirectories: ['/data/runs', '/tmp/attachments'],
       },
       undefined,
       { autoEndAfterFirstTurn: true },

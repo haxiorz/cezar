@@ -4,12 +4,12 @@ import {
   closeSync,
   mkdirSync,
   openSync,
-  readFileSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { z } from 'zod';
+import { readHarnessFsEntry } from './fs-read.js';
 
 const issueClaimSchema = z.object({
   version: z.literal(1),
@@ -73,7 +73,10 @@ export function acquireIssueClaim(
     }
   } catch (error) {
     try {
-      const existing = issueClaimSchema.safeParse(JSON.parse(readFileSync(path, 'utf8')));
+      // No-follow and bounded: the claims directory sits in the repo's shared git dir.
+      const entry = readHarnessFsEntry(path, 64 * 1024);
+      if (entry.kind !== 'file' || entry.content === null) throw new Error('not a claim file');
+      const existing = issueClaimSchema.safeParse(JSON.parse(entry.content.toString('utf8')));
       if (existing.success && existing.data.runId === runId) {
         return { ok: true, claim: { path, held: true, issueId } };
       }
@@ -97,8 +100,12 @@ export function acquireIssueClaim(
 
 export function releaseIssueClaim(path: string, runId: string): { ok: true } | { ok: false; error: string } {
   try {
-    const parsed = issueClaimSchema.safeParse(JSON.parse(readFileSync(path, 'utf8')));
-    if (!parsed.success) {
+    const entry = readHarnessFsEntry(path, 64 * 1024);
+    const parsed =
+      entry.kind === 'file' && entry.content !== null
+        ? issueClaimSchema.safeParse(JSON.parse(entry.content.toString('utf8')))
+        : null;
+    if (!parsed?.success) {
       return { ok: false, error: `claim at ${path} is unreadable and was not removed` };
     }
     if (parsed.data.runId !== runId) {

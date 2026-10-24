@@ -492,13 +492,19 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
    *  are their own synthetic entries: a marker note pushed the moment the
    *  stream switches steps — the divider the step panel jumps to (2026-07-29). */
   let currentStepId: string | undefined
+  // An `onFail.retry` loop re-enters an earlier step; a repeat marker gets a `#n` suffix so row
+  // keys stay unique while the first divider keeps the id the step panel jumps to.
+  const stepMarkerCounts = new Map<string, number>()
   for (const event of events) {
     const eventStepId = str(event.stepId)
     if (eventStepId !== undefined && eventStepId !== currentStepId) {
       currentStepId = eventStepId
+      const seen = (stepMarkerCounts.get(eventStepId) ?? 0) + 1
+      stepMarkerCounts.set(eventStepId, seen)
+      const id = seen === 1 ? `step-start:${eventStepId}` : `step-start:${eventStepId}#${seen}`
       currentTurn().entries.push({
         origin: 'meta',
-        entry: { kind: 'note', id: `step-start:${eventStepId}`, text: eventStepId, tone: 'dim', marker: 'step-start' },
+        entry: { kind: 'note', id, text: eventStepId, tone: 'dim', marker: 'step-start' },
       })
     }
     lastEventAt = stamp(event.ts) ?? lastEventAt

@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { closeSync, existsSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, statSync, writeFileSync, mkdirSync, rmSync, unlinkSync } from 'node:fs'
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, statSync, writeFileSync, mkdirSync, rmSync, unlinkSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -685,6 +685,31 @@ async function runCommandAdapter(model, commandKey, { worktree, prompt = '', env
   }
 }
 
+// One descriptor per entry (CodeQL js/file-system-race): the worktree is model-writable, so a
+// path lstat called a file can be a symlink — or a FIFO — by the time a second call opens it.
+const NO_FOLLOW_READ = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0)
+
+function readEntryNoFollow(path, maxBytes = Infinity) {
+  let fd
+  try {
+    fd = openSync(path, NO_FOLLOW_READ)
+  } catch (error) {
+    // ELOOP (Linux, macOS) / EMLINK (FreeBSD): the last component is a symlink.
+    if (error.code === 'ELOOP' || error.code === 'EMLINK') return { kind: 'symlink', mode: lstatSync(path).mode, target: readlinkSync(path) }
+    if (error.code === 'ENXIO' || error.code === 'EOPNOTSUPP' || error.code === 'ENODEV') return { kind: 'other', mode: lstatSync(path).mode }
+    throw error
+  }
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile()) return { kind: 'other', mode: stat.mode }
+    if (stat.size > maxBytes) return { kind: 'file', mode: stat.mode, content: null }
+    const content = readFileSync(fd)
+    return { kind: 'file', mode: stat.mode, content: content.length > maxBytes ? null : content }
+  } finally {
+    closeSync(fd)
+  }
+}
+
 function captureReviewerMutationState(worktree) {
   return {
     git: captureGitState(worktree),
@@ -692,15 +717,14 @@ function captureReviewerMutationState(worktree) {
     unstaged: git(['diff', '--binary', '--no-ext-diff', '--full-index', '--'], worktree),
     untracked: git(['ls-files', '--others', '--exclude-standard'], worktree).split(/\r?\n/).filter(Boolean).sort()
       .map((path) => {
-        const absolute = resolve(worktree, path)
-        const stat = lstatSync(absolute)
-        if (stat.isSymbolicLink()) return [path, sha256(`symlink:${readlinkSync(absolute)}`)]
-        if (stat.isFile()) {
-          return [path, stat.size <= MODEL_OUTPUT_LIMIT
-            ? sha256(readFileSync(absolute))
+        const entry = readEntryNoFollow(resolve(worktree, path), MODEL_OUTPUT_LIMIT)
+        if (entry.kind === 'symlink') return [path, sha256(`symlink:${entry.target}`)]
+        if (entry.kind === 'file') {
+          return [path, entry.content
+            ? sha256(entry.content)
             : git(['hash-object', '--no-filters', '--', path], worktree).trim()]
         }
-        return [path, sha256(`mode:${stat.mode}`)]
+        return [path, sha256(`mode:${entry.mode}`)]
       })
   }
 }
@@ -1382,9 +1406,11 @@ function captureDirtyState(worktree) {
   for (const path of dirtyPaths(worktree)) {
     const absolute = join(worktree, path)
     try {
-      const stat = lstatSync(absolute)
-      const content = stat.isSymbolicLink() ? Buffer.from(`symlink:${readlinkSync(absolute)}`) : readFileSync(absolute)
-      state[path] = sha256(Buffer.concat([Buffer.from(`${stat.mode}\0`), content]))
+      const entry = readEntryNoFollow(absolute)
+      // Same digest as before; a directory or special file still reads as absent.
+      if (entry.kind === 'other') throw new Error('not a file')
+      const content = entry.kind === 'symlink' ? Buffer.from(`symlink:${entry.target}`) : entry.content
+      state[path] = sha256(Buffer.concat([Buffer.from(`${entry.mode}\0`), content]))
     } catch {
       state[path] = 'absent'
     }
@@ -2103,8 +2129,8 @@ function gitStateDrift(startState, currentState) {
   }
   const startRefs = new Set(startState.refs || [])
   const currentRefs = new Set(currentState.refs || [])
-  for (const line of currentRefs) if (!startRefs.has(line)) drift.push(`ref now at ${line.replace('\t', ' → ')}`)
-  for (const line of startRefs) if (!currentRefs.has(line)) drift.push(`ref no longer at ${line.replace('\t', ' → ')}`)
+  for (const line of currentRefs) if (!startRefs.has(line)) drift.push(`ref now at ${line.replaceAll('\t', ' → ')}`)
+  for (const line of startRefs) if (!currentRefs.has(line)) drift.push(`ref no longer at ${line.replaceAll('\t', ' → ')}`)
   const startLogs = startState.reflogs || {}
   for (const [ref, current] of Object.entries(currentState.reflogs || {})) {
     const before = Array.isArray(startLogs[ref]) ? startLogs[ref] : []

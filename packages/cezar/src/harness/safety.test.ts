@@ -161,6 +161,11 @@ describe('harness safety primitives', () => {
     expect(() => invoke({ command: 'gh issue edit 42 --add-assignee @me' })).toThrow();
     expect(() => invoke({ command: 'gh pr review 42 --approve' })).toThrow();
     expect(() => invoke({ command: 'gh issue view 42 --json title' })).not.toThrow();
+    expect(() => invoke({ command: 'gh api -X POST repos/o/r/pulls' })).toThrow();
+    expect(() => invoke({ command: 'gh api --method=DELETE repos/o/r/git/refs/heads/x' })).toThrow();
+    expect(() => invoke({ command: 'gh api repos/o/r/issues/1/comments -f body=hi' })).toThrow();
+    expect(() => invoke({ command: "gh api graphql -f query='mutation { closeIssue }'" })).toThrow();
+    expect(() => invoke({ command: 'gh api repos/o/r/issues/1 --jq .title' })).not.toThrow();
     expect(() => invoke({ command: 'printf "git"; echo push' })).not.toThrow();
 
     const incompleteEnv = { ...process.env };

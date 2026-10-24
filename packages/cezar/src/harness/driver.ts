@@ -6,7 +6,6 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
-  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -63,6 +62,7 @@ import {
 import { harnessStageResultSchema, samePathSet } from './stage-result.js';
 import { loadTrustedHarnessSkill } from './skill-binding.js';
 import { acquireIssueClaim, releaseIssueClaim } from './issue-claim.js';
+import { readHarnessFsEntry } from './fs-read.js';
 import { harnessPhaseSkills } from './skill-routing.js';
 import { createClaudeStageOnlySettings } from './claude-guard.js';
 import type {
@@ -79,12 +79,12 @@ function readHarnessArtifactText(
   path: string,
   maxBytes = HARNESS_JSON_ARTIFACT_MAX_BYTES,
 ): string {
-  const stat = lstatSync(path);
-  if (!stat.isFile()) throw new Error(`artifact is not a regular file: ${path}`);
-  if (stat.size > maxBytes) {
-    throw new Error(`artifact is ${stat.size} bytes, exceeding the ${maxBytes}-byte safety limit`);
+  const entry = readHarnessFsEntry(path, maxBytes);
+  if (entry.kind !== 'file') throw new Error(`artifact is not a regular file: ${path}`);
+  if (entry.content === null) {
+    throw new Error(`artifact is ${entry.stat.size} bytes, exceeding the ${maxBytes}-byte safety limit`);
   }
-  return readFileSync(path, 'utf8');
+  return entry.content.toString('utf8');
 }
 
 /**
@@ -306,14 +306,14 @@ function hashWorktreeContentVsHead(
     hash.update('\0');
     const absolute = join(cwd, path);
     try {
-      const stat = lstatSync(absolute);
-      if (stat.isSymbolicLink()) hash.update(`symlink:${readlinkSync(absolute)}`);
-      else if (stat.isFile()) {
+      const entry = readHarnessFsEntry(absolute);
+      if (entry.kind === 'symlink') hash.update(`symlink:${entry.target}`);
+      else if (entry.kind === 'file') {
         // Git tracks the executable bit and file type as part of the reviewed change.
-        hash.update(`file:${stat.mode & 0o111 ? 'executable' : 'regular'}\0`);
-        hash.update(readFileSync(absolute));
+        hash.update(`file:${entry.stat.mode & 0o111 ? 'executable' : 'regular'}\0`);
+        hash.update(entry.content!);
       }
-      else hash.update(`mode:${stat.mode}`);
+      else hash.update(`mode:${entry.stat.mode}`);
     } catch {
       hash.update('absent'); // deleted from the worktree
     }
@@ -866,9 +866,8 @@ export async function runHarnessDriver(
     createHash('sha256').update(value).digest('hex');
   const hashFile = (path: string): string | null => {
     try {
-      const stat = lstatSync(path);
-      if (!stat.isFile() || stat.size > HARNESS_JSON_ARTIFACT_MAX_BYTES * 4) return null;
-      return sha256(readFileSync(path));
+      const entry = readHarnessFsEntry(path, HARNESS_JSON_ARTIFACT_MAX_BYTES * 4);
+      return entry.kind === 'file' && entry.content !== null ? sha256(entry.content) : null;
     } catch {
       return null;
     }
@@ -1029,6 +1028,8 @@ export async function runHarnessDriver(
         ...guardEnv,
         CEZ_PROCESS_TOKEN: token,
         CEZ_HARNESS_STAGE_ONLY: '1',
+        // The one directory outside the worktree a stage-only phase may write.
+        CEZ_HARNESS_OUTPUT_DIR: agentOutputDir,
         GIT_ALLOW_PROTOCOL: '',
         GIT_TERMINAL_PROMPT: '0',
         GIT_ASKPASS: '/usr/bin/false',
@@ -1528,8 +1529,14 @@ export async function runHarnessDriver(
               (result.error ?? result.stderr ?? result.stdout).trim() ||
               `exit ${result.exitCode}`
             }`;
-        if (!failure && existsSync(sessionResultPath)) {
-          writeFileSync(resultPath, readFileSync(sessionResultPath));
+        if (!failure) {
+          try {
+            // Copied as bytes, never through a symlink the adapter left in its place.
+            const entry = readHarnessFsEntry(sessionResultPath);
+            if (entry.kind === 'file') writeFileSync(resultPath, entry.content!);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          }
         }
       } else {
         failure = await runAgentInvocation(invocation, {
@@ -2468,13 +2475,15 @@ export async function runHarnessDriver(
     let recoverableCouncil: z.infer<typeof councilResultSchema> | null = null;
     let recoverableCouncilMtimeMs: number | null = null;
     try {
-      const resultStat = lstatSync(resultFile);
-      const parsed = councilResultSchema.safeParse(
-        JSON.parse(readHarnessArtifactText(resultFile)) as unknown,
-      );
-      if (resultStat.isFile() && parsed.success) {
+      // One read for bytes and mtime, so the recovered verdict and its age describe the same file.
+      const entry = readHarnessFsEntry(resultFile, HARNESS_JSON_ARTIFACT_MAX_BYTES);
+      const parsed =
+        entry.kind === 'file' && entry.content !== null
+          ? councilResultSchema.safeParse(JSON.parse(entry.content.toString('utf8')) as unknown)
+          : null;
+      if (entry.kind === 'file' && parsed?.success) {
         recoverableCouncil = parsed.data;
-        recoverableCouncilMtimeMs = resultStat.mtimeMs;
+        recoverableCouncilMtimeMs = entry.stat.mtimeMs;
       }
     } catch {
     }
@@ -3286,9 +3295,6 @@ export async function runHarnessDriver(
           try {
             checks = await validate(agentic.validationCommands, host.cwd, {
               signal: gateAbort.signal,
-              env: harnessChildEnvironment(
-                harnessConfigEnvironmentNames(agentic.agentHarness),
-              ),
               logDir: artifactDir,
               logPrefix: `validation-packet-${effectiveId}-`,
               onSpawn: (identity) => {
@@ -3535,9 +3541,6 @@ export async function runHarnessDriver(
             try {
               const checks = await validate(runtimeAgentic.validationCommands, host.cwd, {
                 signal: controller.signal,
-                env: harnessChildEnvironment(
-                  harnessConfigEnvironmentNames(runtimeAgentic.agentHarness),
-                ),
                 logDir: artifactDir,
                 logPrefix: 'validation-baseline-',
                 onSpawn: (identity) => {
@@ -4509,9 +4512,6 @@ export async function runHarnessDriver(
               try {
                 const checks = await validate(agentic.validationCommands, host.cwd, {
                   signal: controller.signal,
-                  env: harnessChildEnvironment(
-                    harnessConfigEnvironmentNames(agentic.agentHarness),
-                  ),
                   logDir: artifactDir,
                   logPrefix: `validation-${validateId}-`,
                   onSpawn: (identity) => {

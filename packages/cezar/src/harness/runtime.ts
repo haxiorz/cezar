@@ -17,6 +17,7 @@ import { dirname, join } from 'node:path';
 import { z } from 'zod';
 import { discoverSkills, type Skill } from '../skills.js';
 import type { HarnessValidationCheck } from './types.js';
+import { readRegularFileFollowing } from './fs-read.js';
 
 /**
  * The runtime bridge (spec 2026-07-23-harness-orchestration, Architecture §2):
@@ -33,6 +34,10 @@ const OP_OUTPUT_CAP = 200_000;
 const DEFAULT_OP_TIMEOUT_MS = 10 * 60_000;
 const VALIDATION_TIMEOUT_MS = 30 * 60_000;
 const PROCESS_KILL_GRACE_MS = 5_000;
+
+// Provider credentials the runtime and CLI probes may need. The validation gate runs the
+// model-written scripts behind `npm test` unsandboxed, so it never receives them (PR #925 review).
+const HARNESS_PROVIDER_CREDENTIAL_ENV = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY'];
 
 const HARNESS_BASE_ENV = new Set([
   'PATH',
@@ -62,8 +67,7 @@ const HARNESS_BASE_ENV = new Set([
   'NODE_EXTRA_CA_CERTS',
   'SSL_CERT_FILE',
   'SSL_CERT_DIR',
-  'ANTHROPIC_API_KEY',
-  'OPENAI_API_KEY',
+  ...HARNESS_PROVIDER_CREDENTIAL_ENV,
 ]);
 
 export function harnessChildEnvironment(
@@ -290,8 +294,11 @@ function copyTreeByValue(
     return;
   }
   if (!stat.isFile()) return; // sockets/fifos have no place in a sealed runtime
+  // Re-checked on the descriptor: the entry may have changed since the stat above.
+  const content = readRegularFileFollowing(source);
+  if (content === null) return;
   mkdirSync(dirname(dest), { recursive: true });
-  writeFileSync(dest, readFileSync(source));
+  writeFileSync(dest, content);
 }
 
 /** sha256 of the runtime's bytes, or null when it is gone. */
@@ -740,8 +747,10 @@ export async function runValidationCommands(
 ): Promise<HarnessValidationCheck[]> {
   const checks: HarnessValidationCheck[] = [];
   let failed = false;
+  const inherited = harnessChildEnvironment();
+  for (const name of HARNESS_PROVIDER_CREDENTIAL_ENV) delete inherited[name];
   const baseEnvironment = {
-    ...harnessChildEnvironment(),
+    ...inherited,
     ...opts.env,
   };
   let corepackShimDir: string | undefined;

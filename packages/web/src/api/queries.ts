@@ -2103,12 +2103,14 @@ export function useSendMessage(id: string, projectId?: string) {
     // is the ordinary case and keeps the scoped-by-context spelling.
     mutationFn: (message: MessageInput) =>
       projectId === undefined ? sendMessage(id, message) : sendProjectRunMessage(projectId, id, message),
-    onSuccess: (response) => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.runs.all })
-      if ('queuedForPhase' in response) {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.runs.harness(id) })
-      }
-    },
+    // Returned so `mutateAsync` still settles after the runs refetch, as callers rely on.
+    onSuccess: (response) =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.runs.all }),
+        'queuedForPhase' in response
+          ? queryClient.invalidateQueries({ queryKey: queryKeys.runs.harness(id) })
+          : undefined,
+      ]),
     onError: (error) => {
       if (error instanceof ApiError && error.status === 409) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.runs.all })

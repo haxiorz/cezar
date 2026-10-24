@@ -223,6 +223,11 @@ export function NewTaskRoute() {
       ...(deepLink.skill !== ''
         ? { source: { source: 'skill', ref: deepLink.skill } as TaskSource }
         : {}),
+      // A prefill names an ordinary task (Settings → Harness, Inbox, bookmarklet); a Multi-model
+      // tab left over from the last run must not turn it into a harness run.
+      ...(deepLink.ref !== '' || deepLink.skill !== '' || deepLink.todo !== ''
+        ? { composerMode: 'task' as const }
+        : {}),
     }
   })
   useEffect(() => {
@@ -817,7 +822,7 @@ export function NewTaskRoute() {
           source: multiSource,
           model: '',
           runner: 'claude',
-          defaultRunner: health.data?.defaultRunner ?? 'claude',
+          defaultRunner,
           variants: 1,
           images: submitted,
           harnessRoles,
@@ -1047,13 +1052,10 @@ export function NewTaskRoute() {
           // it used to disable the whole box, which put the probe's error text
           // where the prompt's instructions belong and wiped the ability to
           // keep writing every time a model changed and the probe re-ran.
+          // An incomplete lineup stays sendable: its probe never runs (so it would read as
+          // "Checking…" forever), and submit is what reopens model setup and says why.
           sendBlockedReason={
-            composerMode === 'multi'
-              ? (harnessProbeBlock ??
-                (harnessBlocked
-                  ? 'Multi-model needs models from at least two families — configure models first.'
-                  : undefined))
-              : undefined
+            composerMode === 'multi' && !harnessBlocked ? (harnessProbeBlock ?? undefined) : undefined
           }
           autocompleteSkills={composerMode !== 'multi'}
           sendShortcut="↵"

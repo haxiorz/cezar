@@ -476,6 +476,11 @@ export function Composer({
   )
 
   const submitDraft = useCallback(() => {
+    // Enter says why it did nothing: the disabled button's title is out of keyboard reach.
+    if (sendBlockedReason !== undefined && !disabled && !busy) {
+      toast(sendBlockedReason)
+      return
+    }
     if (disabled || submitDisabled || busy) return
     if (text.trim() === '' && images.length === 0 && !allowEmptySubmit) return
     const draftText = text
@@ -486,7 +491,7 @@ export function Composer({
     setImages([], 'submit')
     setTrigger(null)
     void send(draftText, draftImages, true)
-  }, [allowEmptySubmit, busy, disabled, submitDisabled, images, send, text])
+  }, [allowEmptySubmit, busy, disabled, submitDisabled, sendBlockedReason, images, send, text])
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (menuOpen) {
@@ -567,7 +572,8 @@ export function Composer({
     const transcript = dictation.finish()
     if (transcript === '') return
     const merged = text.trim() === '' ? transcript : `${text.replace(/\s*$/, '')} ${transcript}`
-    if (alsoSend) {
+    // A blocked send would return before its restore path, so the cleared draft would be lost.
+    if (alsoSend && !disabled && !submitDisabled && !busy) {
       setText('')
       setImages([], 'submit')
       void send(merged, images, true)
