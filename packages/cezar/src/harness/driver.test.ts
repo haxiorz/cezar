@@ -2312,6 +2312,94 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(h.calls).toEqual([]);
   });
 
+  // PR #925 review (D5): a Stop or a crash ends no attempt, so it must not spend the retry budget.
+  it('does not charge cancelled implement attempts to the two-attempt budget', async () => {
+    let cancelled = false;
+    let implementCalls = 0;
+    const entry = () => {
+      const h = makeHarness(dir);
+      h.host.isCancelled = () => cancelled;
+      h.agentBehavior.set('implement', (req) => {
+        implementCalls += 1;
+        if (implementCalls <= 2) {
+          cancelled = true;
+          return null;
+        }
+        writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/a.ts'] }), 'utf8');
+        return null;
+      });
+      return h;
+    };
+    for (let stop = 0; stop < 2; stop += 1) {
+      cancelled = false;
+      const h = entry();
+      expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    }
+    cancelled = false;
+    const resumed = entry();
+
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+    expect(implementCalls).toBe(3);
+    const ledger = loadLedger(resumed.host.dataDir, resumed.host.runId);
+    expect(ledger?.stage.status).toBe('staged');
+    expect(
+      ledger?.invocations.find((invocation) => invocation.phaseId === 'implement'),
+    ).toMatchObject({ status: 'completed', attempt: 1 });
+  });
+
+  it('does not charge attempts cut short by a process crash to the budget', async () => {
+    let implementCalls = 0;
+    for (let crash = 0; crash < 2; crash += 1) {
+      let cancelled = false;
+      const h = makeHarness(dir);
+      h.host.isCancelled = () => cancelled;
+      h.agentBehavior.set('implement', () => {
+        implementCalls += 1;
+        cancelled = true;
+        return null;
+      });
+      expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+      const ledger = loadLedger(h.host.dataDir, h.host.runId)!;
+      const implement = ledger.invocations.find((invocation) => invocation.phaseId === 'implement')!;
+      implement.status = 'running';
+      implement.error = undefined;
+      implement.endedAt = undefined;
+      saveLedger(h.host.dataDir, h.host.runId, ledger);
+    }
+    const resumed = makeHarness(dir);
+    resumed.agentBehavior.set('implement', (req) => {
+      implementCalls += 1;
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/a.ts'] }), 'utf8');
+      return null;
+    });
+
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+    expect(implementCalls).toBe(3);
+    expect(loadLedger(resumed.host.dataDir, resumed.host.runId)?.stage.status).toBe('staged');
+  });
+
+  it('still fails a phase whose two ended attempts both broke the result contract', async () => {
+    const first = makeHarness(dir);
+    first.agentBehavior.set('implement', (req) => {
+      writeFileSync(req.resultPath, '{"not":"the contract"}', 'utf8');
+      return null;
+    });
+    expect(await runHarnessDriver(first.host, input, first.deps)).toMatch(
+      /"implement" produced no valid result after a retry/,
+    );
+    const resumed = makeHarness(dir);
+    let implementCalls = 0;
+    resumed.agentBehavior.set('implement', () => {
+      implementCalls += 1;
+      return null;
+    });
+
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toMatch(
+      /"implement" produced no valid result after a retry/,
+    );
+    expect(implementCalls).toBe(0);
+  });
+
   it('returns null without staging when cancelled between phases', async () => {
     const h = makeHarness(dir);
     let cancelled = false;

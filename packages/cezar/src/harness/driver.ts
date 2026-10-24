@@ -917,9 +917,16 @@ export async function runHarnessDriver(
     emitInvocation(invocation);
     return null;
   };
+  // A cancel or crash interrupts an attempt before it ends, so it spends no
+  // budget; a completed attempt later demoted for a changed artifact keeps its
+  // artifact hash and still counts (PR #925 review).
+  const consumedAttempts = (invocation: HarnessInvocation): number =>
+    invocation.status === 'interrupted' && invocation.artifactSha256 === undefined
+      ? invocation.attempt - 1
+      : invocation.attempt;
   const attemptsForInput = (id: string, inputSha256: string): number => {
     const invocation = ledger.invocations.find((entry) => entry.id === id);
-    return invocation?.inputSha256 === inputSha256 ? invocation.attempt : 0;
+    return invocation?.inputSha256 === inputSha256 ? consumedAttempts(invocation) : 0;
   };
   const beginInvocation = (init: {
     id: string;
@@ -939,8 +946,9 @@ export async function runHarnessDriver(
       attempt: 0,
     };
     if (!existing) ledger.invocations.push(invocation);
-    if (existing && existing.inputSha256 !== init.inputSha256) {
-      invocation.attempt = 0;
+    if (existing) {
+      invocation.attempt =
+        existing.inputSha256 === init.inputSha256 ? consumedAttempts(existing) : 0;
     }
     invocation.phaseId = init.phaseId;
     invocation.role = init.role;
