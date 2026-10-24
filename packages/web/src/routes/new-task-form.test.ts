@@ -816,6 +816,15 @@ describe('harness role selection (role-based multi-model, 2026-07-24)', () => {
     expect(modelFamilyOf(ref('opencode', ''))).toBe('opencode')
   })
 
+  // Mirrors model-family.test.ts (PR #925 review).
+  it('reads gateway-nested vendors and normalises vendor slugs like the server', () => {
+    expect(modelFamilyOf(ref('opencode', 'openrouter/anthropic/claude-sonnet-5'))).toBe('anthropic')
+    expect(modelFamilyOf(ref('opencode', 'openrouter/acme/new-model'))).toBe('acme')
+    expect(modelFamilyOf(ref('opencode', 'moonshotai/kimi-k2'))).toBe('moonshot')
+    expect(modelFamilyOf(ref('opencode', 'moonshotai/brand-new'))).toBe('moonshot')
+    expect(modelFamilyOf(ref('opencode', 'opencode/brand-new-thing'))).toBe('opencode')
+  })
+
   it('validates a sound role selection', () => {
     expect(
       harnessRolesIssue({

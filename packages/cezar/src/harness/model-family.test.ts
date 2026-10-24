@@ -37,6 +37,34 @@ describe('providerFamilyOf', () => {
     expect(providerFamilyOf({ runner: 'opencode', model: 'deepseek/deepseek-v4' })).toBe('deepseek');
   });
 
+  // PR #925 review: a gateway-nested vendor and a vendor slug read as their own families.
+  it('reads the vendor nested behind a gateway prefix', () => {
+    expect(
+      providerFamilyOf({ runner: 'opencode', model: 'openrouter/anthropic/claude-sonnet-5' }),
+    ).toBe('anthropic');
+    expect(
+      councilFamilyOf({ runner: 'opencode', model: 'openrouter/anthropic/claude-sonnet-5' }),
+    ).toBe(councilFamilyOf({ runner: 'claude', model: 'sonnet' }));
+    expect(providerFamilyOf({ runner: 'opencode', model: 'openrouter/meta-llama/llama-4' })).toBe(
+      'meta',
+    );
+    expect(providerFamilyOf({ runner: 'opencode', model: 'openrouter/acme/new-model' })).toBe(
+      'acme',
+    );
+    expect(reviewerFamily('openrouter/anthropic/claude-sonnet-5', 'opencode')).toBe('anthropic');
+  });
+
+  it('normalises a vendor slug to the family its model name resolves to', () => {
+    expect(providerFamilyOf({ runner: 'opencode', model: 'moonshotai/kimi-k2' })).toBe(
+      providerFamilyOf({ runner: 'opencode', model: 'opencode/kimi-k2' }),
+    );
+    expect(providerFamilyOf({ runner: 'opencode', model: 'moonshotai/brand-new' })).toBe(
+      'moonshot',
+    );
+    expect(providerFamilyOf({ runner: 'opencode', model: 'z-ai/glm-4.7' })).toBe('zhipu');
+    expect(providerFamilyOf({ runner: 'opencode', model: 'x-ai/grok-5' })).toBe('xai');
+  });
+
   it('lets a configured advisor declare its own family', () => {
     expect(providerFamilyOf({ runner: 'harness', model: 'kimi-subscription', family: 'moonshot' })).toBe(
       'moonshot',
@@ -91,5 +119,15 @@ describe('the web mirror stays in step', () => {
     const prefixes = (text: string) =>
       text.match(/GATEWAY_PREFIXES: ReadonlySet<string> = new Set\(\[([^\]]*)\]\)/)?.[1]?.trim();
     expect(prefixes(mirror)).toBe(prefixes(source));
+  });
+
+  it('carries the same vendor-slug table', () => {
+    const vendors = (text: string) =>
+      text
+        .match(/FAMILY_BY_VENDOR: Readonly<Record<string, string>> = \{([^}]*)\}/)?.[1]
+        ?.replace(/\s+/g, '')
+        .replace(/,$/, '');
+    expect(vendors(source)).toBeTruthy();
+    expect(vendors(mirror)).toBe(vendors(source));
   });
 });

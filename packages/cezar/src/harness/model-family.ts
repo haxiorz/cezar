@@ -42,13 +42,29 @@ export const FAMILY_BY_NAME: ReadonlyArray<[RegExp, string]> = [
   [/^ling|^ring/i, 'inclusionai'],
 ];
 
-/** Best-effort weight family for a bare model id; `fallback` (the gateway, or
+/** Vendor slugs (OpenRouter's spelling) that name a family differently (PR #925 review). */
+const FAMILY_BY_VENDOR: Readonly<Record<string, string>> = {
+  moonshotai: 'moonshot',
+  'z-ai': 'zhipu',
+  'x-ai': 'xai',
+  'meta-llama': 'meta',
+  mistralai: 'mistral',
+  qwen: 'alibaba',
+};
+
+/** Best-effort weight family for a model id; `fallback` (the gateway, or
  *  the runner) is used so an unrecognised model never silently merges into
  *  another family — an unknown model counts as its own, which can only make the
- *  diversity check stricter. */
-export function familyByModelName(bareModel: string, fallback: string): string {
-  for (const [pattern, family] of FAMILY_BY_NAME) if (pattern.test(bareModel)) return family;
-  return fallback;
+ *  diversity check stricter. Leading gateway segments are billing, so a nested
+ *  `vendor/model` behind them resolves like the bare vendor id. */
+export function familyByModelName(model: string, fallback: string): string {
+  const segments = model.split('/');
+  let at = 0;
+  while (at < segments.length - 1 && GATEWAY_PREFIXES.has(segments[at]!.toLowerCase())) at += 1;
+  const vendor = at < segments.length - 1 ? segments[at]!.toLowerCase() : '';
+  const name = segments.slice(vendor ? at + 1 : at).join('/');
+  for (const [pattern, family] of FAMILY_BY_NAME) if (pattern.test(name)) return family;
+  return vendor ? (FAMILY_BY_VENDOR[vendor] ?? vendor) : fallback;
 }
 
 export interface FamilyResolvableRef {
@@ -67,15 +83,12 @@ export function providerFamilyOf(ref: FamilyResolvableRef): string {
   if (ref.runner === 'harness') return ref.family ?? 'harness';
 
   const slash = ref.model.indexOf('/');
-  const prefix = slash > 0 ? ref.model.slice(0, slash) : '';
-  const bare = slash > 0 ? ref.model.slice(slash + 1) : ref.model;
-
-  if (prefix && !GATEWAY_PREFIXES.has(prefix.toLowerCase())) return prefix.toLowerCase();
+  const prefix = slash > 0 ? ref.model.slice(0, slash).toLowerCase() : '';
 
   const runnerFallback =
     ref.runner === 'claude' ? 'anthropic'
     : ref.runner === 'codex' ? 'openai'
-    : prefix.toLowerCase() || ref.runner;
+    : (GATEWAY_PREFIXES.has(prefix) ? prefix : '') || ref.runner;
 
-  return familyByModelName(bare, runnerFallback);
+  return familyByModelName(ref.model, runnerFallback);
 }
