@@ -11,7 +11,7 @@ import type {
   ContentBlock,
   SessionOptions,
 } from './agent-runner.ts';
-import { isSignalTerminationExit, prependSystemPrompt, trackChildExit } from './agent-runner.ts';
+import { isCezarTerminationExit, prependSystemPrompt, trackChildExit } from './agent-runner.ts';
 import {
   AUTO_END_DELAY_MS,
   DEFAULT_RUN_TIMEOUT_MS,
@@ -277,7 +277,7 @@ class CodexSession implements AgentSession {
 
       // Our own EOF watchdog / cancel signal coming back as 143/137 — the
       // teardown cezar asked for, not a codex failure (#703).
-      if (this.terminatedByCezar && isSignalTerminationExit(exitCode)) {
+      if (this.terminatedByCezar && isCezarTerminationExit(exitCode)) {
         this.emit({
           type: 'note',
           message: `codex app-server did not exit on its own after close; terminated by cezar (code ${exitCode})`,

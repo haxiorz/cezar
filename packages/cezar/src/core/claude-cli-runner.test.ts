@@ -7,7 +7,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import type { AgentEvent } from './agent-runner.ts';
-import { isSignalTerminationExit, prependSystemPrompt } from './agent-runner.ts';
+import { isCezarTerminationExit, isSignalTerminationExit, prependSystemPrompt } from './agent-runner.ts';
 import {
   buildClaudeArgs,
   CLAUDE_HEADLESS_GUIDANCE,
@@ -152,6 +152,21 @@ describe('isSignalTerminationExit', () => {
     for (const code of [0, 1, 2, 127, null]) {
       expect(isSignalTerminationExit(code)).toBe(false);
     }
+  });
+});
+
+// PR #925 review: on Windows the tree dies by `taskkill /f`, which Node reports as exit 1.
+describe('isCezarTerminationExit', () => {
+  it('settles a Windows taskkill exit as cezar\'s own teardown', () => {
+    expect(isCezarTerminationExit(1, 'win32')).toBe(true);
+    expect(isCezarTerminationExit(143, 'win32')).toBe(true);
+  });
+
+  it('keeps exit 1 a failure where cezar signals the group itself', () => {
+    expect(isCezarTerminationExit(1, 'linux')).toBe(false);
+    expect(isCezarTerminationExit(1, 'darwin')).toBe(false);
+    expect(isCezarTerminationExit(143, 'darwin')).toBe(true);
+    for (const code of [0, 2, null]) expect(isCezarTerminationExit(code, 'win32')).toBe(false);
   });
 });
 

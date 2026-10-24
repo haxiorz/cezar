@@ -1,12 +1,19 @@
 // Plays cezar: starts an agent the way every run does, then leaves the way the test asks —
-// `exit` calls process.exit on SIGUSR2; `handled` turns a SIGINT into a delayed process.exit
-// (serve/run's shutdown); `signal` waits for a signal it does not handle (default death).
+// `exit` calls process.exit on SIGUSR2; `handled` owns shutdown like serve/run, turning SIGINT or
+// SIGHUP into a delayed process.exit; `signal` waits for a signal it does not handle (default death).
+// proper-lockfile is loaded as serve/run load it: its signal-exit adds listeners that own nothing.
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import 'proper-lockfile';
 
 const [bin, cwd, mode] = process.argv.slice(2);
 if (mode === 'exit') process.on('SIGUSR2', () => process.exit(0));
-if (mode === 'handled') process.on('SIGINT', () => setTimeout(() => process.exit(130), 50));
+if (mode === 'handled') {
+  const { ownProcessShutdown } = await import('../../process-tree.ts');
+  ownProcessShutdown();
+  process.on('SIGINT', () => setTimeout(() => process.exit(130), 50));
+  process.on('SIGHUP', () => setTimeout(() => process.exit(129), 50));
+}
 const { spawnCodexAppServer } = await import('../../codex-app-server-transport.ts');
 const child = spawnCodexAppServer(bin, cwd);
 child.stdout.resume();

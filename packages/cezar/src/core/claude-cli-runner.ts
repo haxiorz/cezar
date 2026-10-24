@@ -17,7 +17,7 @@ import type {
 
 // Re-exported for backends and the run manager that still import them from here.
 export type { AgentSession, SessionOptions } from './agent-runner.ts';
-import { isSignalTerminationExit, trackChildExit } from './agent-runner.ts';
+import { isCezarTerminationExit, trackChildExit } from './agent-runner.ts';
 import { thinkingBudgetFor } from './reasoning-effort.ts';
 import { unwrapJsonErrorEnvelope } from './agent-errors.ts';
 import { buildChildEnv } from './agent-env.ts';
@@ -364,7 +364,7 @@ export class ClaudeCliRunner implements AgentRunner {
       // A session cezar itself tore down (EOF watchdog after `end()`, or a
       // cancel) exits 143/137 — that is our own signal coming back, not an
       // agent failure, so it settles on the normal path with a note (#703).
-      if (terminatedByCezar && isSignalTerminationExit(exitCode)) {
+      if (terminatedByCezar && isCezarTerminationExit(exitCode)) {
         onEvent?.({
           type: 'note',
           message: eofKilled

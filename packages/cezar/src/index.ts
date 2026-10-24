@@ -5,6 +5,7 @@ import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { detectEnvironment } from './core/backend-detect.ts';
+import { ownProcessShutdown } from './core/process-tree.ts';
 import {
   ProviderAuthService,
   providerAuthChecksDisabled,
@@ -289,8 +290,11 @@ async function serveCommand(
       })
       .finally(() => process.exit(process.exitCode ?? 0));
   };
+  // A closed terminal or dropped SSH session stops cezar and its detached agents (PR #925 review).
+  ownProcessShutdown();
   process.on('SIGINT', () => shutdown('signal'));
   process.on('SIGTERM', () => shutdown('signal'));
+  process.on('SIGHUP', () => shutdown('signal'));
   const providerAuth = new ProviderAuthService({ cwd: repoRoot, onInconclusive: (probe) => void reportInconclusiveProbe(probe) });
   const workspaceEvents = new WorkspaceEventBus();
   const providerRuntimeAuth = new ProviderRuntimeAuthObserver(providerAuth, (status) => {
@@ -568,8 +572,10 @@ async function runCommand(
   };
   const interrupt = () => shutdown(130);
   const terminate = () => shutdown(143);
+  ownProcessShutdown();
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', terminate);
+  process.on('SIGHUP', () => shutdown(129));
 
   store.on('event', ({ event }) => {
     switch (event.type) {

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -50,12 +50,13 @@ describe.skipIf(process.platform === 'win32')('agent process groups die with cez
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
-  async function startOwner(mode: 'exit' | 'handled' | 'signal') {
+  async function startOwner(mode: 'exit' | 'handled' | 'signal', leaderExits = false) {
     const dir = mkdtempSync(join(tmpdir(), 'cez-tree-exit-'));
     dirs.push(dir);
     const bin = join(dir, 'fake-agent.mjs');
     copyFileSync(fakeAgent, bin);
     chmodSync(bin, 0o755);
+    if (leaderExits) writeFileSync(join(dir, 'leader-exits'), '');
     const child = spawn(process.execPath, ['--import', 'tsx', owner, bin, dir, mode], {
       stdio: ['ignore', 'pipe', 'inherit'],
     });
@@ -71,7 +72,7 @@ describe.skipIf(process.platform === 'win32')('agent process groups die with cez
     expect(await until(() => existsSync(pidsFile) && readFileSync(pidsFile, 'utf8').length > 0, 10_000)).toBe(true);
     const pids = JSON.parse(readFileSync(pidsFile, 'utf8')) as { leader: number; tool: number };
     leaders.push(pids.leader);
-    expect(alive(pids.leader) && alive(pids.tool)).toBe(true);
+    if (!leaderExits) expect(alive(pids.leader) && alive(pids.tool)).toBe(true);
     return { child, pids, exited, ready: () => until(() => out.includes('ready'), 10_000) };
   }
 
@@ -89,6 +90,25 @@ describe.skipIf(process.platform === 'win32')('agent process groups die with cez
     child.kill('SIGINT');
     expect((await exited).code).toBe(130);
     expect(await until(() => !alive(pids.leader) && !alive(pids.tool), 3_000)).toBe(true);
+  }, 20_000);
+
+  // PR #925 review: signal-exit's listener made the hook assume an owner, so a hangup was ignored.
+  it('lets a command that owns shutdown handle a hangup, then takes the agent down', async () => {
+    const { child, pids, exited, ready } = await startOwner('handled');
+    expect(await ready()).toBe(true);
+    child.kill('SIGHUP');
+    expect((await exited).code).toBe(129);
+    expect(await until(() => !alive(pids.leader) && !alive(pids.tool), 3_000)).toBe(true);
+  }, 20_000);
+
+  it('takes down a tool child that outlived its agent leader when cezar exits', async () => {
+    const { child, pids, exited, ready } = await startOwner('exit', true);
+    expect(await ready()).toBe(true);
+    expect(await until(() => !alive(pids.leader), 3_000)).toBe(true);
+    expect(alive(pids.tool)).toBe(true);
+    child.kill('SIGUSR2');
+    expect((await exited).code).toBe(0);
+    expect(await until(() => !alive(pids.tool), 3_000)).toBe(true);
   }, 20_000);
 
   it('takes the agent down on an unhandled Ctrl-C or hangup, and cezar still dies of that signal', async () => {

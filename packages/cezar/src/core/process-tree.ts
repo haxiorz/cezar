@@ -89,8 +89,21 @@ export function terminateAgentProcessTree(
   return timer;
 }
 
-const liveTrees = new Set<ChildProcess>();
+/** Tracked agent groups, keyed by group id (the leader's pid). */
+const liveTrees = new Map<number, ChildProcess>();
+/** How often a group whose leader exited is re-checked until it is empty. */
+const LINGERING_GROUP_CHECK_MS = 5_000;
 let exitHooksInstalled = false;
+let shutdownOwned = false;
+
+/**
+ * `serve` and `run` own shutdown: their signal handlers flush state and call `process.exit`,
+ * which the exit hook follows. Ownership is declared, never inferred from listener counts —
+ * `signal-exit` (via proper-lockfile) adds listeners that own nothing (PR #925 review).
+ */
+export function ownProcessShutdown(): void {
+  shutdownOwned = true;
+}
 
 /**
  * Register a detached agent so cezar's own exit takes its process group down.
@@ -101,14 +114,25 @@ let exitHooksInstalled = false;
  */
 export function trackAgentProcessTree(child: ChildProcess): void {
   if (!AGENT_PROCESS_DETACHED || !(child instanceof ChildProcess) || child.pid === undefined) return;
-  liveTrees.add(child);
-  child.once('exit', () => liveTrees.delete(child));
+  const group = child.pid;
+  liveTrees.set(group, child);
+  child.once('exit', () => forgetWhenEmpty(group));
   installExitHooks();
+}
+
+/** A leader can exit while tools or MCP servers in its group live on: keep the group until it is
+ *  empty, and no longer — an empty group's id is free for reuse by an unrelated process. */
+function forgetWhenEmpty(group: number): void {
+  if (!groupStillAlive(group)) {
+    liveTrees.delete(group);
+    return;
+  }
+  setTimeout(() => forgetWhenEmpty(group), LINGERING_GROUP_CHECK_MS).unref();
 }
 
 /** SIGTERM every tracked agent group still running. Synchronous: it runs from `exit`. */
 export function terminateLiveAgentProcessTrees(): void {
-  for (const child of liveTrees) signalAgentProcessTree(child, 'SIGTERM');
+  for (const child of liveTrees.values()) signalAgentProcessTree(child, 'SIGTERM');
   liveTrees.clear();
 }
 
@@ -119,10 +143,11 @@ function installExitHooks(): void {
   process.once('exit', terminateLiveAgentProcessTrees);
   for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM'] as const) {
     const onSignal = (): void => {
-      // A command with its own handler owns shutdown; its `process.exit` reaches the hook above.
-      if (process.listenerCount(signal) > 1) return;
+      if (shutdownOwned) return;
       terminateLiveAgentProcessTrees();
       process.removeListener(signal, onSignal);
+      // A remaining `signal-exit` listener re-raises once it is the only one; with none, the
+      // default action runs. Either way cezar still dies of the signal.
       process.kill(process.pid, signal);
     };
     process.on(signal, onSignal);
