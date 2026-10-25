@@ -520,6 +520,9 @@ interface ActiveRun {
   /** Skills this session already counted as `skill_used` (telemetry); lazily created, so neither
    *  construction site (`execute`, `runContinuation`) has to know about it. */
   trackedSkills?: Set<string>;
+  /** Cezar ended the session over the memory limit. Optional like `trackedSkills`: neither
+   *  construction site sets it, and a Continue builds a fresh state. */
+  memoryStopped?: boolean;
   /** Identity of this async owner; stale promises must not mutate a replacement owner. */
   ownerToken: symbol;
   cancelled: boolean;
@@ -1591,6 +1594,7 @@ export class RunManager {
       // Closing the session frees the tree and lets the normal exit path settle the run and
       // pump the queue. Suppress autonomous auto-continue so the pause actually holds.
       state.autonomous = false;
+      state.memoryStopped = true;
       this.clearIdleTimer(state);
       state.session.end();
     }
@@ -7862,6 +7866,12 @@ export class RunManager {
         const added = Math.max(0, result.tokensUsed - sessionTokens);
         sessionTokens = Math.max(sessionTokens, result.tokensUsed);
         this.store.updateStep(runId, step.id, { tokensUsed: (storedStep()?.tokensUsed ?? 0) + added });
+      }
+      // A harness phase stopped over the memory limit delivered nothing on purpose: as a runner
+      // failure it spends no attempt and the run pauses, instead of retrying at once with the
+      // ceiling off for the rest of the run (PR #925 review).
+      if (!phaseInfrastructureFailure && phaseResultPath && state.memoryStopped) {
+        return 'paused — the memory limit was exceeded; Continue resumes this phase';
       }
       return phaseInfrastructureFailure;
     } catch (err) {
