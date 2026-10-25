@@ -18,6 +18,7 @@ import type {
 import { resetToasts, Toaster } from '@/components/ui/toaster'
 
 import { readDraft, resetDraft, writeDraft } from './new-task-draft'
+import { harnessSetupPrefill } from './new-task-form'
 import { NewTaskRoute } from './new-task'
 
 /**
@@ -683,6 +684,28 @@ describe('picker data flows', () => {
     // `worktree` is sent only when explicitly OFF (new-task-form.ts): an absent key IS the
     // isolated-worktree default, so absence — not `worktree: false` — is what the fix restores.
     expect(postedBody()).not.toHaveProperty('worktree')
+  })
+
+  // PR #925 review: the setup prefill wrote `worktree: false` into the sticky draft, so every
+  // ordinary task after "Configure models" ran in the user's checkout.
+  it('runs harness setup in the checkout without making in-place the next task\'s default', async () => {
+    const setup: Skill = {
+      name: 'cez-setup-harness',
+      description: 'Configure the harness',
+      body: '',
+      path: '/bundled/cez-setup-harness/SKILL.md',
+      source: 'bundled',
+    }
+    writeDraft({ ...readDraft(), ...harnessSetupPrefill() })
+    serve({ skills: [...SKILLS, setup] })
+    renderNewTask()
+    await pillReady('cez-setup-harness')
+    expect(document.querySelector('[data-slot="worktree-toggle"]')).toBeNull()
+
+    await startTask()
+
+    expect(postedBody()).toMatchObject({ worktree: false })
+    expect(readDraft().worktree).not.toBe(false)
   })
 
   it('base branch pill shows config default (falling back to the checkout) and PUTs /api/v1/config', async () => {

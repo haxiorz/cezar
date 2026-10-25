@@ -103,6 +103,7 @@ import {
   sessionRoleOptions,
   harnessRolesIssue,
   harnessSetupPrefill,
+  runsInPlace,
   harnessWorkflowName,
   isHarnessRunner,
   modelFamilyOf,
@@ -511,7 +512,8 @@ export function NewTaskRoute() {
   // Worktree opt-out (#worktree-toggle): any ordinary run in a git repo may use the current
   // checkout. Parallel variants are the one hard constraint because each competing run needs
   // its own tree; a non-git repo already runs in place.
-  const worktreeToggleShown = hasGit
+  // The setup task decides its own workspace; a toggle there would only leave a sticky choice behind.
+  const worktreeToggleShown = hasGit && !runsInPlace(source)
 
   // Dispatch (spec 2026-09-10-dispatch): this task may fan work out to subtasks. Offered only
   // while the server has it on (`CEZ_DISPATCH=0` hides it — the routes 409 then) and in a git
@@ -571,7 +573,8 @@ export function NewTaskRoute() {
     dispatch: dispatchOn,
   })
   const askOn = askWanted && !dispatchOn && variants <= 1
-  const worktreeOn = runMode.worktree && !askOn
+  const setupInPlace = runsInPlace(source)
+  const worktreeOn = runMode.worktree && !askOn && !setupInPlace
   const autonomousOn = runMode.autonomous
 
   // Follow-up generation (#444) is offered only while the server has the global inbox on

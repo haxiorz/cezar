@@ -34,6 +34,7 @@ import {
   buildCreateRunBody,
   harnessStartBlock,
   harnessSetupPrefill,
+  runsInPlace,
   harnessWorkflowName,
   withoutHarnessWorkflows,
   MODELS_BY_RUNNER,
@@ -559,14 +560,18 @@ describe('pushRecentSource (recency, #picker)', () => {
 })
 
 describe('harness form rules (spec 2026-07-23-harness-orchestration)', () => {
-  it('harnessSetupPrefill selects the vendored setup skill and opts out of the worktree', () => {
+  it('harnessSetupPrefill selects the vendored setup skill, which runs in place by source', () => {
     const prefill = harnessSetupPrefill()
     expect(prefill.source).toEqual({ source: 'skill', ref: 'cez-setup-harness' })
     expect(prefill.composerMode).toBe('task')
     // Setup stages .ai/agentic.config.json + hooks in the real repo for the
     // human to review — a throwaway worktree would strand them on a cez/
     // branch (and a stale base once hid the config entirely: run 9788d87f).
-    expect(prefill.worktree).toBe(false)
+    // That is the source's property, never a sticky draft choice (PR #925 review).
+    expect(prefill).not.toHaveProperty('worktree')
+    expect(runsInPlace(prefill.source)).toBe(true)
+    expect(runsInPlace({ source: 'skill', ref: 'om-fix' })).toBe(false)
+    expect(runsInPlace(null)).toBe(false)
     expect(prefill.text).toContain('Configure the multi-model agent harness')
   })
 

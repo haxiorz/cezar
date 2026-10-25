@@ -327,14 +327,21 @@ export function harnessSetupPrefill(): {
   composerMode: 'task'
   source: TaskSource
   text: string
-  worktree: false
 } {
   return {
     composerMode: 'task',
-    source: { source: 'skill', ref: 'cez-setup-harness' },
+    source: { source: 'skill', ref: HARNESS_SETUP_SKILL },
     text: 'Configure the multi-model agent harness for this repository — detect and bind the reviewer and worker models I actually have access to.',
-    worktree: false,
   }
+}
+
+export const HARNESS_SETUP_SKILL = 'cez-setup-harness'
+
+/** The setup task runs in the checkout as a property of its SOURCE, never as a Worktree choice
+ *  written into the sticky draft: that choice outlived setup and put every later ordinary task in
+ *  place (PR #925 review). */
+export function runsInPlace(source: TaskSource | null | undefined): boolean {
+  return source?.source === 'skill' && source.ref === HARNESS_SETUP_SKILL
 }
 
 /** The harness workflow a source selects, or null — the switch that shows the harness panel,
