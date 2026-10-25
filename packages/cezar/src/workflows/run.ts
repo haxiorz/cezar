@@ -7307,9 +7307,10 @@ export class RunManager {
     let phaseInfrastructureFailure: string | null = null;
     const phaseToolCommandBytes = new Map<string, number>();
 
-    const stepRecord = this.store.getRun(runId)?.steps.find((s) => s.id === step.id);
-    const startTokens = stepRecord?.tokensUsed ?? 0;
-    let stepCost = stepRecord?.costUsd ?? 0;
+    // Council reviewers share one step id: each session adds ITS increments to the stored totals,
+    // or the last writer's `start + own` erased its siblings' usage (PR #925 review).
+    const storedStep = () => this.store.getRun(runId)?.steps.find((s) => s.id === step.id);
+    let sessionTokens = 0;
     let turnText = '';
     let sessionError: string | undefined;
     const sink = this.makeUiSink(runId, step.id);
@@ -7391,11 +7392,12 @@ export class RunManager {
         this.store.updateStep(runId, step.id, { sessionId: event.sessionId, backend });
       }
       if (event.type === 'token-usage') {
-        this.store.updateStep(runId, step.id, { tokensUsed: startTokens + event.tokensUsed });
+        const added = Math.max(0, event.tokensUsed - sessionTokens);
+        sessionTokens = Math.max(sessionTokens, event.tokensUsed);
+        this.store.updateStep(runId, step.id, { tokensUsed: (storedStep()?.tokensUsed ?? 0) + added });
       }
       if (event.type === 'cost') {
-        stepCost += event.usd;
-        this.store.updateStep(runId, step.id, { costUsd: stepCost });
+        this.store.updateStep(runId, step.id, { costUsd: (storedStep()?.costUsd ?? 0) + event.usd });
       }
       if (event.type === 'turn-end') {
         // v2 `turn.completed` already flushed the coalescers; the v1 turn
@@ -7857,7 +7859,9 @@ export class RunManager {
       // events to the RunManager — only it knows how the session settled).
       sink.sessionEnded(state.cancelled ? 'cancelled' : 'end_turn');
       if (!state.cancelled && this.active.get(runId) === state) {
-        this.store.updateStep(runId, step.id, { tokensUsed: startTokens + result.tokensUsed });
+        const added = Math.max(0, result.tokensUsed - sessionTokens);
+        sessionTokens = Math.max(sessionTokens, result.tokensUsed);
+        this.store.updateStep(runId, step.id, { tokensUsed: (storedStep()?.tokensUsed ?? 0) + added });
       }
       return phaseInfrastructureFailure;
     } catch (err) {
