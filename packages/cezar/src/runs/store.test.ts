@@ -1838,6 +1838,7 @@ describe('RunStore — addStep lands at the execution point', () => {
   it('inserts a dynamic step before the first pending one, keeping execution order', () => {
     const store = RunStore.open(dataDir);
     const run = store.createRun({ title: 't', workflow: 'w', task: 'task', steps: harnessSteps() });
+    store.updateRun(run.id, { harness: { profile: 'standard', workflow: 'harness-implement-feature' } });
     // Preflight and capture ran; the driver then creates the baseline gate.
     store.updateStep(run.id, 'preflight', { status: 'done' });
     store.updateStep(run.id, 'capture', { status: 'done' });
@@ -1876,6 +1877,25 @@ describe('RunStore — addStep lands at the execution point', () => {
     store.addStep(run.id, { id: 'continue-1', name: 'Continue', kind: 'agent' });
 
     expect(store.getRun(run.id)!.steps.map((step) => step.id)).toEqual(['task', 'continue-1'])
+  })
+
+  // PR #925 review (fifth round): a cancelled walk leaves later steps pending, and slotting the
+  // Continue before them made a later Continue resume a stale session.
+  it('appends Continue after pending steps an ordinary walk never reached', () => {
+    const store = RunStore.open(dataDir);
+    const run = store.createRun({
+      title: 't',
+      workflow: 'w',
+      task: 'task',
+      steps: [
+        { id: 'plan', name: 'Plan', kind: 'agent' },
+        { id: 'check', name: 'Check', kind: 'check' },
+      ],
+    });
+    store.updateStep(run.id, 'plan', { status: 'cancelled' });
+    store.addStep(run.id, { id: 'continue-1', name: 'Continue', kind: 'agent' });
+
+    expect(store.getRun(run.id)!.steps.map((step) => step.id)).toEqual(['plan', 'check', 'continue-1'])
   })
 })
 

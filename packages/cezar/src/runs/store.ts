@@ -1482,14 +1482,14 @@ export class RunStore extends EventEmitter {
    *  not started yet — the harness predeclares its seven base steps and
    *  creates the rest (baseline gate, council rounds, fix rounds) as it goes,
    *  and appending those at the tail displayed Stage as "step 7 of 19" on a
-   *  run whose stage ran LAST (user report 2026-07-29). For ordinary runs
-   *  every earlier step is terminal by the time Continue adds one, so the
-   *  insertion point is the tail — exactly the old order. */
+   *  run whose stage ran LAST (user report 2026-07-29). Ordinary runs keep the
+   *  tail: a failed or cancelled walk leaves later steps pending, and a Continue
+   *  slotted before them resumed a stale session (PR #925 review). */
   addStep(runId: string, step: Pick<StepState, 'id' | 'name' | 'kind'>): void {
     const run = this.runs.get(runId);
     if (!run || run.steps.some((s) => s.id === step.id)) return;
     const created: StepState = { ...step, status: 'pending', iterations: 0, tokensUsed: 0 };
-    const firstPending = run.steps.findIndex((s) => s.status === 'pending');
+    const firstPending = run.harness ? run.steps.findIndex((s) => s.status === 'pending') : -1;
     if (firstPending === -1) run.steps.push(created);
     else run.steps.splice(firstPending, 0, created);
     this.touch(run);
