@@ -177,6 +177,12 @@ rl.on('line', (line) => {
       emit({ id: msg.id, error: { code: -32603, message: 'thread is busy compacting context' } });
       return;
     }
+    // Opt-in assertion: reasoning effort rides on turn/start, the only request codex reads it from.
+    const requiredEffort = process.env.MOCK_CODEX_REQUIRE_EFFORT;
+    if (requiredEffort && msg.params?.effort !== requiredEffort) {
+      emit({ id: msg.id, error: { code: -32602, message: `expected turn/start effort ${requiredEffort}, got ${msg.params?.effort}` } });
+      return;
+    }
     const turnId = scenario ? `turn_mock_${turnSeq}` : 'turn_mock_1';
     emit({ id: msg.id, result: { turn: { id: turnId } } });
     emit({ method: 'turn/started', params: { turn: { id: turnId, status: 'inProgress', items: [] } } });

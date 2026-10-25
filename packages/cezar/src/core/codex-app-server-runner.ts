@@ -437,10 +437,6 @@ class CodexSession implements AgentSession {
           ? 'workspace-write'
           : 'danger-full-access',
       approvalPolicy: 'never',
-      // Reasoning effort (user feedback 2026-07-24): the seam's neutral tier
-      // mapped to codex's own levels (`max` → `xhigh`), camelCase like the
-      // sibling overrides. `clean()` drops it when unset.
-      modelReasoningEffort: codexReasoningEffortOf(this.spec.reasoningEffort) ?? undefined,
       // Private MCP servers (spec 2026-10-07-private-project-mcp) ride in as per-server dotted
       // config overrides, so the user's own [mcp_servers] table is extended, never replaced.
       config: this.privateMcpConfig(),
@@ -510,10 +506,14 @@ class CodexSession implements AgentSession {
     // with its default (no summary), so the reasoning thread stays empty even
     // though the mapper and UI can render it. The override persists for this
     // turn and every subsequent turn, so seeding it on turn/start is enough.
+    // Reasoning effort (user feedback 2026-07-24), `max` → `xhigh`: only TurnStartParams carries it;
+    // thread/start and thread/resume dropped it silently (PR #925 review, codex-cli 0.159.2 schema).
+    const effort = codexReasoningEffortOf(this.spec.reasoningEffort);
     const res = await this.rpc.request('turn/start', {
       threadId: this.threadId,
       input,
       summary: reasoningSummary(),
+      ...(effort ? { effort } : {}),
     });
     this.activeTurnId = turnIdOf(res) ?? this.activeTurnId;
   }

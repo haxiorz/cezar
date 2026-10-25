@@ -126,6 +126,16 @@ describe('a teardown cezar initiated (codex app-server)', () => {
     await expect(session.result).resolves.toMatchObject({ sessionId: 'th_mock_1' });
   }, 15_000);
 
+  // PR #925 review: effort rode on thread/start, which codex ignores, so the Effort picker did nothing.
+  it('sends the reasoning effort on turn/start, mapped to codex levels', async () => {
+    const session = new CodexAppServerRunner({ bin: mockBin, timeoutMs: 0 }).startSession(
+      { userPrompt: 'hi', cwd: process.cwd(), reasoningEffort: 'max', env: { MOCK_CODEX_REQUIRE_EFFORT: 'xhigh' } },
+      undefined,
+      { autoEndAfterFirstTurn: true },
+    );
+    await expect(session.result).resolves.toMatchObject({ sessionId: 'th_mock_1' });
+  }, 15_000);
+
   it('surfaces a failed turn as an AgentEvent error', async () => {
     const runner = new CodexAppServerRunner({ bin: mockBin, timeoutMs: 0 });
     const events: AgentEvent[] = [];
