@@ -830,6 +830,50 @@ describe('harness API', () => {
       ]);
     });
 
+    // PR #925 review: Continue re-queues a harness run that already has a ledger. A message sent
+    // while it waited was stacked onto the folded prompt, which the resume ignores — acknowledged,
+    // never applied.
+    it('routes a message for a resumed harness run waiting in the queue to its ledger', async () => {
+      const run = store.createRun({ title: 't', workflow: HARNESS_FIX_ISSUE, task: 'x', steps: [] });
+      store.updateRun(run.id, { status: 'queued', harness: { profile: 'standard', workflow: HARNESS_FIX_ISSUE } });
+      saveLedger(dataDir, run.id, createLedger({
+        workflow: HARNESS_FIX_ISSUE,
+        requestedProfile: 'standard',
+        subject: { kind: 'brief', text: 'x' },
+      }));
+      const stacking = createApp({
+        repoRoot,
+        store,
+        version: '0.0.0-test',
+        providerAuth: connectedProviderAuth(),
+        manager: {
+          isActive: () => false,
+          sendMessage: () => false,
+          deferMessage: () => false,
+          // The engine stacks onto a run it still holds in its queue.
+          enqueueMessage: (runId: string) => {
+            const message = { id: 'stacked', text: 'stacked', createdAt: new Date().toISOString() };
+            store.updateRun(runId, { queuedMessages: [message] });
+            return message;
+          },
+        } as unknown as RunManager,
+      });
+
+      const res = await apiRequest(stacking, `/api/v1/runs/${run.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: 'Also handle X.' }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ queuedForPhase: true });
+      expect(store.getRun(run.id)?.queuedMessages ?? []).toEqual([]);
+      const after = readLedger(dataDir, run.id);
+      expect(after.status === 'valid' ? after.ledger.pendingMessages : []).toEqual([
+        expect.objectContaining({ text: 'Also handle X.' }),
+      ]);
+    });
+
     // PR #925 review: a message queued after an HA run's last agent boundary blocked stage forever.
     it('refuses a message for implemented high-assurance packet work', async () => {
       const run = store.createRun({ title: 't', workflow: HARNESS_FIX_ISSUE, task: 'x', steps: [] });

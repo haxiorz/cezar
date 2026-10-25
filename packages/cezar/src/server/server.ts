@@ -5739,6 +5739,9 @@ export function createApp(deps: ServerDeps) {
       //   starting up  → buffered  · anything else → 409, exactly as before
       if (manager.sendMessage(id, content)) return c.json({ delivered: true });
 
+      // A harness run with a ledger resumes from it, never from its folded prompt: a message stacked
+      // onto a resumed run waiting in the queue was acknowledged and never applied (PR #925 review).
+      const harnessResumes = Boolean(run.harness) && readLedger(dataDir, id).status !== 'missing';
       const currentRun = store.getRun(id);
       const stack = currentRun?.queuedMessages ?? [];
       // Bounds apply only to a message that is actually about to be stacked. Without this
@@ -5746,7 +5749,7 @@ export function createApp(deps: ServerDeps) {
       // long` when the truthful answer is `409 session closed`. The status read is safe
       // here because it only decides whether to reject EARLY — `enqueueMessage` still
       // re-checks against the engine's own queue before writing anything.
-      if (currentRun?.status === 'queued') {
+      if (currentRun?.status === 'queued' && !harnessResumes) {
         if (stack.length >= MAX_QUEUED_MESSAGES) {
           return c.json({ error: `too many queued messages — ${MAX_QUEUED_MESSAGES} message limit` }, 400);
         }
@@ -5769,7 +5772,7 @@ export function createApp(deps: ServerDeps) {
         }
       }
 
-      const queued = manager.enqueueMessage(id, content);
+      const queued = harnessResumes ? null : manager.enqueueMessage(id, content);
       if (queued) return c.json({ queued: true, message: queued });
       if (!run.harness && manager.deferMessage(id, content)) return c.json({ deferred: true });
       if (
