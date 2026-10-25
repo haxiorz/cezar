@@ -7373,7 +7373,9 @@ export class RunManager {
       emit({ ...event, stepId: step.id });
       if (event.type === 'error') {
         sessionError ??= event.message;
-        state.session?.interrupt();
+        // A concurrent council reviewer never takes the singular slot: interrupting it left the
+        // failed session open until the phase timeout, holding its run's slot (PR #925 review).
+        (concurrentPhase ? liveSession : state.session)?.interrupt();
         return;
       }
       if (sessionError) return;

@@ -1547,6 +1547,41 @@ describe('a turn that parks on its sub-agents while declaring its PR is not "nee
     expect(parked?.prNumber).toBe(4242);
   }, 30_000);
 
+  // PR #925 review: a concurrent council reviewer never takes the singular session slot, so its
+  // error interrupted whatever held that slot instead, and the failed session itself lived on.
+  it('interrupts a concurrent harness phase whose session reports an error', async () => {
+    const record = manager.startRun(SINGLE_STEP, { task: 'just do the thing', worktree: false });
+    currentId = record.id;
+    await waitFor(record.id, (r) => r?.status === 'waiting');
+    const internals = manager as unknown as {
+      active: Map<string, unknown>;
+      runAgentStep: (...args: unknown[]) => Promise<string | null>;
+    };
+    const started = Date.now();
+    const failure = await internals.runAgentStep.call(
+      manager,
+      record.id,
+      internals.active.get(record.id),
+      { id: 'review-r1', name: 'Reviewer', prompt: 'mock:auth-error' },
+      { task: 'x', worktree: false },
+      [],
+      null,
+      false,
+      () => undefined,
+      undefined,
+      'claude',
+      undefined,
+      undefined,
+      [],
+      undefined,
+      { concurrent: true, resultPath: join(repoRoot, 'phase-review-result.json'), timeoutMs: 20_000 },
+    );
+    expect(failure).toMatch(/authenticate/i);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    // The error interrupted whichever session held the slot — here the parked task's own.
+    expect(store.getRun(record.id)?.status).toBe('waiting');
+  }, 40_000);
+
   it('parks running/monitoring at the continuation turn-end (runContinuation)', async () => {
     const record = manager.startRun(SINGLE_STEP, { task: 'just do the thing', worktree: false });
     currentId = record.id;
