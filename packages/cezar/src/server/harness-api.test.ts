@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Hono } from 'hono';
@@ -1188,6 +1188,40 @@ describe('harness API', () => {
       expect(body.prompt).toBeNull();
       expect(body.result).toBeNull();
     });
+
+    // PR #925 review (fifth round): agent-output/ is model-writable — a FIFO hung the server and
+    // a symlink served any host file.
+    it.skipIf(process.platform === 'win32')('serves neither a planted symlink nor a FIFO, and never blocks', async () => {
+      const { run, artifactDir } = seedRun([]);
+      const output = join(artifactDir, 'agent-output');
+      mkdirSync(output, { recursive: true });
+      const secret = join(dataDir, 'host-secret.txt');
+      writeFileSync(secret, 'host secret', 'utf8');
+      symlinkSync(secret, join(output, 'phase-review-result.json'));
+      execFileSync('mkfifo', [join(output, 'phase-review-prompt.md')]);
+      // A symlinked DIRECTORY on the way: the final component is a plain file behind it.
+      symlinkSync(dataDir, join(output, 'packet'));
+      const ledger = readLedger(dataDir, run.id);
+      if (ledger.status !== 'valid') throw new Error('seed failed');
+      ledger.ledger.invocations = [
+        reviewer({
+          promptPath: join(output, 'phase-review-prompt.md'),
+          artifactPath: join(output, 'phase-review-result.json'),
+        }),
+        reviewer({ id: 'inv-2', artifactPath: join(output, 'packet', 'host-secret.txt') }),
+      ] as typeof ledger.ledger.invocations;
+      saveLedger(dataDir, run.id, ledger.ledger);
+
+      const res = await apiRequest(app, `/api/v1/runs/${run.id}/harness/invocations/inv-1`);
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { prompt: string | null; result: string | null };
+      expect(body.result).toBeNull();
+      expect(body.prompt).toBeNull();
+      const viaDir = await apiRequest(app, `/api/v1/runs/${run.id}/harness/invocations/inv-2`);
+      expect(viaDir.status).toBe(200);
+      expect(((await viaDir.json()) as { result: string | null }).result).toBeNull();
+    }, 10_000);
 
     it('reports an unrecorded prompt as null rather than failing', async () => {
       const { run } = seedRun([]);

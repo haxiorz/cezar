@@ -13,7 +13,7 @@ import { E2E_SETUP_TASK, e2eCredentialsAmong, e2eSetupWorkflow, latestE2eSetupRu
 import { createTrackerService } from './tracker/index.ts';
 import { TrackerWatches } from './tracker/watch.ts';
 import { readTrackerAssociation, writeTrackerAssociation, clearTrackerAssociation } from '../tracker-association.ts';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import {
   detectedUrlsSchema, discoveredCommandsSchema,
   startAppSetSchema, startAppStateSchema, terminalCreateSchema, terminalInputSchema, terminalOutputQuerySchema, terminalOutputSchema,
@@ -221,6 +221,7 @@ import { providerFamilyOf } from '../harness/model-family.ts';
 import { canonicalizeAdvisorRefs } from '../harness/advisor-identity.ts';
 import { opencodeSeatingError, runnerEquivalentOf } from '../harness/reviewer-binding.ts';
 import { releaseIssueClaim } from '../harness/issue-claim.ts';
+import { readHarnessFsEntry } from '../harness/fs-read.ts';
 import {
   HARNESS_PROFILES,
   type HarnessProfile,
@@ -4853,6 +4854,7 @@ export function createApp(deps: ServerDeps) {
   };
 
   const HARNESS_ARTIFACT_CHAR_CAP = 400_000;
+  const HARNESS_ARTIFACT_READ_MAX_BYTES = 8 * 1024 * 1024;
 
   const MULTI_MODEL_DISABLED_ERROR =
     'Multi-model runs are disabled for this repository. Set "multiModel": true in .ai/cezar/config.json to enable them.';
@@ -5065,7 +5067,16 @@ export function createApp(deps: ServerDeps) {
         const full = resolve(path);
         if (full !== artifactRoot && !full.startsWith(`${artifactRoot}${sep}`)) return null;
         try {
-          const text = readFileSync(full, 'utf8');
+          // agent-output/ is model-writable: its directories must resolve inside the artifact root,
+          // then one no-follow, non-blocking, bounded read — a FIFO there hung the server and a
+          // symlink served any host file (PR #925 review).
+          const realRoot = realpathSync(artifactRoot);
+          const parent = realpathSync(dirname(full));
+          if (parent !== realRoot && !parent.startsWith(`${realRoot}${sep}`)) return null;
+          const entry = readHarnessFsEntry(full, HARNESS_ARTIFACT_READ_MAX_BYTES);
+          if (entry.kind !== 'file') return null;
+          if (entry.content === null) return `… artifact too large to show (${entry.stat.size} bytes)`;
+          const text = entry.content.toString('utf8');
           return text.length > HARNESS_ARTIFACT_CHAR_CAP
             ? `${text.slice(0, HARNESS_ARTIFACT_CHAR_CAP)}\n\n… truncated (${text.length} characters total)`
             : text;
