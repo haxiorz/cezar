@@ -76,6 +76,10 @@ export function councilQuorum(
   return { ok: true, degraded: policy.mode === 'quorum' && failed.length > 0, completed, failed };
 }
 
+/** A reviewer that edited what it was judging is an integrity failure, never retried: attempt 2
+ *  would review its own edit (PR #925 review). */
+export const REVIEWER_MUTATION_FAILURE = 'reviewer mutated the worktree or index';
+
 /**
  * Whether a second attempt could plausibly differ.
  *
@@ -86,7 +90,7 @@ export function councilQuorum(
  * connection, a malformed result) can genuinely differ on a retry.
  */
 export function isRetryableReviewerFailure(failure: string): boolean {
-  return !/timed?\s?out|timeout/i.test(failure);
+  return !/timed?\s?out|timeout/i.test(failure) && !failure.startsWith(REVIEWER_MUTATION_FAILURE);
 }
 
 /** How many council reviewers may run at once. The om runtime this was ported

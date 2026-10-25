@@ -56,6 +56,7 @@ import {
   councilQuorum,
   isRetryableReviewerFailure,
   pool,
+  REVIEWER_MUTATION_FAILURE,
   type CouncilOutcome,
 } from './council-quorum.js';
 import { providerFamilyOf } from './model-family.js';
@@ -640,6 +641,9 @@ const PHASE_TIMEOUTS_MS: Record<string, number> = {
   review: 30 * 60_000,
 };
 
+const UNAPPLIED_MESSAGES_REASON =
+  'operator messages arrived after the final safe agent boundary and were not applied: ';
+
 export function harnessArtifactDir(dataDir: string, runId: string): string {
   return join(dataDir, 'runs', `${runId}-harness`);
 }
@@ -863,6 +867,11 @@ export async function runHarnessDriver(
       council,
     ];
   };
+  // A stage blocked on unapplied messages hands every one to this resume as feedback, assigned or
+  // not: the phase that took one may never run again, and the block had no other exit (PR #925 review).
+  const blockedOnMessages =
+    ledger.outcome.status === 'blocked' &&
+    ledger.outcome.blockingReasons.some((reason) => reason.startsWith(UNAPPLIED_MESSAGES_REASON));
   // A block without a pending decision is re-derived by this entry; left in
   // place it outlived a clean resume, and staging promotes only `pending` (PR #925 review).
   if (ledger.outcome.status === 'blocked' && !ledger.outcome.pendingDecision) {
@@ -1137,7 +1146,7 @@ export async function runHarnessDriver(
   };
 
   const feedback = ledger.pendingMessages.filter(
-    (message) => !message.consumedAt && !message.assignedToPhaseId,
+    (message) => !message.consumedAt && (!message.assignedToPhaseId || blockedOnMessages),
   );
   const feedbackPhase = ledger.outcome.status === 'no-action'
     ? 'qualify'
@@ -1175,6 +1184,13 @@ export async function runHarnessDriver(
       invocation.status = 'interrupted';
       invocation.inputSha256 = sha256(`superseded:${invocation.inputSha256}`);
       invocation.error = 'superseded by operator feedback';
+    }
+    // A later phase's unconsumed message goes with the restart, or nothing consumes it once that
+    // phase is superseded and staging blocks on it (PR #925 review).
+    for (const message of ledger.pendingMessages) {
+      if (!message.consumedAt && message.assignedToPhaseId && invalidated.has(message.assignedToPhaseId)) {
+        message.assignedToPhaseId = feedbackPhase;
+      }
     }
     for (const message of feedback) message.assignedToPhaseId = feedbackPhase;
     phase.status = 'pending';
@@ -2384,7 +2400,7 @@ export async function runHarnessDriver(
     try {
       const after = await snapshotReviewSubject(host.cwd);
       if (after !== before) {
-        return 'reviewer mutated the worktree or index; review results were rejected and the changed subject was preserved for manual recovery';
+        return `${REVIEWER_MUTATION_FAILURE}; review results were rejected and the changed subject was preserved for manual recovery`;
       }
     } catch (error) {
       return `could not verify the worktree after the read-only review: ${
@@ -2392,6 +2408,14 @@ export async function runHarnessDriver(
       }`;
     }
     return failure;
+  };
+  /** A council judges one subject: a reviewer that edited it voids the round even when the rest
+   *  reached quorum, or its edit would stage as `ready` (PR #925 review). */
+  const councilMutationIssue = (outcomes: readonly CouncilOutcome[]): string | null => {
+    const mutated = outcomes.find((outcome) => outcome.reason?.startsWith(REVIEWER_MUTATION_FAILURE));
+    return mutated
+      ? `council reviewer ${mutated.label} edited the review subject, so this round is void; the changed worktree was preserved for manual recovery`
+      : null;
   };
 
   /** One packet-less advisor council op (spec 2026-07-24-advisor-reviewers):
@@ -2476,6 +2500,9 @@ export async function runHarnessDriver(
         d.kind === 'council.retry' &&
         d.detail === councilDecisionDetail({ council, round, subjectSha256 }),
     ).length;
+  const priorReviewerFailure = (invocationId: string): string =>
+    ledger.invocations.find((invocation) => invocation.id === invocationId)?.error ??
+    'failed before the recorded proceed decision';
   const councilProceedAccepted = (
     council: CouncilKind,
     round: number,
@@ -2591,6 +2618,8 @@ export async function runHarnessDriver(
     artifact?: string;
     /** Extra attempts granted by recorded `council.retry` decisions. */
     retryAllowance?: number;
+    /** A recorded `council.proceed`: a member that already failed gets no new attempt. */
+    proceedAccepted?: boolean;
   }): Promise<{ rows: Array<Record<string, unknown>>; error: string | null } | null> => {
     const configSource = ledger.trustedConfig?.path ?? join(host.cwd, '.ai', 'agentic.config.json');
     const rows: Array<Record<string, unknown>> = [];
@@ -2717,7 +2746,8 @@ export async function runHarnessDriver(
           });
           continue;
         }
-        if (attemptsForInput(id, inputSha256) >= 2 + (op.retryAllowance ?? 0)) {
+        const attempts = attemptsForInput(id, inputSha256);
+        if (attempts >= 2 + (op.retryAllowance ?? 0) || (op.proceedAccepted && attempts > 0)) {
           rows.push({
             id: member.label,
             runner: 'harness',
@@ -4084,13 +4114,16 @@ export async function runHarnessDriver(
                 message: `reused completed reviewer ${label} from the durable ledger`,
               });
             }
-            let lastFailure: string | null = null;
-            let lastContractFailure: string | null = null;
             const priorAttempts = attemptsForInput(invocationId, inputSha256);
+            // "Proceed with the survivors" ignores a reviewer that already failed: paying for it
+            // again before the decision applies is what the user declined (PR #925 review).
+            const proceeding = priorAttempts > 0 && councilProceedAccepted('spec', sround, specSubjectSha256);
+            let lastFailure: string | null = proceeding ? priorReviewerFailure(invocationId) : null;
+            let lastContractFailure: string | null = null;
             for (
               let attempt = priorAttempts + 1;
               // A recorded `council.retry` decision extends the budget of 2.
-              attempt <= 2 + councilRetryAllowance('spec', sround, specSubjectSha256) && parsed === null;
+              !proceeding && attempt <= 2 + councilRetryAllowance('spec', sround, specSubjectSha256) && parsed === null;
               attempt += 1
             ) {
               const attemptPrompt =
@@ -4205,6 +4238,7 @@ export async function runHarnessDriver(
                   round: sround,
                   members: specCouncilMembers,
                   retryAllowance: councilRetryAllowance('spec', sround, specSubjectSha256),
+                  proceedAccepted: councilProceedAccepted('spec', sround, specSubjectSha256),
                   criteriaText: `${[
                       `Spec council criteria (run ${host.runId}).`,
                       ``,
@@ -4220,6 +4254,14 @@ export async function runHarnessDriver(
           // A cancelled reviewer records no outcome: gating on the survivors would park a
           // stopped run on a false "below quorum" decision (PR #925 review).
           if (host.isCancelled()) return null;
+          const specSubjectIssue = councilMutationIssue(outcomes);
+          if (specSubjectIssue) {
+            finishPhase(ledger, councilId, 'failed', specSubjectIssue);
+            persist();
+            host.setStepStatus(councilId, 'failed', specSubjectIssue);
+            emitPhase(councilId);
+            return specSubjectIssue;
+          }
           if (specAdvisorWork !== null) {
             const advisorRun = specAdvisorRun;
             if (advisorRun === null) return null;
@@ -4970,13 +5012,16 @@ export async function runHarnessDriver(
               message: `reused completed reviewer ${label} from the durable ledger`,
             });
           }
-          let lastFailure: string | null = null;
-          let lastContractFailure: string | null = null;
           const priorAttempts = attemptsForInput(invocationId, inputSha256);
+          // "Proceed with the survivors" ignores a reviewer that already failed: paying for it
+          // again before the decision applies is what the user declined (PR #925 review).
+          const proceeding = priorAttempts > 0 && councilProceedAccepted('implementation', round, implementationSubjectSha256);
+          let lastFailure: string | null = proceeding ? priorReviewerFailure(invocationId) : null;
+          let lastContractFailure: string | null = null;
           for (
             let attempt = priorAttempts + 1;
             // A recorded `council.retry` decision extends the budget of 2.
-            attempt <= 2 + councilRetryAllowance('implementation', round, implementationSubjectSha256) && parsed === null;
+            !proceeding && attempt <= 2 + councilRetryAllowance('implementation', round, implementationSubjectSha256) && parsed === null;
             attempt += 1
           ) {
             const attemptPrompt =
@@ -5093,6 +5138,7 @@ export async function runHarnessDriver(
                 round,
                 members: implCouncilMembers,
                 retryAllowance: councilRetryAllowance('implementation', round, implementationSubjectSha256),
+                proceedAccepted: councilProceedAccepted('implementation', round, implementationSubjectSha256),
                 criteriaText: `${[
                     `Role-based cezar council criteria (run ${host.runId}).`,
                     ``,
@@ -5111,6 +5157,14 @@ export async function runHarnessDriver(
         const settledAdvisorRun = await settleCouncilGroups(runnerReviewerWork, advisorWork);
         // See the spec council: a stop is not a reviewer failure (PR #925 review).
         if (host.isCancelled()) return null;
+        const implSubjectIssue = councilMutationIssue(outcomes);
+        if (implSubjectIssue) {
+          finishPhase(ledger, reviewId, 'failed', implSubjectIssue);
+          persist();
+          host.setStepStatus(reviewId, 'failed', implSubjectIssue);
+          emitPhase(reviewId);
+          return implSubjectIssue;
+        }
         if (advisorWork !== null) {
           const advisorRun = settledAdvisorRun;
           if (advisorRun === null) return null;
@@ -5308,8 +5362,9 @@ export async function runHarnessDriver(
     );
     if (unconsumedMessages.length > 0) {
       const reason =
-        `operator messages arrived after the final safe agent boundary and were not applied: ` +
-        unconsumedMessages.map((message) => message.id).join(', ');
+        UNAPPLIED_MESSAGES_REASON +
+        unconsumedMessages.map((message) => message.id).join(', ') +
+        ' — Continue applies them as feedback';
       setOutcome({ status: 'blocked', blockingReasons: [reason] });
       return reason;
     }

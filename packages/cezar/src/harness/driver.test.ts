@@ -1116,6 +1116,63 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(loadLedger(first.host.dataDir, first.host.runId)?.loops.fixRounds).toBe(0);
   });
 
+  // PR #925 review: fix-2 took a message and failed; feedback then restarted at implement, round 1
+  // approved, and the message — still assigned to the superseded fix-2 — blocked staging forever.
+  it('hands a superseded phase’s unconsumed message to the feedback restart', async () => {
+    const first = makeHarness(dir);
+    first.agentBehavior.set('review', (req) => {
+      const external = loadLedger(first.host.dataDir, first.host.runId)!;
+      external.pendingMessages.push({ id: 'during-review', text: 'Keep the alias.', createdAt: new Date().toISOString() });
+      saveLedger(first.host.dataDir, first.host.runId, external);
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify({ verdict: 'request_changes', findings: [{ severity: 'blocker', title: 'TOCTOU remains' }] }),
+        'utf8',
+      );
+      return null;
+    });
+    first.agentBehavior.set('fix-2', () => 'Claude usage limit reached');
+    expect(await runHarnessDriver(first.host, input, first.deps)).toMatch(/usage limit/);
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    expect(ledger.pendingMessages[0]).toMatchObject({ id: 'during-review', assignedToPhaseId: 'fix-2' });
+    ledger.pendingMessages.push({ id: 'feedback', text: 'Also keep the order.', createdAt: new Date().toISOString() });
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+
+    const resumed = makeHarness(dir);
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+
+    const after = loadLedger(first.host.dataDir, first.host.runId)!;
+    expect(after.pendingMessages.map((message) => [message.id, message.consumedByPhaseId])).toEqual([
+      ['during-review', 'implement'],
+      ['feedback', 'implement'],
+    ]);
+    expect(after.stage.status).toBe('staged');
+  });
+
+  it('applies the messages a stage blocked on at the next resume, assigned or not', async () => {
+    const first = makeHarness(dir);
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    ledger.pendingMessages.push({
+      id: 'stranded',
+      text: 'Keep the alias.',
+      createdAt: new Date().toISOString(),
+      assignedToPhaseId: 'fix-2',
+    });
+    ledger.stage = { status: 'pending' };
+    ledger.outcome = {
+      status: 'blocked',
+      blockingReasons: ['operator messages arrived after the final safe agent boundary and were not applied: stranded'],
+    };
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+
+    const resumed = makeHarness(dir);
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+
+    expect(loadLedger(first.host.dataDir, first.host.runId)?.pendingMessages[0])
+      .toMatchObject({ consumedByPhaseId: 'implement' });
+  });
+
   /**
    * Regression (review 2026-07-27): a reviewer that lists a blocker and still
    * labels the pass "approve" used to end the fix loop and stage the run as
@@ -2789,6 +2846,43 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(h.ops.some((o) => o.id === 'review')).toBe(true);
   });
 
+  // PR #925 review: the mutating attempt was retried, attempt 2 approved its own edit, and the
+  // edit staged as `ready` on a review the rest of the council never saw.
+  it('voids a council round a reviewer edited instead of retrying it into a staged result', async () => {
+    const h = makeHarness(dir);
+    for (const phase of ['qualify', 'diagnose', 'implement']) {
+      h.agentBehavior.set(phase, (req) => {
+        writeFileSync(req.resultPath, JSON.stringify(phaseDefaults[phase]), 'utf8');
+        return null;
+      });
+    }
+    const file = join(dir, 'src', 'a.ts');
+    h.deps.snapshotReviewSubject = async () => {
+      try {
+        return createHash('sha256').update(readFileSync(file)).digest('hex');
+      } catch {
+        return 'untouched';
+      }
+    };
+    let reviewerAttempts = 0;
+    h.agentBehavior.set('review', (req) => {
+      reviewerAttempts += 1;
+      if (reviewerAttempts === 1) {
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, 'the reviewer rewrote this\n', 'utf8');
+      }
+      writeFileSync(req.resultPath, JSON.stringify({ verdict: 'approve', findings: [] }), 'utf8');
+      return null;
+    });
+
+    const error = await runHarnessDriver(h.host, { ...input, roles }, h.deps);
+
+    expect(error).toMatch(/council reviewer .* edited the review subject, so this round is void/);
+    expect(reviewerAttempts).toBe(1);
+    expect(h.calls.map((call) => call.id)).not.toContain('stage');
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.stage.status).not.toBe('staged');
+  });
+
   it('runs a Codex and gateway lineup when the optional Claude sandbox is unavailable', async () => {
     const guard = vi.spyOn(claudeGuard, 'createClaudeStageOnlySettings').mockImplementation(() => {
       throw new Error('optional Claude sandbox is unavailable');
@@ -3102,9 +3196,8 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
   it('a recorded proceed decision continues with the survivors, loudly', async () => {
     const h = makeHarness(dir);
     const councilCalls = advisorsAlwaysFail(h);
-    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toMatch(/quorum/);
-    // Advisors auto-spend their second attempt on the next resume and fail
-    // again — exhausting the automatic budget before the decision applies.
+    // Decided at the FIRST pause: pre-spending the budget with an extra resume hid that the
+    // decision used to buy the failed advisors a second paid attempt (PR #925 review).
     expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toMatch(/quorum/);
 
     const decided = loadLedger(h.host.dataDir, h.host.runId)!;
@@ -3120,13 +3213,45 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
 
     expect(resumed).toBeNull();
     expect(h.calls.map((c) => c.id)).toContain('stage');
-    // The decision never buys another advisor attempt — budget stayed at 2.
-    expect(councilCalls).toHaveLength(2);
+    // The decision never buys another advisor attempt.
+    expect(councilCalls).toHaveLength(1);
     const ledger = loadLedger(h.host.dataDir, h.host.runId);
     expect(ledger?.outcome.status).toBe('ready');
     expect(ledger?.outcome.pendingDecision).toBeUndefined();
     const notes = h.events.filter((e) => e.type === 'note').map((e) => String(e.message));
     expect(notes.some((n) => n.includes('proceeds WITHOUT quorum'))).toBe(true);
+  });
+
+  it('a recorded proceed decision never re-runs a session reviewer that already failed', async () => {
+    const h = makeHarness(dir);
+    h.setCouncilBehavior((ids) => ({
+      ok: true,
+      result: {
+        verdict: 'approve',
+        reviewers: ids.map((id) => ({ id, status: 'completed', review: { verdict: 'approve', findings: [] } })),
+      },
+    }));
+    // A timeout is never retried, so the first pause leaves this reviewer one attempt short.
+    let sessionReviews = 0;
+    h.agentBehavior.set('review', () => {
+      sessionReviews += 1;
+      return 'claude timed out after 30m and was stopped';
+    });
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toMatch(/quorum/);
+    expect(sessionReviews).toBe(1);
+
+    const decided = loadLedger(h.host.dataDir, h.host.runId)!;
+    decided.decisions.push({
+      at: new Date().toISOString(),
+      kind: 'council.proceed',
+      by: 'user',
+      detail: recordedDecisionDetail(decided),
+    });
+    saveLedger(h.host.dataDir, h.host.runId, decided);
+
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toBeNull();
+    expect(sessionReviews).toBe(1);
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.outcome.status).toBe('ready');
   });
 
   it('a recorded retry decision buys the failed reviewers one more attempt', async () => {
