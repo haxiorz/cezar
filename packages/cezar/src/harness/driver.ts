@@ -1072,7 +1072,10 @@ export async function runHarnessDriver(
     request: HarnessAgentPhaseRequest,
   ): Promise<string | null> => {
     let guardEnv: Record<string, string> = {};
-    if ((request.runner ?? 'claude') === 'claude') {
+    // A phase without a role runs on Claude, and says so: left unset it fell to the task's runner
+    // (OpenCode, Cursor…) with no guard or sandbox, while the ledger recorded Claude (PR #925 review).
+    const runner = request.runner ?? 'claude';
+    if (runner === 'claude') {
       try {
         claudeGuard ??= createClaudeStageOnlySettings(artifactDir, host.cwd, agentOutputDir);
         guardEnv = claudeGuard.env;
@@ -1093,6 +1096,7 @@ export async function runHarnessDriver(
     }
     const failure = await host.runAgent({
       ...request,
+      runner,
       ...(trustedPrompt ? { skillSystemPrompt: trustedPrompt } : {}),
       env: {
         ...request.env,

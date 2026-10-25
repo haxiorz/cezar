@@ -90,6 +90,8 @@ function materializeTestSkill(dir: string, name: string, body = `# ${name}\n`): 
 
 function makeHarness(dir: string) {
   const calls: FakeCall[] = [];
+  /** The runner each agent launch asked for, in launch order. */
+  const agentRunners: Array<string | undefined> = [];
   const events: Array<{ type: string; [k: string]: unknown }> = [];
   const steps = new Map<string, string>();
 
@@ -139,6 +141,7 @@ function makeHarness(dir: string) {
     emit: (event) => events.push(event),
     runAgent: async (req) => {
       calls.push({ kind: 'agent', id: req.phaseId, skill: req.skill });
+      agentRunners.push(req.runner);
       const base = req.phaseId.replace(/-\d+$/, '');
       const behavior = agentBehavior.get(req.phaseId) ?? agentBehavior.get(base);
       if (behavior) return behavior(req);
@@ -370,6 +373,7 @@ function makeHarness(dir: string) {
     host,
     deps,
     calls,
+    agentRunners,
     ops,
     events,
     steps,
@@ -1428,6 +1432,15 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(h.calls.map((c) => c.id)).not.toContain('stage');
     const notes = h.events.filter((e) => e.type === 'note').map((e) => String(e.message));
     expect(notes.some((n) => n.includes('refusing to execute a modified runtime'))).toBe(true);
+  });
+
+  // PR #925 review: a phase without a role left `runner` unset, so it ran on the task's runner
+  // (OpenCode, Cursor…) with no guard or sandbox, while the ledger recorded Claude.
+  it('runs every role-less phase on Claude, the runner its guard and ledger assume', async () => {
+    const h = makeHarness(dir);
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    expect(h.agentRunners.length).toBeGreaterThan(0);
+    expect(h.agentRunners).toEqual(h.agentRunners.map(() => 'claude'));
   });
 
   it('rejects a review result when the reviewer mutates the worktree or index', async () => {
