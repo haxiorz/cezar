@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -12,7 +13,7 @@ import {
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, sep } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as claudeGuard from './claude-guard.js';
 import {
@@ -2877,7 +2878,7 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
 
     const error = await runHarnessDriver(h.host, { ...input, roles }, h.deps);
 
-    expect(error).toMatch(/council reviewer .* edited the review subject, so this round is void/);
+    expect(error).toMatch(/review subject changed during the council, so this round is void/);
     expect(reviewerAttempts).toBe(1);
     expect(h.calls.map((call) => call.id)).not.toContain('stage');
     expect(loadLedger(h.host.dataDir, h.host.runId)?.stage.status).not.toBe('staged');
@@ -4202,6 +4203,31 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
    * can no longer trigger this; for changes that are real, the council retries
    * once against the current subject before giving up.
    */
+  // PR #925 review: the council wrote `.ai/qa/cez-council-*` inside the worktree, unsandboxed and
+  // following links, so a model-planted symlink there redirected the write to a host file.
+  // PR #925 review: the runtime's default 3 attempts with escalating timeouts outlasted the op's
+  // own timeout, so one slow advisor got the op killed and every completed sibling recorded failed.
+  it('leaves advisor retries to cezar: the synthesized council runs each reviewer once', async () => {
+    const h = makeHarness(dir);
+    bindKimi(h);
+    expect(await runHarnessDriver(h.host, advisorInput, h.deps)).toBeNull();
+    const review = h.ops.find((op) => op.id === 'review')!;
+    const config = JSON.parse(readFileSync(review.args![review.args!.indexOf('--config') + 1]!, 'utf8')) as {
+      agentHarness: { profiles: Record<string, { retry?: unknown }> };
+    };
+    expect(config.agentHarness.profiles['cez-role-council']?.retry).toEqual({ maxAttempts: 1 });
+  });
+
+  it('gives the advisor council an output dir under the run artifacts, never the worktree', async () => {
+    const h = makeHarness(dir);
+    bindKimi(h);
+    expect(await runHarnessDriver(h.host, advisorInput, h.deps)).toBeNull();
+    const review = h.ops.find((op) => op.id === 'review')!;
+    const outputDir = review.args![review.args!.indexOf('--output-dir') + 1]!;
+    expect(outputDir.startsWith(harnessArtifactDir(h.host.dataDir, h.host.runId) + sep)).toBe(true);
+    expect(outputDir).not.toContain(join('.ai', 'qa'));
+  });
+
   it('retries the advisor council once when the subject changed mid-council', async () => {
     const h = makeHarness(dir);
     bindKimi(h);
@@ -4218,12 +4244,23 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
       };
     });
     const error = await runHarnessDriver(h.host, advisorInput, h.deps);
-    expect(error).toBeNull();
     expect(h.ops.filter((o) => o.id === 'review')).toHaveLength(2);
     const notes = h.events.filter((e) => e.type === 'note').map((e) => String(e.message));
     expect(notes.some((n) => n.includes('retrying the council once against the current subject'))).toBe(true);
-    const ledger = loadLedger(h.host.dataDir, h.host.runId);
-    expect(ledger?.stage.status).toBe('staged');
+    // A change that outlives the council voids the round: staging it would hand over a subject the
+    // gate never validated and part of the council never saw (PR #925 review).
+    expect(error).toMatch(/review subject changed during the council, so this round is void/);
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.stage.status).not.toBe('staged');
+
+    // Continue re-validates and re-reviews the subject as it now stands.
+    const validated: string[] = [];
+    h.deps.validate = async (commands) => {
+      validated.push(subject);
+      return commands.map((command) => ({ command, status: 'passed' as const, exitCode: 0, evidence: 'ok' }));
+    };
+    expect(await runHarnessDriver(h.host, advisorInput, h.deps)).toBeNull();
+    expect(validated).toContain('changed-during-council');
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.stage.status).toBe('staged');
   });
 
   function scriptCouncil(
@@ -4269,6 +4306,53 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
       kill: () => undefined,
     });
   }
+
+  // PR #925 review: the leaf check followed a symlinked DIRECTORY, so the unsandboxed runtime read a
+  // file the sandbox denies (`ln -s ~/.ssh docs/k`) and sent it to the reviewer endpoints.
+  it.skipIf(process.platform === 'win32')('refuses a spec reported through a symlinked directory', async () => {
+    const h = makeHarness(dir);
+    bindKimi(h);
+    const outside = join(dir, '..', `outside-${basename(dir)}`);
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, 'id_ed25519'), 'PRIVATE KEY\n', 'utf8');
+    h.agentBehavior.set('spec', (req) => {
+      mkdirSync(join(dir, 'docs'), { recursive: true });
+      if (!existsSync(join(dir, 'docs', 'k'))) symlinkSync(outside, join(dir, 'docs', 'k'));
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify({ summary: 'spec', specPath: 'docs/k/id_ed25519', files: ['docs/k/id_ed25519'] }),
+        'utf8',
+      );
+      return null;
+    });
+    try {
+      const error = await runHarnessDriver(h.host, { ...advisorInput, workflow: HARNESS_IMPLEMENT_FEATURE }, h.deps);
+      expect(error).toMatch(/symlinked directory/);
+      expect(h.ops.some((op) => op.id === 'review')).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('hands the spec council runtime a copy of the verified spec, not a worktree path', async () => {
+    const h = makeHarness(dir);
+    bindKimi(h);
+    h.agentBehavior.set('spec', (req) => {
+      mkdirSync(join(dir, '.ai', 'specs'), { recursive: true });
+      writeFileSync(join(dir, '.ai', 'specs', 'feat.md'), '# feat\n', 'utf8');
+      writeFileSync(
+        req.resultPath,
+        JSON.stringify({ summary: 'spec', specPath: '.ai/specs/feat.md', files: ['.ai/specs/feat.md'] }),
+        'utf8',
+      );
+      return null;
+    });
+    await runHarnessDriver(h.host, { ...advisorInput, workflow: HARNESS_IMPLEMENT_FEATURE }, h.deps);
+    const review = h.ops.find((op) => op.id === 'review' && op.args?.includes('--artifact'))!;
+    const artifact = review.args![review.args!.indexOf('--artifact') + 1]!;
+    expect(artifact.startsWith(harnessArtifactDir(h.host.dataDir, h.host.runId) + sep)).toBe(true);
+    expect(readFileSync(artifact, 'utf8')).toBe('# feat\n');
+  });
 
   it('adopts a subject-rejected spec council in the retry when its contract names the current spec', async () => {
     const h = makeHarness(dir);
@@ -4562,9 +4646,9 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
 
     for (const o of h.ops) if (o.id === 'review') reviewArgs.push(o.args ?? []);
     expect(reviewArgs).toHaveLength(3); // spec ×2 rounds + implementation ×1
-    // The spec council reviews the SPEC FILE, not the diff.
+    // The spec council reviews the SPEC FILE, not the diff — as a verified copy (PR #925 review).
     expect(reviewArgs[0]).toContain('--artifact');
-    expect(reviewArgs[0]![reviewArgs[0]!.indexOf('--artifact') + 1]).toContain('.ai/specs/feat.md');
+    expect(reviewArgs[0]![reviewArgs[0]!.indexOf('--artifact') + 1]).toMatch(/spec-subject-r1\.md$/);
     expect(reviewArgs[2]).not.toContain('--artifact');
     const order = h.calls.map((c) => c.id);
     expect(order.indexOf('spec-2')).toBeGreaterThan(order.indexOf('spec-review'));

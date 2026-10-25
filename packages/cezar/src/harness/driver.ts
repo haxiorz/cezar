@@ -2328,7 +2328,10 @@ export async function runHarnessDriver(
     }
   }
   if (input.issueId) {
-    const claimed = acquireClaim(host.cwd, host.runId, input.issueId);
+    const claimed = acquireClaim(host.cwd, host.runId, input.issueId, {
+      dataDir: host.dataDir,
+      runExists: (runId) => readLedger(host.dataDir, runId).status !== 'missing',
+    });
     if (!claimed.ok) return claimed.error;
     ledger.claim = {
       held: true,
@@ -2409,13 +2412,21 @@ export async function runHarnessDriver(
     }
     return failure;
   };
-  /** A council judges one subject: a reviewer that edited it voids the round even when the rest
-   *  reached quorum, or its edit would stage as `ready` (PR #925 review). */
-  const councilMutationIssue = (outcomes: readonly CouncilOutcome[]): string | null => {
-    const mutated = outcomes.find((outcome) => outcome.reason?.startsWith(REVIEWER_MUTATION_FAILURE));
-    return mutated
-      ? `council reviewer ${mutated.label} edited the review subject, so this round is void; the changed worktree was preserved for manual recovery`
-      : null;
+  /** A council judges one subject. A change that outlives it voids the round even when the rest
+   *  reached quorum, or a subject no gate validated and part of the council never saw would stage as
+   *  `ready` (PR #925 review). Nobody can attribute the change, so the message blames no reviewer. */
+  const councilSubjectIssue = async (
+    before: string,
+    current: () => Promise<string | null>,
+  ): Promise<string | null> => {
+    try {
+      if ((await current()) === before) return null;
+    } catch (error) {
+      return `could not verify the review subject after the council: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+    }
+    return 'the review subject changed during the council, so this round is void; the changed worktree was preserved for manual recovery, and Continue re-validates and re-reviews it';
   };
 
   /** One packet-less advisor council op (spec 2026-07-24-advisor-reviewers):
@@ -2623,12 +2634,9 @@ export async function runHarnessDriver(
   }): Promise<{ rows: Array<Record<string, unknown>>; error: string | null } | null> => {
     const configSource = ledger.trustedConfig?.path ?? join(host.cwd, '.ai', 'agentic.config.json');
     const rows: Array<Record<string, unknown>> = [];
-    const outputDir = join(
-      host.cwd,
-      '.ai',
-      'qa',
-      `cez-council-${host.runId.slice(0, 8)}-${op.kindTag}-r${op.round}`,
-    );
+    // Outside the worktree: the runtime writes here unsandboxed and follows links, so a model-planted
+    // symlink in a worktree folder redirected its writes to host files (PR #925 review).
+    const outputDir = join(artifactDir, `council-${op.kindTag}-r${op.round}`);
     const resultFile = join(outputDir, 'review-result.json');
     let subjectSha256: string;
     if (op.artifact) {
@@ -2818,6 +2826,10 @@ export async function runHarnessDriver(
           workers: [],
           reviewers: ids,
           reviewPolicy: { mode: 'all-required', requiredReviewers: ids },
+          // Cezar owns retries (two per reviewer, never after a timeout). The runtime's own 3× with
+          // escalating timeouts outlasted this op, which then killed it and lost the reviews that
+          // had completed (PR #925 review).
+          retry: { maxAttempts: 1 },
         },
       };
       configJson.agentHarness = harnessObj;
@@ -2825,7 +2837,6 @@ export async function runHarnessDriver(
       writeFileSync(councilConfigPath, `${JSON.stringify(configJson, null, 2)}\n`, 'utf8');
       const criteriaPath = join(artifactDir, `council-criteria-${op.kindTag}-r${op.round}.md`);
       writeFileSync(criteriaPath, op.criteriaText, 'utf8');
-      await excludeFromGit(host.cwd, '.ai/qa/');
       const timeoutMs =
         Math.max(600_000, ...ids.map((id) => Number(harnessObj.models?.[id]?.timeoutMs) || 0)) + 120_000;
       for (const member of pendingMembers) {
@@ -3857,6 +3868,17 @@ export async function runHarnessDriver(
       if (!p || p.startsWith('/') || p.split('/').includes('..')) {
         return `returned an unsafe spec path: ${p}`;
       }
+      // Every directory, not only the leaf: through a symlinked one the unsandboxed runtime read a
+      // file the sandbox denies and sent it to the reviewers (PR #925 review).
+      let parent: string | null = null;
+      try {
+        parent = realpathSync(join(host.cwd, dirname(p)));
+      } catch {
+        // a missing directory is reported below
+      }
+      if (parent !== null && parent !== join(realpathSync(host.cwd), dirname(p))) {
+        return `reported "${p}" through a symlinked directory; write the spec as a regular file inside the run worktree`;
+      }
       if (!existsSync(join(host.cwd, p))) {
         return existsSync(join(host.repoRoot, p))
           ? `wrote "${p}" to the main checkout (${join(host.repoRoot, p)}) ` +
@@ -4036,10 +4058,21 @@ export async function runHarnessDriver(
           }
           const specViolation = specPathViolation(specPath);
           if (specViolation) return `the spec phase ${specViolation}`;
-          const specSubjectSha256 = hashFile(join(host.cwd, specPath));
-          if (!specSubjectSha256) {
+          let specBytes: Buffer | null = null;
+          try {
+            const entry = readHarnessFsEntry(join(host.cwd, specPath), HARNESS_JSON_ARTIFACT_MAX_BYTES * 4);
+            if (entry.kind === 'file') specBytes = entry.content;
+          } catch {
+            // reported below
+          }
+          if (!specBytes) {
             return `could not hash the specification before council round ${sround}: ${specPath}`;
           }
+          const specSubjectSha256 = sha256(specBytes);
+          // The runtime reads its subject unsandboxed: it gets these verified bytes, never a worktree
+          // path a reviewer could re-point mid-council (PR #925 review).
+          const specArtifact = join(artifactDir, `spec-subject-r${sround}.md`);
+          writeFileSync(specArtifact, specBytes);
           const councilId = sround === 1 ? 'spec-review' : `spec-review-${sround}`;
           const councilName = `Spec council (round ${sround})`;
           const councilWasDone = phaseDone(councilId);
@@ -4176,6 +4209,8 @@ export async function runHarnessDriver(
                 lastFailure = failure;
                 finishInvocation(invocation, 'failed', { error: failure });
                 if (!isRetryableReviewerFailure(failure)) break;
+                // The spec changed under this reviewer: the round is void, so a retry buys nothing.
+                if (failure.startsWith(REVIEWER_MUTATION_FAILURE) && hashFile(join(host.cwd, specPath)) !== specSubjectSha256) break;
                 continue;
               }
               const read = readReviewResultFile(resultPath);
@@ -4247,14 +4282,14 @@ export async function runHarnessDriver(
                       ``,
                       `Judge risks, backward compatibility, gaps, implementation-readiness, and simplicity.`,
                     ].join('\n')}${councilBoundaryAppendix}`,
-                  artifact: join(host.cwd, specPath),
+                  artifact: specArtifact,
                 })
               : null;
           const specAdvisorRun = await settleCouncilGroups(specRunnerWork, specAdvisorWork);
           // A cancelled reviewer records no outcome: gating on the survivors would park a
           // stopped run on a false "below quorum" decision (PR #925 review).
           if (host.isCancelled()) return null;
-          const specSubjectIssue = councilMutationIssue(outcomes);
+          const specSubjectIssue = await councilSubjectIssue(specSubjectSha256, async () => hashFile(join(host.cwd, specPath)));
           if (specSubjectIssue) {
             finishPhase(ledger, councilId, 'failed', specSubjectIssue);
             persist();
@@ -5073,6 +5108,14 @@ export async function runHarnessDriver(
               lastFailure = failure;
               finishInvocation(invocation, 'failed', { error: failure });
               if (!isRetryableReviewerFailure(failure)) break;
+              // The subject changed under this reviewer and stayed changed: the round is void, so a
+              // retry would only pay to review an edit no gate validated (PR #925 review).
+              if (
+                failure.startsWith(REVIEWER_MUTATION_FAILURE) &&
+                (await snapshotReviewSubject(host.cwd)) !== implementationSubjectSha256
+              ) {
+                break;
+              }
               continue;
             }
             const read = readReviewResultFile(resultPath);
@@ -5157,7 +5200,7 @@ export async function runHarnessDriver(
         const settledAdvisorRun = await settleCouncilGroups(runnerReviewerWork, advisorWork);
         // See the spec council: a stop is not a reviewer failure (PR #925 review).
         if (host.isCancelled()) return null;
-        const implSubjectIssue = councilMutationIssue(outcomes);
+        const implSubjectIssue = await councilSubjectIssue(implementationSubjectSha256, () => snapshotReviewSubject(host.cwd));
         if (implSubjectIssue) {
           finishPhase(ledger, reviewId, 'failed', implSubjectIssue);
           persist();

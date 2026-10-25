@@ -1,11 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  REVIEWER_MUTATION_FAILURE,
-  councilQuorum,
-  isRetryableReviewerFailure,
-  pool,
-  type CouncilOutcome,
-} from './council-quorum.js';
+import { councilQuorum, isRetryableReviewerFailure, pool, type CouncilOutcome } from './council-quorum.js';
 
 /**
  * Resilience rules for a council round (2026-07-25).
@@ -114,10 +108,6 @@ describe('councilQuorum', () => {
 });
 
 describe('isRetryableReviewerFailure', () => {
-  it('does not retry a reviewer that edited its subject — attempt 2 would review its own edit', () => {
-    expect(isRetryableReviewerFailure(`${REVIEWER_MUTATION_FAILURE}; review results were rejected`)).toBe(false);
-  });
-
   it('does not retry a timeout — the budget is already spent', () => {
     expect(isRetryableReviewerFailure('opencode timed out after 60m and was killed')).toBe(false);
     expect(isRetryableReviewerFailure('POST /session/x/message timed out after 3600000ms')).toBe(false);
