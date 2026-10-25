@@ -127,8 +127,11 @@ describe('harness phase-boundary composer', () => {
 
     // The horizontal phase rail became one status line (review 2026-07-27): it
     // was 2620px of content in an 820px viewport, so the live phase was always
-    // off-screen. The history moved behind its Timeline toggle.
-    expect(document.querySelector('[data-slot="harness-status-bar"]')).not.toBeNull()
+    // off-screen. The history moved behind its Timeline toggle. Lazily loaded (PR #925 review).
+    await waitFor(() => {
+      expect(document.querySelector('[data-slot="harness-status-bar"]')).not.toBeNull()
+      expect(document.querySelector('[data-slot="harness-models-dock"]')).not.toBeNull()
+    })
     expect(document.querySelector('[data-slot="harness-phase-rail"]')).toBeNull()
     expect(document.querySelector('[data-slot="harness-timeline-toggle"]')).not.toBeNull()
     expect(

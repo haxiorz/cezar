@@ -18,7 +18,7 @@ import {
   TicketIcon,
   ShieldCheckIcon,
 } from 'lucide-react'
-import type { ComponentType, SVGProps } from 'react'
+import { Suspense, type ComponentType, type SVGProps } from 'react'
 
 import type { Capabilities } from '@open-mercato/cezar-api-client'
 import { AccountsSection } from './accounts-section'
@@ -28,7 +28,6 @@ import { AppearanceSection } from './appearance'
 import { InstructionsSection } from './instructions-section'
 import { KeyboardSection } from './keyboard-section'
 import { BookmarkletsSection } from './bookmarklets-section'
-import { HarnessSection } from './harness-section'
 import { NotificationsSection } from './notifications-section'
 import { PrivacySection } from './privacy-section'
 import { ProjectsSection } from './projects-section'
@@ -39,6 +38,19 @@ import { WorktreesSection } from './worktrees-section'
 import { TrackerSection } from './tracker-section'
 import { ProjectSecretsSection, WorkspaceSecretsSection } from './secrets-section'
 import { IntegrationsSection } from './integrations-section'
+import { lazyRoute } from '@/lib/telemetry'
+
+// Multi-model is opt-in, so its section is a chunk of its own (PR #925 review, UI performance gate).
+const HarnessSectionBody = lazyRoute('settings-harness', () =>
+  import('./harness-section').then((m) => ({ default: m.HarnessSection })),
+)
+function HarnessSection() {
+  return (
+    <Suspense fallback={null}>
+      <HarnessSectionBody />
+    </Suspense>
+  )
+}
 
 /**
  * The Settings section registry (R6 Step 1.3, spec §"Settings"): the ONE place a section is

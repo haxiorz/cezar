@@ -1,6 +1,6 @@
 import { queueWaitLabel } from '@/lib/queue-wait-label'
 import { MessageSquareTextIcon, SearchXIcon } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useParams } from 'react-router'
 
 import { Link } from '@/lib/project-router'
@@ -66,12 +66,23 @@ import {
   type ThreadAsk,
   type ThreadState,
 } from './thread-state'
-import { HarnessModelsDock } from '../task-harness/harness-components'
-import { HarnessRail } from '../task-harness/harness-rail'
-import { HarnessStatusBar, HarnessTimelineDialog } from '../task-harness/harness-status-bar'
-import { ReviewerModal } from '../task-harness/reviewer-modal'
 import { RUN_RAIL_GRID, runShellClass } from './run-shell'
 import { harnessPublishBlockedReason, mergeHarnessLedger, orderStepsByLedger } from '../task-harness/harness-state'
+import { lazyRoute } from '@/lib/telemetry'
+
+// Ordinary runs never render these (PR #925 review, UI performance gate).
+const loadThreadHarness = () => import('../task-harness/thread-harness')
+const HarnessModelsDock = lazyRoute('thread-harness', () =>
+  loadThreadHarness().then((m) => ({ default: m.HarnessModelsDock })),
+)
+const HarnessRail = lazyRoute('thread-harness', () => loadThreadHarness().then((m) => ({ default: m.HarnessRail })))
+const HarnessStatusBar = lazyRoute('thread-harness', () =>
+  loadThreadHarness().then((m) => ({ default: m.HarnessStatusBar })),
+)
+const HarnessTimelineDialog = lazyRoute('thread-harness', () =>
+  loadThreadHarness().then((m) => ({ default: m.HarnessTimelineDialog })),
+)
+const ReviewerModal = lazyRoute('thread-harness', () => loadThreadHarness().then((m) => ({ default: m.ReviewerModal })))
 
 /**
  * `/tasks/:id` — the Session tab (spec, "Task thread"): the run header (title/meta/tabs/
@@ -443,11 +454,13 @@ export function ThreadView({
       {harnessLedger ? (
         <div className="border-b border-border bg-card px-4 md:px-6">
           <div className={runShellClass(true)}>
-            <HarnessStatusBar
-              ledger={harnessLedger}
-              timelineOpen={timelineOpen}
-              onOpenTimeline={() => setTimelineOpen((open) => !open)}
-            />
+            <Suspense fallback={null}>
+              <HarnessStatusBar
+                ledger={harnessLedger}
+                timelineOpen={timelineOpen}
+                onOpenTimeline={() => setTimelineOpen((open) => !open)}
+              />
+            </Suspense>
           </div>
         </div>
       ) : null}
@@ -461,11 +474,13 @@ export function ThreadView({
         )}
       >
         {harnessLedger ? (
-          <HarnessTimelineDialog
-            ledger={harnessLedger}
-            open={timelineOpen}
-            onOpenChange={setTimelineOpen}
-          />
+          <Suspense fallback={null}>
+            <HarnessTimelineDialog
+              ledger={harnessLedger}
+              open={timelineOpen}
+              onOpenChange={setTimelineOpen}
+            />
+          </Suspense>
         ) : null}
         {/* The transcript column beside the run rail. Without a ledger both wrappers are
             `contents`, so an ordinary run keeps the single flex column it always had. */}
@@ -580,12 +595,14 @@ export function ThreadView({
           </div>
 
           {harnessLedger ? (
-            <HarnessRail
-              ledger={harnessLedger}
-              runId={run.id}
-              onOpenTimeline={() => setTimelineOpen((open) => !open)}
-              onOpenReviewer={setOpenReviewer}
-            />
+            <Suspense fallback={null}>
+              <HarnessRail
+                ledger={harnessLedger}
+                runId={run.id}
+                onOpenTimeline={() => setTimelineOpen((open) => !open)}
+                onOpenReviewer={setOpenReviewer}
+              />
+            </Suspense>
           ) : null}
         </div>
       </div>
@@ -604,12 +621,14 @@ export function ThreadView({
       />
 
       {harnessLedger ? (
-        <ReviewerModal
-          runId={run.id}
-          ledger={harnessLedger}
-          reviewerId={openReviewer}
-          onClose={() => setOpenReviewer(null)}
-        />
+        <Suspense fallback={null}>
+          <ReviewerModal
+            runId={run.id}
+            ledger={harnessLedger}
+            reviewerId={openReviewer}
+            onClose={() => setOpenReviewer(null)}
+          />
+        </Suspense>
       ) : null}
 
       {/* The dock region (mockup `.dock`): plan dock, paused hint, then the composer.
@@ -631,7 +650,9 @@ export function ThreadView({
 
         {harnessLedger ? (
           <div className="xl:hidden">
-            <HarnessModelsDock ledger={harnessLedger} />
+            <Suspense fallback={null}>
+              <HarnessModelsDock ledger={harnessLedger} />
+            </Suspense>
           </div>
         ) : null}
 
