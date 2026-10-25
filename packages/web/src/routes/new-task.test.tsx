@@ -429,6 +429,19 @@ describe('the hero surface', () => {
     expect(screen.getByRole('tabpanel', { name: 'Task' })).toBeTruthy()
   })
 
+  // PR #925 review: the setup prompt took the composer and the brief was gone for good.
+  it('keeps an unsent brief when Configure models takes the composer', async () => {
+    writeDraft({ ...readDraft(), text: 'My long brief', composerMode: 'multi' })
+    serve()
+    renderNewTask()
+    fireEvent.click(await screen.findByRole('button', { name: /configure models/i }))
+    await waitFor(() => expect(textarea().value).toMatch(/Configure the multi-model agent harness/))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Restore it now' }))
+    await waitFor(() => expect(textarea().value).toBe('My long brief'))
+    expect(document.querySelector('[data-slot="setup-stash-note"]')).toBeNull()
+  })
+
   it('starts an ordinary task from a persisted multi-model draft when the feature is off', async () => {
     writeDraft({
       ...readDraft(),

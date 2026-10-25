@@ -8,6 +8,7 @@ import {
   clearStartedDraft,
   composerRunModeNote,
   handOffComposition,
+  harnessSetupPatch,
   normalizeDispatchIntent,
   readAttachments,
   readDraft,
@@ -163,6 +164,25 @@ describe('the new-task draft store', () => {
     expect(first.generateFollowups).toBe(false)
     first.text = 'mutated'
     expect(readDraft().text).toBe('fix it')
+  })
+
+  // PR #925 review: "Configure models" replaced an unsent brief with the setup prompt, no undo.
+  it('sets an unsent brief aside for harness setup and restores it once setup starts', () => {
+    const brief = { ...readDraft(), text: 'My long brief', composerMode: 'multi' as const }
+    writeDraft({ ...brief, ...harnessSetupPatch(brief) })
+    const during = readDraft()
+    expect(during.text).toMatch(/Configure the multi-model agent harness/)
+    expect(during.setupStash).toEqual({ text: 'My long brief', source: null, composerMode: 'multi' })
+    // A second click never stashes the setup prompt over the brief.
+    expect(harnessSetupPatch(during)).not.toHaveProperty('setupStash')
+
+    clearStartedDraft()
+    expect(readDraft()).toMatchObject({ text: 'My long brief', source: null, composerMode: 'multi' })
+    expect(readDraft()).not.toHaveProperty('setupStash')
+  })
+
+  it('stashes nothing when the composer is empty', () => {
+    expect(harnessSetupPatch({ ...readDraft(), text: '  ' })).not.toHaveProperty('setupStash')
   })
 
   it('clearStartedDraft spends the branch name but keeps the New branch toggle', () => {

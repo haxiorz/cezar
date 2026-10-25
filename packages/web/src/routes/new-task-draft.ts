@@ -8,7 +8,7 @@ import {
   type Runner,
 } from '@open-mercato/cezar-api-client'
 import type { PendingAttachment } from '@/components/composer/composer-attachments'
-import { RUNNERS, type TaskSource } from './new-task-form'
+import { harnessSetupPrefill, RUNNERS, type TaskSource } from './new-task-form'
 
 /**
  * The new-task draft store (spec: "Queued form state survives navigation (draft store)").
@@ -66,6 +66,24 @@ export interface NewTaskDraft {
   /** The Ask chip (spec 2026-10-20-trunk-based-projects): a read-only task. Absent = the
    *  project decides (a trunk-based project asks when the message is a question). Per task, never sticky. */
   readOnly?: boolean
+  /** The unsent brief "Configure models" set aside for the setup prompt (PR #925 review). It
+   *  comes back once setup starts, or on Restore. */
+  setupStash?: SetupStash
+}
+
+export interface SetupStash {
+  text: string
+  source: TaskSource | null
+  composerMode: 'task' | 'multi' | null
+}
+
+/** "Configure models" takes the composer for the setup prompt without losing what was typed. */
+export function harnessSetupPatch(draft: NewTaskDraft): Partial<NewTaskDraft> {
+  const prefill = harnessSetupPrefill()
+  const unsent = draft.text.trim() !== '' && draft.text !== prefill.text && !draft.setupStash
+  return unsent
+    ? { ...prefill, setupStash: { text: draft.text, source: draft.source, composerMode: draft.composerMode } }
+    : prefill
 }
 
 export interface ComposerRunModeInput {
@@ -250,7 +268,18 @@ function normalize(raw: unknown): NewTaskDraft {
     harnessRoles: isHarnessRoles(obj.harnessRoles) ? obj.harnessRoles : null,
     dispatch: normalizeDispatchIntent(obj.dispatch),
     ...(typeof obj.readOnly === 'boolean' ? { readOnly: obj.readOnly } : {}),
+    ...(isSetupStash(obj.setupStash) ? { setupStash: obj.setupStash } : {}),
   }
+}
+
+function isSetupStash(raw: unknown): raw is SetupStash {
+  if (!raw || typeof raw !== 'object') return false
+  const stash = raw as SetupStash
+  return (
+    typeof stash.text === 'string' &&
+    (stash.source === null || isSource(stash.source)) &&
+    (stash.composerMode === null || stash.composerMode === 'task' || stash.composerMode === 'multi')
+  )
 }
 
 /**
@@ -355,11 +384,11 @@ export function writeDraft(next: NewTaskDraft, projectId: string | null = null):
  *  task usually runs the same way (legacy keeps its pills too). A SKILL is not: it is a
  *  decision about the task that just started, and carrying it into the next one is how a skill
  *  picked once ended up silently running every task after it. A fresh `/new` starts with no
- *  skill; picking one again is one click. */
+ *  skill; picking one again is one click. A brief set aside for harness setup comes back instead. */
 export function clearStartedDraft(projectId: string | null = null): void {
   // A branch name is per-task — two tasks cannot both create it — while the toggle stays sticky.
-  const { branchName: _spent, readOnly: _asked, ...kept } = readDraft(projectId)
-  writeDraft({ ...kept, text: '', source: null }, projectId)
+  const { branchName: _spent, readOnly: _asked, setupStash, ...kept } = readDraft(projectId)
+  writeDraft(setupStash ? { ...kept, ...setupStash } : { ...kept, text: '', source: null }, projectId)
 }
 
 /**

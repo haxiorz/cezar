@@ -82,6 +82,7 @@ import {
 } from './new-task-autostart'
 import {
   clearStartedDraft,
+  harnessSetupPatch,
   autoLandsUnreviewed,
   composerRunModeNote,
   explicitWorktreeFor,
@@ -102,7 +103,6 @@ import {
   advisorHarnessOptions,
   sessionRoleOptions,
   harnessRolesIssue,
-  harnessSetupPrefill,
   runsInPlace,
   harnessWorkflowName,
   isHarnessRunner,
@@ -498,7 +498,11 @@ export function NewTaskRoute() {
   }
   const startHarnessSetup = () => {
     setHarnessSetupOpen(false)
-    update(harnessSetupPrefill())
+    update(harnessSetupPatch(draft))
+  }
+  const restoreSetupStash = () => {
+    if (!draft.setupStash) return
+    update({ ...draft.setupStash, setupStash: undefined })
   }
 
   // Parallel variants need a worktree per variant, hence git (the server 409s without it).
@@ -985,6 +989,14 @@ export function NewTaskRoute() {
           </div>
         )}
         {recoveryError && <p role="alert" className="mb-3 text-sm">{recoveryError}</p>}
+        {draft.setupStash ? (
+          <p data-slot="setup-stash-note" className="mb-3 text-center text-[13px] text-muted-foreground">
+            Your task description is saved and comes back once setup starts.{' '}
+            <button type="button" className="font-medium text-foreground underline" onClick={restoreSetupStash}>
+              Restore it now
+            </button>
+          </p>
+        ) : null}
         {/* The composer's two surfaces (user feedback 2026-07-23): the ordinary Task tab and
             the Multi-model tab, a first-class entry instead of a workflow hidden in the picker.
             Behind the `multiModel` config flag (off by default) there is only one surface, so
