@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -150,6 +150,30 @@ describe('loadConfig systemPrompt', () => {
       git('rm', '-q', '--cached', '.ai/cezar/config.json');
       expect((await loadConfig(repoRoot)).multiModel).toBe(true);
       expect(multiModelEnabled(repoRoot)).toBe(true);
+    });
+    // PR #925 review (fifth round): committed content reached the flag under a path git did not
+    // report as tracked — through a symlinked directory, or a case variant on macOS.
+    it('ignores multiModel reached through a symlink or a committed case variant', async () => {
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd: repoRoot, stdio: 'ignore' });
+      git('init', '-q');
+      rmSync(join(repoRoot, '.ai/cezar'), { recursive: true, force: true });
+      mkdirSync(join(repoRoot, 'shared'), { recursive: true });
+      writeFileSync(join(repoRoot, 'shared', 'config.json'), JSON.stringify({ multiModel: true }));
+      symlinkSync(join(repoRoot, 'shared'), join(repoRoot, '.ai/cezar'));
+      git('add', '-A');
+      git('commit', '-q', '-m', 'symlinked config');
+      expect(multiModelEnabled(repoRoot)).toBe(false);
+      expect((await loadConfig(repoRoot)).multiModel).toBe(false);
+
+      git('rm', '-q', '-r', '--cached', '.');
+      rmSync(join(repoRoot, '.ai/cezar'));
+      mkdirSync(join(repoRoot, '.ai/Cezar'), { recursive: true });
+      writeFileSync(join(repoRoot, '.ai/Cezar/config.json'), JSON.stringify({ multiModel: true }));
+      git('add', '-A');
+      git('commit', '-q', '-m', 'case variant');
+      expect(multiModelEnabled(repoRoot)).toBe(false);
+      expect((await loadConfig(repoRoot)).multiModel).toBe(false);
     });
     it('keeps synchronous admission and asynchronous config fail-closed on malformed files', async () => {
       for (const raw of ['{', 'null', '[]', '{"multiModel":true,"maxParallel":"invalid"}']) {

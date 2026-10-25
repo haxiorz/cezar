@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
+import { lstatSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { worktreeLifecycleConfigSchema } from '@open-mercato/cezar-contract';
@@ -175,13 +175,23 @@ export const MULTI_MODEL_TRACKED_ERROR =
   'Multi-model runs cannot be enabled from a git-tracked .ai/cezar/config.json: a committed file would opt in every clone. Untrack the file, or enable it in local configuration.';
 
 /**
- * Is `.ai/cezar/config.json` tracked by git? A committed file speaks for every clone, so — like
- * worktree scripts and auto-land — it cannot opt the user in to multi-model runs, whose trusted
- * config can call endpoints and run reviewer commands (PR #925 review).
+ * Does `.ai/cezar/config.json` come from the repository rather than this machine? A committed file
+ * speaks for every clone, so — like worktree scripts and auto-land — it cannot opt the user in to
+ * multi-model runs, whose trusted config can call endpoints and run reviewer commands. A symlinked
+ * path component or a case variant lets committed content stand in for the local file under a
+ * path git never reports as tracked (PR #925 review).
  */
 export function configTrackedByGit(repoRoot: string): boolean {
+  for (const part of [['.ai'], ['.ai', 'cezar'], ['.ai', 'cezar', 'config.json']]) {
+    try {
+      if (lstatSync(join(repoRoot, ...part)).isSymbolicLink()) return true;
+    } catch {
+      // absent: nothing to stand in for
+    }
+  }
   try {
-    execFileSync('git', ['ls-files', '--error-unmatch', '--', join('.ai', 'cezar', 'config.json')], {
+    // `icase`: on a case-insensitive filesystem a committed `.ai/Cezar/config.json` is this file.
+    execFileSync('git', ['ls-files', '--error-unmatch', '--', ':(icase).ai/cezar/config.json'], {
       cwd: repoRoot,
       stdio: 'ignore',
     });
