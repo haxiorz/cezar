@@ -1,8 +1,8 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import * as childProcess from 'node:child_process';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeCliRunner } from '../core/claude-cli-runner.js';
 import {
@@ -142,12 +142,36 @@ describe('harness live probe transports', () => {
     };
 
     await expect(createLiveTransport({ advisors: { leak: binding } })({ runner: 'harness', model: 'leak' }))
-      .resolves.toMatchObject({ status: 'unverified' });
+      .resolves.not.toMatchObject({ status: 'ready' });
     await expect(probeAdvisorHttp(binding)).resolves.toMatchObject({
       status: 'failed',
       detail: expect.stringMatching(/only over https/),
     });
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  // PR #925 review: `unverified` blocked every command advisor at start, the setup template's `codex`
+  // among them. Readiness is "its CLI is installed" — the repo-configured argv never runs here.
+  it('readies a command advisor whose CLI is installed, without running it', async () => {
+    const bin = mkdtempSync(join(tmpdir(), 'cez-command-advisor-'));
+    dirs.push(bin);
+    const marker = join(bin, 'ran');
+    writeFileSync(join(bin, 'fake-cli'), `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`, 'utf8');
+    chmodSync(join(bin, 'fake-cli'), 0o755);
+    vi.stubEnv('PATH', `${bin}${delimiter}${process.env.PATH ?? ''}`);
+    const transport = createLiveTransport({
+      advisors: {
+        installed: { adapter: 'command', model: 'm', commands: { probe: ['fake-cli', '--version'], review: ['fake-cli', 'exec'] } },
+        missing: { adapter: 'command', model: 'm', commands: { review: ['no-such-cli-anywhere', 'exec'] } },
+      },
+    });
+
+    await expect(transport({ runner: 'harness', model: 'installed' })).resolves.toMatchObject({ status: 'ready' });
+    await expect(transport({ runner: 'harness', model: 'missing' })).resolves.toMatchObject({
+      status: 'failed',
+      detail: expect.stringContaining('not on PATH'),
+    });
+    expect(existsSync(marker)).toBe(false);
   });
 
   it.each([

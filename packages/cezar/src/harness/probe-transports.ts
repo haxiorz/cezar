@@ -1,9 +1,9 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import { ClaudeCliRunner } from '../core/claude-cli-runner.js';
 import { trackAgentProcessTree } from '../core/process-tree.js';
 import { advisorCredentialBindingIssue } from './advisor-identity.js';
@@ -410,8 +410,39 @@ export async function probeAdvisorHttp(
 
 /** Build the transport that routes a ref to its real code path. `advisors`
  *  supplies the `agentHarness.models` entry for `runner: 'harness'` refs. */
+/**
+ * A command advisor is ready when its CLI is installed. Its argv is never run here: this probe
+ * fires when the Multi-model tab opens, and repository config must not execute then. The council
+ * run surfaces a broken binding. `unverified` here blocked every command advisor, the setup
+ * template's `codex` among them, at start (PR #925 review).
+ */
+function probeCommandAdvisor(
+  advisor: { commands?: { probe?: string[]; review?: string[] } },
+  cwd: string | undefined,
+): ProbeVerdict {
+  const bin = advisor.commands?.review?.[0] ?? advisor.commands?.probe?.[0];
+  if (!bin) return { status: 'failed', detail: 'the command advisor declares no review command' };
+  const candidates = bin.includes('/') || bin.includes('\\')
+    ? [resolve(cwd ?? process.cwd(), bin)]
+    : (process.env.PATH ?? '')
+        .split(delimiter)
+        .filter(Boolean)
+        .flatMap((dir) => (process.platform === 'win32' ? [`${bin}.exe`, `${bin}.cmd`, bin] : [bin]).map((name) => join(dir, name)));
+  const found = candidates.some((path) => {
+    try {
+      accessSync(path, constants.X_OK);
+      return statSync(path).isFile();
+    } catch {
+      return false;
+    }
+  });
+  return found
+    ? { status: 'ready', detail: `${bin} is installed; the binding itself is verified when its council runs` }
+    : { status: 'failed', detail: `${bin} is not on PATH` };
+}
+
 export function createLiveTransport(deps: {
-  advisors?: Record<string, { adapter?: string; model: string; preset?: string; endpoint?: string; credentialEnv?: string; authStoreProvider?: string; binaryEnv?: string }>;
+  advisors?: Record<string, { adapter?: string; model: string; preset?: string; endpoint?: string; credentialEnv?: string; authStoreProvider?: string; binaryEnv?: string; commands?: { probe?: string[]; review?: string[] } }>;
   cwd?: string;
   timeoutMs?: number;
 }): ProbeTransport {
@@ -430,10 +461,11 @@ export function createLiveTransport(deps: {
       if (advisor.preset === 'kimi-subscription') {
         return probeKimiSubscription(advisor, { timeoutMs: deps.timeoutMs });
       }
+      if (advisor.adapter === 'command') return probeCommandAdvisor(advisor, deps.cwd);
       // Only an adapter that calls an endpoint is probed over HTTP, as the runtime does: a command
       // adapter never sends its key to one (PR #925 review).
       if (advisor.adapter !== 'openai-compatible' && advisor.adapter !== 'preset') {
-        return { status: 'unverified', detail: `a ${advisor.adapter ?? 'command'} advisor is verified when its council runs` };
+        return { status: 'unverified', detail: `a ${advisor.adapter ?? 'unknown'} advisor cannot be probed` };
       }
       return probeAdvisorHttp(advisor, { timeoutMs: deps.timeoutMs });
     }
