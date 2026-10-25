@@ -880,7 +880,9 @@ export async function runHarnessDriver(
   for (const invocation of ledger.invocations.filter((entry) => entry.status === 'running')) {
     if (invocation.process) {
       const reconciliation = await reconcileProcess(invocation.process);
-      if (reconciliation.status === 'mismatch' || reconciliation.status === 'unverified') {
+      // `mismatch` proves the pid now runs another process: ours is gone, and a pid is not reused
+      // while its group lives. Blocking on it dead-ended every Continue (PR #925 review).
+      if (reconciliation.status === 'unverified') {
         const error = `harness recovery blocked: ${reconciliation.error}`;
         setOutcome({ status: 'blocked', blockingReasons: [error] });
         return error;

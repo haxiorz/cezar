@@ -2309,8 +2309,7 @@ describe('harness driver — standard fix-issue graph', () => {
     ).toBeUndefined();
   });
 
-  it('fails closed when a recorded PID no longer has the invocation identity', async () => {
-    const h = makeHarness(dir);
+  const strandedInvocation = () => {
     const ledger = createLedger({
       workflow: HARNESS_FIX_ISSUE,
       requestedProfile: 'standard',
@@ -2327,19 +2326,41 @@ describe('harness driver — standard fix-issue graph', () => {
       inputSha256: 'prior-input',
       process: { pid: 4242, token: 'old-token', startedAt: new Date().toISOString() },
     });
-    saveLedger(h.host.dataDir, h.host.runId, ledger);
+    return ledger;
+  };
+
+  // PR #925 review: `mismatch` proves the pid now runs another process, so the invocation's own
+  // process is gone. Blocking on it re-blocked every Continue, with no route to clear it.
+  it('recovers past a recorded PID that now belongs to another process', async () => {
+    const h = makeHarness(dir);
+    saveLedger(h.host.dataDir, h.host.runId, strandedInvocation());
     h.deps.reconcileProcess = async () => ({
       status: 'mismatch',
       error: 'pid 4242 no longer belongs to this harness invocation',
+    });
+
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+
+    const recovered = loadLedger(h.host.dataDir, h.host.runId)?.invocations.find(
+      (invocation) => invocation.id === 'advisor:impl:1:kimi',
+    );
+    expect(recovered).toMatchObject({ status: 'interrupted' });
+    expect(recovered?.process).toBeUndefined();
+  });
+
+  it('still fails closed when a recorded PID cannot be verified at all', async () => {
+    const h = makeHarness(dir);
+    saveLedger(h.host.dataDir, h.host.runId, strandedInvocation());
+    h.deps.reconcileProcess = async () => ({
+      status: 'unverified',
+      error: 'cannot verify process identity for pid 4242 on win32',
     });
 
     const error = await runHarnessDriver(h.host, input, h.deps);
 
     expect(error).toMatch(/recovery blocked.*pid 4242/i);
     expect(h.calls).toHaveLength(0);
-    expect(loadLedger(h.host.dataDir, h.host.runId)?.outcome).toMatchObject({
-      status: 'blocked',
-    });
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.outcome).toMatchObject({ status: 'blocked' });
   });
 
   it('delivers a durable boundary message to the next agent phase and records consumption', async () => {
