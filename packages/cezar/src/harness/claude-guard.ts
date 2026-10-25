@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 const GUARD_SCRIPT = `#!/usr/bin/env node
-import { existsSync, realpathSync } from 'node:fs'
+import { lstatSync, realpathSync } from 'node:fs'
 import { dirname, isAbsolute, relative, resolve } from 'node:path'
 
 const chunks = []
@@ -28,22 +28,33 @@ try {
   const worktreeInput = process.env.CEZ_HARNESS_WORKTREE
   const outputInput = process.env.CEZ_HARNESS_OUTPUT_DIR
   if (!worktreeInput || !outputInput) throw new Error('writable-root environment is incomplete')
-  worktree = realpathSync(worktreeInput)
-  outputDir = realpathSync(outputInput)
+  worktree = realpathSync.native(worktreeInput)
+  outputDir = realpathSync.native(outputInput)
 } catch (error) {
   refuse('guard initialization failed: ' + (error instanceof Error ? error.message : String(error)))
+}
+// lstat, not existsSync: a dangling symlink "did not exist", so its name was resolved back inside
+// the worktree and the write went through it to any host path. Resolving it now throws, and the
+// write is refused. The native realpath also restores the on-disk case (PR #925 review).
+const present = (path) => {
+  try {
+    lstatSync(path)
+    return true
+  } catch {
+    return false
+  }
 }
 const canonicalTarget = (raw) => {
   const target = resolve(worktree, raw)
   let cursor = target
   const suffix = []
-  while (!existsSync(cursor)) {
+  while (!present(cursor)) {
     const parent = dirname(cursor)
     if (parent === cursor) break
     suffix.unshift(cursor.slice(parent.length + 1))
     cursor = parent
   }
-  return resolve(realpathSync(cursor), ...suffix)
+  return resolve(realpathSync.native(cursor), ...suffix)
 }
 const outside = (root, target) => {
   const rel = relative(root, target)
@@ -74,7 +85,9 @@ if (filePath) {
       refuse(\`write outside the run worktree and phase-output directory is disabled: \${filePath}\`)
     }
     // The worktree's .git is a pointer the host's git follows (git-pin.ts, PR #925 review).
-    const gitEntry = relative(worktree, target)
+    // Case-folded where the filesystem usually is: \`.GIT\` is the pointer on APFS and NTFS.
+    const rel = relative(worktree, target)
+    const gitEntry = process.platform === 'darwin' || process.platform === 'win32' ? rel.toLowerCase() : rel
     if (gitEntry === '.git' || gitEntry.startsWith('.git/') || gitEntry.startsWith('.git\\\\')) {
       refuse(\`writes to the worktree's .git are disabled: \${filePath}\`)
     }

@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -177,6 +178,18 @@ describe('harness safety primitives', () => {
     expect(() => invoke({ file_path: join(worktree, '.git') })).toThrow();
     expect(() => invoke({ file_path: join(worktree, '.git', 'config') })).toThrow();
     expect(() => invoke({ file_path: join(worktree, '.github', 'ci.yml') })).not.toThrow();
+    // PR #925 review: a dangling link "did not exist", so a write through it reached any host path.
+    const hostTarget = join(root, 'outside-not-yet', 'planted.plist');
+    symlinkSync(hostTarget, join(worktree, 'innocent.txt'));
+    expect(() => invoke({ file_path: join(worktree, 'innocent.txt') })).toThrow();
+    mkdirSync(join(worktree, 'src'), { recursive: true });
+    symlinkSync(join(root, 'no-such-dir'), join(worktree, 'src', 'linked'));
+    expect(() => invoke({ file_path: join(worktree, 'src', 'linked', 'x.ts') })).toThrow();
+    // ...and on a case-insensitive filesystem `.GIT` is the pointer.
+    if (process.platform === 'darwin' || process.platform === 'win32') {
+      expect(() => invoke({ file_path: join(worktree, '.GIT') })).toThrow();
+      expect(() => invoke({ file_path: join(worktree, '.Git', 'config') })).toThrow();
+    }
     expect(() => invoke({ command: 'git push origin HEAD' })).toThrow();
     expect(() => invoke({ command: 'git -C . push origin HEAD' })).toThrow();
     expect(() => invoke({ command: '/usr/bin/git --no-pager commit -m unsafe' })).toThrow();
