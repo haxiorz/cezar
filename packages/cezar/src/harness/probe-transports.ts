@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ClaudeCliRunner } from '../core/claude-cli-runner.js';
+import { trackAgentProcessTree } from '../core/process-tree.js';
 import { advisorCredentialBindingIssue } from './advisor-identity.js';
 import type { ProbeRef, ProbeTransport, ProbeVerdict } from './probe.js';
 import { harnessChildEnvironment, terminateProcessTree } from './runtime.js';
@@ -70,6 +71,8 @@ export async function probeOpencode(
     detached: process.platform !== 'win32',
     windowsHide: true,
   });
+  // Detached, so Ctrl-C never reaches it: cezar's exit hook must (PR #925 review).
+  trackAgentProcessTree(child);
 
   const done = (verdict: ProbeVerdict): ProbeVerdict => {
     terminateProcessTree(child);
@@ -179,6 +182,7 @@ export async function probeCodex(
       detached: process.platform !== 'win32',
       windowsHide: true,
     });
+    trackAgentProcessTree(child);
     let stderr = '';
     let settled = false;
     const finish = (verdict: ProbeVerdict) => {
@@ -222,6 +226,8 @@ function kimiBinary(model: { binaryEnv?: string }): string | null {
       encoding: 'utf8',
       stdio: 'pipe',
       env: harnessChildEnvironment(model.binaryEnv ? [model.binaryEnv] : []),
+      // Synchronous on the server thread: a hung CLI froze the cockpit (PR #925 review).
+      timeout: 10_000,
     });
     if (!result.error && result.status === 0) return candidate;
   }
@@ -277,6 +283,7 @@ export async function probeKimiSubscription(
       detached: process.platform !== 'win32',
       windowsHide: true,
     });
+    trackAgentProcessTree(child);
     let stdout = '';
     let stderr = '';
     let settled = false;

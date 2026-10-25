@@ -18,6 +18,7 @@ import { z } from 'zod';
 import { discoverSkills, type Skill } from '../skills.js';
 import type { HarnessValidationCheck } from './types.js';
 import { readHarnessFsEntry, readRegularFileFollowing } from './fs-read.js';
+import { trackAgentProcessTree } from '../core/process-tree.js';
 
 /**
  * The runtime bridge (spec 2026-07-23-harness-orchestration, Architecture §2):
@@ -105,9 +106,15 @@ export function harnessConfigEnvironmentNames(agentHarness: Record<string, unkno
 function signalProcessTreePid(pid: number | undefined, signal: 'SIGTERM' | 'SIGKILL'): void {
   if (!pid) return;
   if (process.platform === 'win32') {
-    const args = ['/pid', String(pid), '/t'];
-    if (signal === 'SIGKILL') args.push('/f');
-    const killer = spawn('taskkill', args, { stdio: 'ignore', windowsHide: true });
+    // Always `/f`, and an 'error' listener so a missing taskkill is not an uncaught exception — as
+    // `signalAgentProcessTree` already does (PR #925 review).
+    const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+    killer.once('error', () => {
+      try {
+        process.kill(pid, signal);
+      } catch {
+      }
+    });
     killer.unref();
     return;
   }
@@ -443,6 +450,8 @@ export class HarnessRuntime {
         detached: process.platform !== 'win32',
         windowsHide: true,
       });
+      // Detached, so Ctrl-C never reaches it: cezar's exit hook must (PR #925 review).
+      trackAgentProcessTree(child);
       this.current = child;
       const identity: HarnessProcessIdentity | undefined = child.pid
         ? {
@@ -841,6 +850,7 @@ export async function runValidationCommands(
           detached: process.platform !== 'win32',
           windowsHide: true,
         });
+        trackAgentProcessTree(child);
         const identity: HarnessProcessIdentity | undefined = child.pid
           ? {
               pid: child.pid,

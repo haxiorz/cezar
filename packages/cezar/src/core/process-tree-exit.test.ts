@@ -50,14 +50,14 @@ describe.skipIf(process.platform === 'win32')('agent process groups die with cez
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
-  async function startOwner(mode: 'exit' | 'handled' | 'signal', leaderExits = false) {
+  async function startOwner(mode: 'exit' | 'handled' | 'signal', leaderExits = false, spawner: 'agent' | 'harness' = 'agent') {
     const dir = mkdtempSync(join(tmpdir(), 'cez-tree-exit-'));
     dirs.push(dir);
     const bin = join(dir, 'fake-agent.mjs');
     copyFileSync(fakeAgent, bin);
     chmodSync(bin, 0o755);
     if (leaderExits) writeFileSync(join(dir, 'leader-exits'), '');
-    const child = spawn(process.execPath, ['--import', 'tsx', owner, bin, dir, mode], {
+    const child = spawn(process.execPath, ['--import', 'tsx', owner, bin, dir, mode, spawner], {
       stdio: ['ignore', 'pipe', 'inherit'],
     });
     owners.push(child);
@@ -78,6 +78,16 @@ describe.skipIf(process.platform === 'win32')('agent process groups die with cez
 
   it('takes the agent and its tool children down when cezar exits', async () => {
     const { child, pids, exited, ready } = await startOwner('exit');
+    expect(await ready()).toBe(true);
+    child.kill('SIGUSR2');
+    expect((await exited).code).toBe(0);
+    expect(await until(() => !alive(pids.leader) && !alive(pids.tool), 3_000)).toBe(true);
+  }, 20_000);
+
+  // PR #925 review: probes, runtime ops and validation commands are detached too, but were never
+  // tracked, so `opencode serve` from a readiness probe kept listening after Ctrl-C.
+  it('takes a harness-spawned process group down when cezar exits', async () => {
+    const { child, pids, exited, ready } = await startOwner('exit', false, 'harness');
     expect(await ready()).toBe(true);
     child.kill('SIGUSR2');
     expect((await exited).code).toBe(0);
