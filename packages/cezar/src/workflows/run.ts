@@ -158,6 +158,7 @@ import {
   type HarnessRolesInput,
 } from '../harness/driver.ts';
 import { createLedger, harnessFeedbackClosedReason, readLedger, saveLedger } from '../harness/ledger.ts';
+import { releaseLedgerIssueClaim } from '../harness/issue-claim.ts';
 import { HARNESS_FIX_ISSUE, isHarnessWorkflow } from '../harness/workflows.ts';
 import {
   HARNESS_PROFILES,
@@ -1463,6 +1464,7 @@ export class RunManager {
       cancelAndWait: id => this.cancelAndWait(id),
       onWorktreeRemoved: () => this.sweepPrHeadRefs(),
       onTaskDeleted: id => deleteRunLayouts(this.dataDir, id),
+      beforeTaskDeleted: id => releaseLedgerIssueClaim(this.dataDir, id),
       cancelPending: id => {
         const queued = this.queue.indexOf(id);
         if (queued >= 0) this.queue.splice(queued, 1);

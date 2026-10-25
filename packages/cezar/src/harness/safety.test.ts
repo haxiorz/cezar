@@ -116,6 +116,25 @@ describe('harness safety primitives', () => {
     expect(acquireIssueClaim(cwd, 'run-b', '642')).toMatchObject({ ok: true });
   });
 
+  // PR #925 review: a claim whose run was deleted (or whose `.ai/cezar/` was) had no release path,
+  // so every later harness run on that issue failed preflight until someone found the file.
+  it('takes over a claim this project no longer knows, never one another project holds', () => {
+    const cwd = tempDir('cez-claim-stale-');
+    execFileSync('git', ['init', '-b', 'main'], { cwd, stdio: 'ignore' });
+    const owner = (dataDir: string, live: string[]) => ({ dataDir, runExists: (id: string) => live.includes(id) });
+
+    expect(acquireIssueClaim(cwd, 'run-a', '642', owner('/p/one', ['run-a']))).toMatchObject({ ok: true });
+    // Live in this project: still refused.
+    expect(acquireIssueClaim(cwd, 'run-b', '642', owner('/p/one', ['run-a', 'run-b']))).toMatchObject({ ok: false });
+    // Another project's claim: never judged by this project's ledgers.
+    expect(acquireIssueClaim(cwd, 'run-b', '642', owner('/p/two', ['run-b']))).toMatchObject({ ok: false });
+    // run-a is gone from this project: its claim is stale and passes to run-b.
+    const taken = acquireIssueClaim(cwd, 'run-b', '642', owner('/p/one', ['run-b']));
+    expect(taken).toMatchObject({ ok: true });
+    if (!taken.ok) throw new Error(taken.error);
+    expect(JSON.parse(readFileSync(taken.claim.path, 'utf8'))).toMatchObject({ runId: 'run-b', dataDir: '/p/one' });
+  });
+
   it('materializes a strict Claude sandbox and rejects writes outside its two roots', () => {
     const root = tempDir('cez-claude-guard-');
     const worktree = join(root, 'worktree');

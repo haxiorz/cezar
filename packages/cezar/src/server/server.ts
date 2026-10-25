@@ -220,7 +220,7 @@ import { harnessArtifactDir } from '../harness/driver.ts';
 import { providerFamilyOf } from '../harness/model-family.ts';
 import { canonicalizeAdvisorRefs } from '../harness/advisor-identity.ts';
 import { opencodeSeatingError, runnerEquivalentOf } from '../harness/reviewer-binding.ts';
-import { releaseIssueClaim } from '../harness/issue-claim.ts';
+import { releaseLedgerIssueClaim } from '../harness/issue-claim.ts';
 import { readHarnessFsEntry } from '../harness/fs-read.ts';
 import {
   HARNESS_PROFILES,
@@ -832,14 +832,6 @@ const streamSSENoBuffer: typeof streamSSE = (c, cb, onError) => {
   return res;
 };
 
-function releaseHarnessIssueClaim(dataDir: string, runId: string): void {
-  const read = readLedger(dataDir, runId);
-  if (read.status !== 'valid' || !read.ledger.claim?.held || !read.ledger.claim.path) return;
-  const released = releaseIssueClaim(read.ledger.claim.path, runId);
-  if (!released.ok) return;
-  read.ledger.claim.held = false;
-  saveLedger(dataDir, runId, read.ledger);
-}
 
 // A run starts from a named workflow OR an inline chain of steps (spec 008 —
 // the approved plan is posted as-is, never written to a file).
@@ -5287,7 +5279,7 @@ export function createApp(deps: ServerDeps) {
           const run = store.getRun(id);
           if (!run?.archived) continue;
           stopTaskProcesses(id);
-          if (run.harness) releaseHarnessIssueClaim(dataDir, id);
+          if (run.harness) releaseLedgerIssueClaim(dataDir, id);
         }
       }
       // One event for the sweep, `value` = how many it archived (summed on the dashboard).
@@ -5310,7 +5302,7 @@ export function createApp(deps: ServerDeps) {
       const parsed = { data: c.req.valid('json') };
       const retiresQuestion = parsed.data.archived !== false && store.getRun(id)?.awaitingAnswerSince !== undefined;
       const run = store.setArchived(id, parsed.data.archived !== false);
-      if (run?.archived && !manager.isActive(id)) releaseHarnessIssueClaim(dataDir, id);
+      if (run?.archived && !manager.isActive(id)) releaseLedgerIssueClaim(dataDir, id);
       if (run && parsed.data.archived !== false) stopTaskProcesses(id);
       if (run && retiresQuestion) manager.notifyQuestionRetired?.(id);
       // Labelled with the button that did it.
@@ -5948,7 +5940,7 @@ export function createApp(deps: ServerDeps) {
       if (!finished) return c.json({ error: 'no open session' }, 409);
       // Finishing a harness phase session leaves the driver conducting the run, and the driver
       // releases its own claim (PR #925 review) — as archive/remove-worktree/delete check too.
-      if (!manager.isActive(id)) releaseHarnessIssueClaim(dataDir, id);
+      if (!manager.isActive(id)) releaseLedgerIssueClaim(dataDir, id);
       if (before.status === 'review') track('review_decided', { label: 'accepted' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json({ finished: true });
     })
@@ -6499,7 +6491,7 @@ export function createApp(deps: ServerDeps) {
             type: 'note',
             message: `${draft ? 'draft PR' : 'PR'} created: ${outcome.url}${outcome.dryRun ? ' (dry run — no real PR)' : ''}`,
           });
-          releaseHarnessIssueClaim(dataDir, id);
+          releaseLedgerIssueClaim(dataDir, id);
           return outcome;
         })()
           .then((outcome) => ({ outcome, branch }))
@@ -6551,7 +6543,7 @@ export function createApp(deps: ServerDeps) {
           stopTaskProcesses(id);
           if (run.worktreePath) await removeWorktree(repoRoot, run.worktreePath, run.branch);
           store.updateRun(id, { worktreePath: undefined, branch: undefined });
-          releaseHarnessIssueClaim(dataDir, id);
+          releaseLedgerIssueClaim(dataDir, id);
           if (run.prHead) await manager.sweepPrHeadRefs();
           return c.json({ removed: true });
         });
@@ -6571,7 +6563,7 @@ export function createApp(deps: ServerDeps) {
           // Layouts go with the task, and only with it — archiving keeps them (spec §5.3).
           deleteRunLayouts(dataDir, id);
           if (run.worktreePath) await removeWorktree(repoRoot, run.worktreePath, run.branch);
-          releaseHarnessIssueClaim(dataDir, id);
+          releaseLedgerIssueClaim(dataDir, id);
           const deleted = store.deleteRun(id);
           // The run's `refs/cezar/pr/<n>` goes with the last run that needed it (Phase 3).
           if (deleted && run.prHead) await manager.sweepPrHeadRefs();
