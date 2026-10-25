@@ -4972,6 +4972,12 @@ export function createApp(deps: ServerDeps) {
         resolved.plan.implementer,
         ...canonical.refs,
       ];
+      // A disabled provider is a settings fact: probing it was a live, billed call the user had
+      // turned off, answered `ready` (PR #925 review).
+      const providersBlocked = await providerActionError(
+        providersRequiredByHarness(body.roles ? { profile, roles: body.roles } : { profile }, agentic.agentHarness),
+      );
+      if (providersBlocked) return c.json({ profile, ready: false, reason: providersBlocked, models: [] });
       const prober =
         deps.harnessProber ??
         createModelProber({
@@ -5519,6 +5525,12 @@ export function createApp(deps: ServerDeps) {
         if (planSeating) {
           return c.json({ error: `harness start blocked: ${planSeating}` }, 409);
         }
+        // A disabled provider is refused before any billed probe of it (PR #925 review).
+        const providersBlocked = await providerActionError([...requiredProviders], {
+          repoRoot,
+          profileFor: (provider) => (provider === fallback ? parsed.data.agentProfile : undefined),
+        });
+        if (providersBlocked) return c.json({ error: providersBlocked }, 409);
         const prober =
           deps.harnessProber ??
           createModelProber({
@@ -5554,10 +5566,13 @@ export function createApp(deps: ServerDeps) {
           );
         }
       }
-      const blocked = await providerActionError([...requiredProviders], {
-        repoRoot,
-        profileFor: (provider) => (provider === fallback ? parsed.data.agentProfile : undefined),
-      });
+      // A harness start ran this gate before its probes.
+      const blocked = harnessInput
+        ? null
+        : await providerActionError([...requiredProviders], {
+            repoRoot,
+            profileFor: (provider) => (provider === fallback ? parsed.data.agentProfile : undefined),
+          });
       if (blocked) return c.json({ error: blocked }, 409);
       // A composer override names an account the user just picked, so a stale id (deleted since
       // the page loaded) is answered honestly instead of quietly running on the default — the

@@ -14,6 +14,7 @@ import type { WorkflowDef } from '../workflows/types.js';
 import { connectedProviderAuth } from './provider-auth.testkit.js';
 import { createApp } from './server.js';
 import { apiRequest } from './loopback-request.testkit.js';
+import { defaultWorkspaceConfig } from '../workspace/config.ts';
 
 /**
  * The harness API surface (spec 2026-07-23-harness-orchestration, API
@@ -1035,6 +1036,46 @@ describe('harness API', () => {
       });
       expect(res.status).toBe(201);
       expect(captured?.harness?.roles).toEqual(roles);
+    });
+
+    // PR #925 review: probes are live, billed calls; a provider the user disabled was probed (and
+    // reported ready) before the provider gate refused the start.
+    it('never probes a provider the user disabled', async () => {
+      const probed: string[] = [];
+      let workspace = { ...defaultWorkspaceConfig(), disabledProviders: ['codex' as const] };
+      const gated = createApp({
+        repoRoot,
+        store,
+        version: '0.0.0-test',
+        providerAuth: connectedProviderAuth(),
+        workspaceConfig: {
+          load: async () => workspace,
+          mergeWrite: async (mutate: (current: typeof workspace) => typeof workspace | void) => {
+            workspace = mutate(workspace) ?? workspace;
+            return workspace;
+          },
+        } as unknown as Parameters<typeof createApp>[0]['workspaceConfig'],
+        manager: { startRun: () => { throw new Error('must not start'); }, isActive: () => false } as unknown as RunManager,
+        harnessProber: {
+          probe: async (ref) => {
+            probed.push(`${ref.runner}/${ref.model}`);
+            return { status: 'ready', detail: 'probed' };
+          },
+          probeAll: async (refs) => {
+            probed.push(...refs.map((ref) => `${ref.runner}/${ref.model}`));
+            return new Map(refs.map((ref) => [`${ref.runner}/${ref.model || 'auto'}`, { status: 'ready' as const, detail: 'probed' }]));
+          },
+          clearCache: () => undefined,
+        },
+      });
+      const send = (path: string, body: unknown) =>
+        apiRequest(gated, path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+
+      const probe = await send('/api/v1/harness/probe', { roles });
+      expect(await probe.json()).toMatchObject({ ready: false, reason: expect.stringMatching(/codex/i) });
+      const start = await send('/api/v1/runs', { task: 'Fix issue #642', workflow: HARNESS_FIX_ISSUE, harness: { roles } });
+      expect(start.status).toBe(409);
+      expect(probed).toEqual([]);
     });
 
     it('rejects fewer than 2 reviewers', async () => {
