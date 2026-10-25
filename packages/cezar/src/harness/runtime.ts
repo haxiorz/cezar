@@ -17,7 +17,7 @@ import { dirname, join } from 'node:path';
 import { z } from 'zod';
 import { discoverSkills, type Skill } from '../skills.js';
 import type { HarnessValidationCheck } from './types.js';
-import { readRegularFileFollowing } from './fs-read.js';
+import { readHarnessFsEntry, readRegularFileFollowing } from './fs-read.js';
 
 /**
  * The runtime bridge (spec 2026-07-23-harness-orchestration, Architecture §2):
@@ -780,9 +780,10 @@ export async function runValidationCommands(
   try {
     const packageManager = (() => {
       try {
-        const pkg = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8')) as {
-          packageManager?: unknown;
-        };
+        // Model-writable: a FIFO here blocked the server thread on every resume (PR #925 review).
+        const entry = readHarnessFsEntry(join(cwd, 'package.json'), 1 << 20);
+        if (entry.kind !== 'file' || !entry.content) return undefined;
+        const pkg = JSON.parse(entry.content.toString('utf8')) as { packageManager?: unknown };
         return typeof pkg.packageManager === 'string' ? pkg.packageManager : undefined;
       } catch {
         return undefined;
@@ -790,17 +791,16 @@ export async function runValidationCommands(
     })();
     if (packageManager && /^(?:yarn|pnpm)@/.test(packageManager)) {
       const candidate = mkdtempSync(join(tmpdir(), 'cez-corepack-'));
-      try {
-        execFileSync('corepack', ['enable', '--install-directory', candidate], {
-          cwd,
-          env: baseEnvironment,
-          stdio: 'ignore',
-          timeout: 10_000,
-        });
-        corepackShimDir = candidate;
-      } catch {
-        rmSync(candidate, { recursive: true, force: true });
-      }
+      const enabled = await new Promise<boolean>((done) => {
+        execFile(
+          'corepack',
+          ['enable', '--install-directory', candidate],
+          { cwd, env: baseEnvironment, timeout: 10_000 },
+          (error) => done(!error),
+        );
+      });
+      if (enabled) corepackShimDir = candidate;
+      else rmSync(candidate, { recursive: true, force: true });
     }
     const validationEnvironment = {
       ...baseEnvironment,

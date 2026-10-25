@@ -316,6 +316,13 @@ describe('harness runtime bridge', () => {
     },
   );
 
+  // PR #925 review: a blocking read here froze the whole server, and again on every resume.
+  it.skipIf(process.platform === 'win32')('runs the gate past a FIFO planted at package.json', async () => {
+    execFileSync('mkfifo', [join(dir, 'package.json')]);
+    const [check] = await runValidationCommands(['echo gate-ran'], dir);
+    expect(check).toMatchObject({ status: 'passed', evidence: 'gate-ran' });
+  }, 10_000);
+
   it('bounds validation output exactly at the configured cap', async () => {
     const [check] = await runValidationCommands(
       [`node -e "process.stdout.write('x'.repeat(250000))"`],
