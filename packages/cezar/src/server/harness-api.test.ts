@@ -787,6 +787,70 @@ describe('harness API', () => {
     });
   });
 
+  // PR #925 review: the pause survives a resume until the council re-runs, so a second click while
+  // the run was live bought every failed reviewer another paid attempt, or waived quorum; and a
+  // decision whose resume failed was kept anyway.
+  describe('council decisions', () => {
+    const pausedCouncil = (status: 'failed' | 'running') => {
+      const run = store.createRun({ title: 't', workflow: HARNESS_FIX_ISSUE, task: 'x', steps: [] });
+      store.updateRun(run.id, { status, harness: { profile: 'multi', workflow: HARNESS_FIX_ISSUE } });
+      const ledger = createLedger({ workflow: HARNESS_FIX_ISSUE, requestedProfile: 'multi', subject: { kind: 'brief', text: 'x' } });
+      ledger.outcome = {
+        status: 'blocked',
+        blockingReasons: ['implementation council did not reach quorum'],
+        pendingDecision: {
+          kind: 'council',
+          council: 'implementation',
+          round: 1,
+          failed: [{ label: 'kimi' }],
+          completedCount: 1,
+          canProceed: true,
+          subjectSha256: 'subject',
+        },
+      };
+      saveLedger(dataDir, run.id, ledger);
+      return run.id;
+    };
+    const decisions = (id: string) => {
+      const read = readLedger(dataDir, id);
+      return read.status === 'valid' ? read.ledger.decisions.filter((d) => d.kind.startsWith('council.')) : [];
+    };
+    const decide = (target: Hono, id: string) =>
+      apiRequest(target, `/api/v1/runs/${id}/harness/council-decision`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'retry' }),
+      });
+
+    it('records a decision for a paused run and resumes it', async () => {
+      const id = pausedCouncil('failed');
+      const res = await decide(app, id);
+      expect(res.status).toBe(200);
+      expect(decisions(id)).toHaveLength(1);
+    });
+
+    it('refuses a decision while the run is already resuming', async () => {
+      const id = pausedCouncil('running');
+      const res = await decide(app, id);
+      expect(res.status).toBe(409);
+      expect(decisions(id)).toEqual([]);
+    });
+
+    it('keeps no decision when the run cannot resume', async () => {
+      const id = pausedCouncil('failed');
+      const refusing = createApp({
+        repoRoot,
+        store,
+        version: '0.0.0-test',
+        providerAuth: connectedProviderAuth(),
+        manager: { isActive: () => false, continueRun: () => ({ ok: false, error: 'busy' }) } as unknown as RunManager,
+      });
+      const res = await decide(refusing, id);
+      expect(res.status).toBe(409);
+      expect(decisions(id)).toEqual([]);
+    });
+  });
+
   describe('phase-boundary messages', () => {
     it('persists the dequeue-startup gap before acknowledging a harness message', async () => {
       const run = store.createRun({

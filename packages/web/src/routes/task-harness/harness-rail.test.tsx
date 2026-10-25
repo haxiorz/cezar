@@ -3,6 +3,7 @@ import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { HarnessLedgerResponse } from '@open-mercato/cezar-api-client'
 
+import { queryKeys } from '@/api/queries'
 import { createQueryClient } from '@/api/query-client'
 
 import { HarnessRail } from './harness-rail'
@@ -193,12 +194,15 @@ describe('HarnessRail council decision card', () => {
         },
       } as HarnessLedgerResponse['outcome'],
     })
-  const renderRail = (l: HarnessLedgerResponse, runId?: string) =>
-    render(
-      <QueryClientProvider client={createQueryClient()}>
+  const renderRail = (l: HarnessLedgerResponse, runId?: string, status = 'failed') => {
+    const client = createQueryClient()
+    if (runId) client.setQueryData(queryKeys.runs.detail(runId), { id: runId, status })
+    return render(
+      <QueryClientProvider client={client}>
         <HarnessRail ledger={l} runId={runId} />
       </QueryClientProvider>,
     )
+  }
 
   it('offers retry and proceed when survivors exist', () => {
     renderRail(paused(), 'r1')
@@ -218,6 +222,14 @@ describe('HarnessRail council decision card', () => {
 
   it('stays read-only without a runId to act on', () => {
     renderRail(paused())
+
+    expect(document.querySelector('[data-slot="council-decision"]')).toBeNull()
+  })
+
+  // PR #925 review: the ledger keeps the pause until the council re-runs, so the card stayed
+  // clickable during the retry it had just started.
+  it('hides the decision while the run is resuming', () => {
+    renderRail(paused(), 'r1', 'running')
 
     expect(document.querySelector('[data-slot="council-decision"]')).toBeNull()
   })

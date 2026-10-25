@@ -1,6 +1,6 @@
 import { BotIcon, LoaderCircleIcon, RotateCcwIcon, ShieldCheckIcon, WaypointsIcon } from 'lucide-react'
 
-import { useCouncilDecision } from '@/api/queries'
+import { useCouncilDecision, useRun } from '@/api/queries'
 import type { HarnessLedgerResponse, HarnessPhaseRecord } from '@open-mercato/cezar-api-client'
 import { Pill } from '@/components/pill'
 import { StatusDot } from '@/components/status-dot'
@@ -63,8 +63,11 @@ export function CouncilDecisionCard({
   ledger: HarnessLedgerResponse
 }) {
   const decision = useCouncilDecision(runId)
+  const run = useRun(runId)
   const pending = ledger.outcome.pendingDecision
   if (ledger.outcome.status !== 'blocked' || pending?.kind !== 'council') return null
+  // The ledger keeps the pause until the council re-runs; only a paused run takes a decision.
+  if (run.data?.status !== 'failed' && run.data?.status !== 'cancelled') return null
   const act = (action: 'retry' | 'proceed') =>
     decision.mutate(action, {
       onSuccess: () =>

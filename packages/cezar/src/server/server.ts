@@ -5232,6 +5232,11 @@ export function createApp(deps: ServerDeps) {
         if (read.ledger.outcome.status !== 'blocked' || pending?.kind !== 'council') {
           return c.json({ error: 'this run has no council decision to make' }, 409);
         }
+        // The pause survives a resume until the council re-runs: a second click while the run is
+        // live bought every failed reviewer another paid attempt, or waived quorum (PR #925 review).
+        if ((run.status !== 'failed' && run.status !== 'cancelled') || manager.isActive(id)) {
+          return c.json({ error: 'the run is already resuming — decide again only if it pauses' }, 409);
+        }
         if (body.action === 'proceed' && !pending.canProceed) {
           return c.json(
             { error: 'every reviewer failed — there is nothing to proceed with; retry instead' },
@@ -5247,10 +5252,11 @@ export function createApp(deps: ServerDeps) {
         saveLedger(dataDir, id, read.ledger);
         const resumed = manager.continueRun(id);
         if (!resumed.ok) {
-          return c.json(
-            { error: `decision recorded but the run could not resume: ${resumed.error}` },
-            409,
-          );
+          // An unapplied decision must not count later: a retry would buy an attempt the user
+          // was told failed, a proceed would waive quorum (PR #925 review).
+          read.ledger.decisions.pop();
+          saveLedger(dataDir, id, read.ledger);
+          return c.json({ error: `the run could not resume, so the decision was not recorded: ${resumed.error}` }, 409);
         }
         store.appendEvent(id, {
           type: 'note',
