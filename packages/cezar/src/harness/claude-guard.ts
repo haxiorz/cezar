@@ -68,6 +68,11 @@ if (filePath) {
     if (outsideEveryWritableRoot(target)) {
       refuse(\`write outside the run worktree and phase-output directory is disabled: \${filePath}\`)
     }
+    // The worktree's .git is a pointer the host's git follows (git-pin.ts, PR #925 review).
+    const gitEntry = relative(worktree, target)
+    if (gitEntry === '.git' || gitEntry.startsWith('.git/') || gitEntry.startsWith('.git\\\\')) {
+      refuse(\`writes to the worktree's .git are disabled: \${filePath}\`)
+    }
   } catch (error) {
     refuse('write target could not be validated: ' + (error instanceof Error ? error.message : String(error)))
   }
@@ -199,7 +204,8 @@ export function createClaudeStageOnlySettings(
           filesystem: {
             denyRead: [],
             allowWrite: [worktree, outputDir, CLAUDE_CWD_MARKER_GLOB],
-            denyWrite: [],
+            // Host-side git follows the worktree's .git pointer (git-pin.ts, PR #925 review).
+            denyWrite: [join(worktree, '.git')],
           },
           credentials: {
             envVars: [

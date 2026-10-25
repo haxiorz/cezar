@@ -1222,6 +1222,33 @@ describe('harness driver — standard fix-issue graph', () => {
 
   // PR #925 review: preflight rm+cp'd over a tracked `.claude/skills/<name>`, and the handoff,
   // derived from git, staged cezar's copy as part of the user's change.
+  // PR #925 review: a phase that repoints the worktree's `.git` makes host git load its config.
+  it.skipIf(process.platform === 'win32')('fails closed when a phase rewrites the worktree .git pointer, and restores it', async () => {
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, encoding: 'utf8' });
+    const repo = join(dir, 'repo');
+    const wt = join(dir, 'wt');
+    git(dir, 'init', '-q', '-b', 'main', repo);
+    writeFileSync(join(repo, 'a.txt'), 'one\n');
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-q', '-m', 'base');
+    git(repo, 'worktree', 'add', '-q', '-b', 'task', wt);
+    const pointer = readFileSync(join(wt, '.git'), 'utf8');
+    const h = makeHarness(wt);
+    h.host.repoRoot = repo;
+    h.agentBehavior.set('implement', (req) => {
+      writeFileSync(join(wt, '.git'), `gitdir: ${join(dir, 'attacker', '.git')}\n`);
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['a.txt'] }), 'utf8');
+      return null;
+    });
+
+    const error = await runHarnessDriver(h.host, input, h.deps);
+
+    expect(error).toMatch(/\.git pointer was rewritten/);
+    expect(readFileSync(join(wt, '.git'), 'utf8').trim()).toBe(pointer.trim());
+    expect(h.calls.map((call) => call.id)).not.toContain('stage');
+  });
+
   it('never rewrites a skill directory the repository tracks', async () => {
     const git = (...args: string[]) =>
       execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd: dir, encoding: 'utf8' });

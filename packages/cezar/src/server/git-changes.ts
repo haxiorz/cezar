@@ -8,6 +8,7 @@ import { resolveTaskDiffBase, type RepointedHead } from '../git-diff-base.ts';
 import { isSafeGitRef } from '../git-refs.ts';
 import { resolveTaskRemotes, splitRemoteRef } from '../git-remotes.ts';
 import { branchesCheckedOutElsewhere, gitHasIdentity, seedScratchIndex, unresolvedConflicts } from '../git-worktree.ts';
+import { pinnedGitEnv } from '../git-pin.ts';
 
 /**
  * Session git plumbing for the cockpit's Changes & Files tabs (redesign spec
@@ -32,6 +33,9 @@ interface GitResult {
 /** Run git, never throw — degradation is the caller's policy. `env` overrides (e.g. a scratch
  *  `GIT_INDEX_FILE`) merge over the process env. */
 function git(cwd: string, args: string[], env?: Record<string, string>): Promise<GitResult> {
+  // A harness worktree's `.git` pointer is model-writable (git-pin.ts).
+  const pinned = pinnedGitEnv(cwd);
+  const merged = env || pinned ? { ...env, ...pinned } : undefined;
   return new Promise((resolvePromise) => {
     execFile(
       'git',
@@ -40,7 +44,7 @@ function git(cwd: string, args: string[], env?: Record<string, string>): Promise
         cwd,
         maxBuffer: 32 * 1024 * 1024,
         encoding: 'utf8',
-        ...(env ? { env: { ...process.env, ...env } } : {}),
+        ...(merged ? { env: { ...process.env, ...merged } } : {}),
       },
       (err, stdout, stderr) => resolvePromise({ ok: !err, stdout: stdout ?? '', stderr: stderr ?? '' }),
     );

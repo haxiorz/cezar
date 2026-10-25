@@ -154,6 +154,10 @@ describe('harness safety primitives', () => {
     expect(() => invoke({ file_path: join(worktree, 'src', 'safe.ts') })).not.toThrow();
     expect(() => invoke({ file_path: join(output, 'phase-result.json') })).not.toThrow();
     expect(() => invoke({ file_path: join(root, 'outside.ts') })).toThrow();
+    // PR #925 review: host git follows the worktree's .git pointer.
+    expect(() => invoke({ file_path: join(worktree, '.git') })).toThrow();
+    expect(() => invoke({ file_path: join(worktree, '.git', 'config') })).toThrow();
+    expect(() => invoke({ file_path: join(worktree, '.github', 'ci.yml') })).not.toThrow();
     expect(() => invoke({ command: 'git push origin HEAD' })).toThrow();
     expect(() => invoke({ command: 'git -C . push origin HEAD' })).toThrow();
     expect(() => invoke({ command: '/usr/bin/git --no-pager commit -m unsafe' })).toThrow();

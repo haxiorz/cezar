@@ -76,6 +76,7 @@ import { harnessStageResultSchema, samePathSet } from './stage-result.js';
 import { loadTrustedHarnessSkill } from './skill-binding.js';
 import { acquireIssueClaim, releaseIssueClaim } from './issue-claim.js';
 import { readHarnessFsEntry } from './fs-read.js';
+import { pinnedGitEnv, pinWorktreeGitDir, resolveTrustedGitDir, verifyWorktreeGitPointer } from '../git-pin.js';
 import { harnessPhaseSkills } from './skill-routing.js';
 import { createClaudeStageOnlySettings } from './claude-guard.js';
 import type {
@@ -340,7 +341,7 @@ export async function snapshotHarnessReviewSubject(cwd: string): Promise<string>
       cwd,
       encoding: 'buffer',
       maxBuffer: 256 * 1024 * 1024,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' },
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', ...pinnedGitEnv(cwd) },
     });
   hashWorktreeContentVsHead(hash, cwd, git);
   hash.update('\0head-reflog\0');
@@ -359,7 +360,7 @@ export async function snapshotHarnessStageSubject(cwd: string): Promise<string> 
       cwd,
       encoding: 'buffer',
       maxBuffer: 256 * 1024 * 1024,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' },
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', ...pinnedGitEnv(cwd) },
     });
   hashWorktreeContentVsHead(hash, cwd, git);
   return hash.digest('hex');
@@ -371,7 +372,7 @@ function currentChangedPaths(cwd: string): string[] | null {
       cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' },
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', ...pinnedGitEnv(cwd) },
     })
       .split('\0')
       .filter(Boolean);
@@ -382,7 +383,7 @@ function currentChangedPaths(cwd: string): string[] | null {
         cwd,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
-        env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' },
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', ...pinnedGitEnv(cwd) },
       },
     )
       .split('\0')
@@ -713,6 +714,17 @@ export async function runHarnessDriver(
   const noGitHubAuthDir = join(artifactDir, 'no-github-auth');
   mkdirSync(noGitHubAuthDir, { recursive: true });
   let claudeGuard: ReturnType<typeof createClaudeStageOnlySettings> | undefined;
+  // Resolved from the main repository, never through the worktree's model-writable `.git`
+  // pointer; every host-side git call here and in the runtime uses it (git-pin.ts, PR #925 review).
+  const trustedGitDir = resolveTrustedGitDir(host.repoRoot, host.cwd);
+  if (trustedGitDir) pinWorktreeGitDir(host.cwd, trustedGitDir);
+  const gitPointerIssue = (): string | null => {
+    if (!trustedGitDir) return null;
+    const check = verifyWorktreeGitPointer(host.cwd, trustedGitDir);
+    return check.ok ? null : check.error;
+  };
+  const entryPointerIssue = gitPointerIssue();
+  if (entryPointerIssue) return entryPointerIssue;
 
   const ledgerRead = readLedger(host.dataDir, host.runId);
   if (ledgerRead.status === 'corrupt') {
@@ -1059,7 +1071,11 @@ export async function runHarnessDriver(
     const trustedPrompt =
       request.skillSystemPrompt ??
       (request.skill ? trustedSkillPrompts.get(request.skill) : undefined);
-    return host.runAgent({
+    // An agent CLI runs its own git outside the tool sandbox at session start: check the pointer
+    // before every phase, and after it before any host-side git reads the worktree.
+    const pointerBefore = gitPointerIssue();
+    if (pointerBefore) return pointerBefore;
+    const failure = await host.runAgent({
       ...request,
       ...(trustedPrompt ? { skillSystemPrompt: trustedPrompt } : {}),
       env: {
@@ -1087,6 +1103,7 @@ export async function runHarnessDriver(
         emitInvocation(invocation);
       },
     });
+    return gitPointerIssue() ?? failure;
   };
 
   const emitPhase = (phaseId: string) => {
@@ -1880,7 +1897,7 @@ export async function runHarnessDriver(
           execFileSync('git', ['ls-files', '-z', '--', `.claude/skills/${name}`], {
             cwd: host.cwd,
             encoding: 'utf8',
-            env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+            env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', ...pinnedGitEnv(host.cwd) },
           }).length > 0
         );
       } catch {
@@ -2319,6 +2336,8 @@ export async function runHarnessDriver(
         harnessConfigEnvironmentNames(runtimeAgentic.agentHarness),
       ),
       CEZ_HARNESS_REVIEW_SKILL: phaseSkills.codeReview,
+      // The runtime pins its own git calls with these — never a process-wide GIT_DIR (git-pin.ts).
+      ...(trustedGitDir ? { CEZ_HARNESS_GIT_DIR: trustedGitDir, CEZ_HARNESS_GIT_WORK_TREE: host.cwd } : {}),
     },
   });
   const runtime: RuntimeLike = {

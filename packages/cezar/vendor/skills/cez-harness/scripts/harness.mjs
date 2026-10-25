@@ -1188,8 +1188,20 @@ function renderMarkdown(result) {
   return lines.join('\n')
 }
 
+function pinnedGitEnv(cwd) {
+  const gitDir = process.env.CEZ_HARNESS_GIT_DIR
+  const workTree = process.env.CEZ_HARNESS_GIT_WORK_TREE
+  if (!gitDir || !workTree) return {}
+  let inside
+  try {
+    const rel = relative(realpathSync(workTree), realpathSync(cwd))
+    inside = !rel.startsWith('..') && !isAbsolute(rel)
+  } catch { return {} }
+  return inside ? { GIT_DIR: gitDir, GIT_WORK_TREE: realpathSync(workTree), GIT_NO_REPLACE_OBJECTS: '1' } : {}
+}
+
 function git(args, cwd, options = {}) {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8', stdio: options.stdio || 'pipe', env: { ...process.env, ...(options.env || {}) } })
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', stdio: options.stdio || 'pipe', env: { ...process.env, ...pinnedGitEnv(cwd), ...(options.env || {}) } })
   if (result.status !== 0) throw new Error((result.stderr || result.stdout || `git ${args[0]} failed`).trim())
   return result.stdout
 }
@@ -1291,7 +1303,7 @@ function ensureIgnoredRunDir(runDir, worktree) {
   const rel = relative(worktree, runDir)
   if (rel === '') throw new Error('Harness artifact directory must not be the worktree root')
   if (rel.startsWith('..') || isAbsolute(rel)) return
-  const result = spawnSync('git', ['check-ignore', '-q', '--no-index', '--', rel], { cwd: worktree, stdio: 'ignore' })
+  const result = spawnSync('git', ['check-ignore', '-q', '--no-index', '--', rel], { cwd: worktree, stdio: 'ignore', env: { ...process.env, ...pinnedGitEnv(worktree) } })
   if (result.status !== 0) throw new Error(`Harness artifact directory inside the worktree must be ignored by Git: ${rel}`)
 }
 

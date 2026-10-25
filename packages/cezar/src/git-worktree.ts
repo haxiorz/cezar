@@ -4,6 +4,7 @@ import { copyFile, readdir, readFile, rm, stat, utimes } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { resolveTaskDiffBase } from './git-diff-base.ts';
+import { pinnedGitEnv } from './git-pin.ts';
 import { isSafeGitRef } from './git-refs.ts';
 import { resolveTaskRemotes, splitRemoteRef, type TaskRemotes } from './git-remotes.ts';
 
@@ -41,10 +42,18 @@ function git(
   opts: { timeout?: number; env?: NodeJS.ProcessEnv } = {},
 ): Promise<GitResult> {
   return new Promise((resolve) => {
+    const pinned = pinnedGitEnv(cwd);
     execFile(
       'git',
       args,
-      { cwd, maxBuffer: 32 * 1024 * 1024, encoding: 'utf8', ...opts },
+      {
+        cwd,
+        maxBuffer: 32 * 1024 * 1024,
+        encoding: 'utf8',
+        ...opts,
+        // A harness worktree's `.git` pointer is model-writable (git-pin.ts).
+        ...(pinned ? { env: { ...(opts.env ?? process.env), ...pinned } } : {}),
+      },
       (err, stdout, stderr) => resolve({ ok: !err, stdout: stdout ?? '', stderr: stderr ?? '' }),
     );
   });

@@ -642,6 +642,36 @@ const VALID_POLICY = new Set(['advisory', 'quorum', 'all-required'])`,
     "    const credentialIssue = envCredentialIssue(model)\n    if (credentialIssue) throw new Error(`Model ${id} ${credentialIssue}`)\n    if (model.maxOutputTokens !== undefined && (!Number.isInteger(model.maxOutputTokens) || model.maxOutputTokens < 1)) throw new Error(`models.${id}.maxOutputTokens must be a positive integer`)",
     'environment credential validation',
   );
+  // Repository pinning (PR #925 review): a model can rewrite the worktree's `.git` pointer, and
+  // git then loads a config it controls (core.fsmonitor runs a program) in this unsandboxed
+  // runtime. cezar resolves the real gitdir from the main repository and hands it over in
+  // CEZ_HARNESS_GIT_DIR; only this runtime's own git calls in that worktree use it.
+  text = replaceRequired(
+    text,
+    `function git(args, cwd, options = {}) {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', stdio: options.stdio || 'pipe', env: { ...process.env, ...(options.env || {}) } })`,
+    `function pinnedGitEnv(cwd) {
+  const gitDir = process.env.CEZ_HARNESS_GIT_DIR
+  const workTree = process.env.CEZ_HARNESS_GIT_WORK_TREE
+  if (!gitDir || !workTree) return {}
+  let inside
+  try {
+    const rel = relative(realpathSync(workTree), realpathSync(cwd))
+    inside = !rel.startsWith('..') && !isAbsolute(rel)
+  } catch { return {} }
+  return inside ? { GIT_DIR: gitDir, GIT_WORK_TREE: realpathSync(workTree), GIT_NO_REPLACE_OBJECTS: '1' } : {}
+}
+
+function git(args, cwd, options = {}) {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', stdio: options.stdio || 'pipe', env: { ...process.env, ...pinnedGitEnv(cwd), ...(options.env || {}) } })`,
+    'pinned repository for runtime git',
+  );
+  text = replaceRequired(
+    text,
+    "spawnSync('git', ['check-ignore', '-q', '--no-index', '--', rel], { cwd: worktree, stdio: 'ignore' })",
+    "spawnSync('git', ['check-ignore', '-q', '--no-index', '--', rel], { cwd: worktree, stdio: 'ignore', env: { ...process.env, ...pinnedGitEnv(worktree) } })",
+    'pinned repository for ignore checks',
+  );
   text = replaceRequired(
     text,
     `    try {
