@@ -262,7 +262,14 @@ import {
   readWorktreePath,
   repoIndexContains,
 } from './git-changes.ts';
-import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
+import {
+  configTrackedByGit,
+  gatedSkillsRepos,
+  loadConfig,
+  MULTI_MODEL_TRACKED_ERROR,
+  resolveWorktreeRetention,
+  type CezConfig,
+} from '../config.ts';
 import { findConfigFile } from '../agent-config/catalog.ts';
 import { readConfigFile, statConfigPath, writeConfigFile } from '../agent-config/files.ts';
 import { type AgentModelDefaults, readAgentModelDefaults } from '../agent-config/models.ts';
@@ -8042,6 +8049,9 @@ export function createApp(deps: ServerDeps) {
         (parsed.data.defaultModels !== undefined || parsed.data.defaultModelsAuto !== undefined)
       ) {
         return c.json({ error: AGENT_MODELS_LOCKED_ERROR }, 409);
+      }
+      if (parsed.data.multiModel === true && configTrackedByGit(repoRoot)) {
+        return c.json({ error: MULTI_MODEL_TRACKED_ERROR }, 409);
       }
       try {
         const configPath = join(dataDir, 'config.json');

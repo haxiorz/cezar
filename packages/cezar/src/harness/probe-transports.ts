@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ClaudeCliRunner } from '../core/claude-cli-runner.js';
-import { advisorAuthStoreBindingIssue } from './advisor-identity.js';
+import { advisorCredentialBindingIssue } from './advisor-identity.js';
 import type { ProbeRef, ProbeTransport, ProbeVerdict } from './probe.js';
 import { harnessChildEnvironment, terminateProcessTree } from './runtime.js';
 
@@ -335,8 +335,8 @@ export function resolveAdvisorCredential(model: {
   // credential has a narrower trust boundary: it may leave only for its
   // official provider endpoint. This must happen before even looking up a key,
   // and mirrors the later runtime validation for preflight probes.
-  const authStoreIssue = advisorAuthStoreBindingIssue(model);
-  if (authStoreIssue) return { key: null, reason: authStoreIssue };
+  const credentialIssue = advisorCredentialBindingIssue(model);
+  if (credentialIssue) return { key: null, reason: credentialIssue };
   if (model.credentialEnv && process.env[model.credentialEnv]) {
     return { key: String(process.env[model.credentialEnv]), source: `env ${model.credentialEnv}` };
   }

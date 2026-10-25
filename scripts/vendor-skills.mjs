@@ -598,6 +598,50 @@ async function runCommandReviewer(id, model, prompt, worktree, timeoutMs = null)
     `import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, statSync, writeFileSync, mkdirSync, rmSync, unlinkSync } from 'node:fs'`,
     'descriptor-read imports',
   );
+  // Environment credentials (PR #925 review): the repository's config names both the variable and
+  // the endpoint, so the runtime pins them with the host's rule (advisor-identity.ts).
+  text = replaceRequired(
+    text,
+    `const VALID_POLICY = new Set(['advisory', 'quorum', 'all-required'])`,
+    `const ENV_CREDENTIAL_HOSTS = {
+  DEEPSEEK_API_KEY: ['api.deepseek.com'],
+  OM_ZEN_KEY: ['opencode.ai'],
+  OPENCODE_API_KEY: ['opencode.ai'],
+  OPENAI_API_KEY: ['api.openai.com'],
+  OPENROUTER_API_KEY: ['openrouter.ai'],
+  GROQ_API_KEY: ['api.groq.com'],
+  TOGETHER_API_KEY: ['api.together.xyz'],
+  FIREWORKS_API_KEY: ['api.fireworks.ai'],
+  MISTRAL_API_KEY: ['api.mistral.ai'],
+  MOONSHOT_API_KEY: ['api.moonshot.ai', 'api.moonshot.cn']
+}
+const HOST_SECRET_ENV = /^(?:GITHUB_|GH_|GITLAB_|BITBUCKET_|AWS_|AZURE_|GOOGLE_|GCP_|GCLOUD_|NPM_|NODE_AUTH_|SSH_|ANTHROPIC_|CLAUDE_|CODEX_|CEZ_|DOCKER_|HEROKU_|VERCEL_|NETLIFY_|CLOUDFLARE_|DIGITALOCEAN_|SLACK_|STRIPE_|SENTRY_)/
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
+
+function envCredentialIssue(model) {
+  const name = model.credentialEnv
+  if (name === undefined || name === '') return null
+  if (typeof name !== 'string' || !/^[A-Z_][A-Z0-9_]*_KEY$/.test(name) || HOST_SECRET_ENV.test(name)) return 'may read only a provider API key (an environment variable ending in _KEY, never a host credential)'
+  if (model.adapter === 'command' || (model.endpoint === undefined && model.adapter !== 'openai-compatible')) return null
+  let endpoint
+  try { endpoint = new URL(String(model.endpoint)) } catch { return 'has no valid endpoint for its environment credential' }
+  const loopback = LOOPBACK_HOSTS.has(endpoint.hostname)
+  if (endpoint.protocol !== 'https:' && !(endpoint.protocol === 'http:' && loopback)) return 'may send its environment credential only over https (or to a loopback server)'
+  const preset = AUTH_STORE_ENDPOINTS[model.preset]
+  if (model.adapter === 'preset' && preset && model.endpoint !== preset.endpoint) return "may use its preset credential only with the preset's official endpoint"
+  const hosts = ENV_CREDENTIAL_HOSTS[name]
+  if (hosts && !hosts.includes(endpoint.hostname)) return \`may send \${name} only to its provider (\${hosts.join(', ')})\`
+  return null
+}
+const VALID_POLICY = new Set(['advisory', 'quorum', 'all-required'])`,
+    'environment credential pinning',
+  );
+  text = replaceRequired(
+    text,
+    "    if (model.maxOutputTokens !== undefined && (!Number.isInteger(model.maxOutputTokens) || model.maxOutputTokens < 1)) throw new Error(`models.${id}.maxOutputTokens must be a positive integer`)",
+    "    const credentialIssue = envCredentialIssue(model)\n    if (credentialIssue) throw new Error(`Model ${id} ${credentialIssue}`)\n    if (model.maxOutputTokens !== undefined && (!Number.isInteger(model.maxOutputTokens) || model.maxOutputTokens < 1)) throw new Error(`models.${id}.maxOutputTokens must be a positive integer`)",
+    'environment credential validation',
+  );
   text = replaceRequired(
     text,
     `    try {

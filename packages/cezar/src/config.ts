@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -170,12 +171,32 @@ const configSchema = z.object({
 
 export type CezConfig = z.infer<typeof configSchema>;
 
+export const MULTI_MODEL_TRACKED_ERROR =
+  'Multi-model runs cannot be enabled from a git-tracked .ai/cezar/config.json: a committed file would opt in every clone. Untrack the file, or enable it in local configuration.';
+
+/**
+ * Is `.ai/cezar/config.json` tracked by git? A committed file speaks for every clone, so — like
+ * worktree scripts and auto-land — it cannot opt the user in to multi-model runs, whose trusted
+ * config can call endpoints and run reviewer commands (PR #925 review).
+ */
+export function configTrackedByGit(repoRoot: string): boolean {
+  try {
+    execFileSync('git', ['ls-files', '--error-unmatch', '--', join('.ai', 'cezar', 'config.json')], {
+      cwd: repoRoot,
+      stdio: 'ignore',
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Synchronous admission guard for new runs; recovery uses the persisted workflow. */
 export function multiModelEnabled(repoRoot: string): boolean {
   try {
     const raw: unknown = JSON.parse(readFileSync(join(repoRoot, '.ai/cezar', 'config.json'), 'utf8'));
     const parsed = configSchema.safeParse(raw);
-    return parsed.success && parsed.data.multiModel;
+    return parsed.success && parsed.data.multiModel && !configTrackedByGit(repoRoot);
   } catch {
     return false;
   }
@@ -226,7 +247,11 @@ export async function loadConfig(repoRoot: string): Promise<CezConfig> {
   }
   try {
     const parsed = configSchema.safeParse(withMachineDefaults(JSON.parse(raw), machine));
-    if (parsed.success) return parsed.data;
+    if (parsed.success) {
+      return parsed.data.multiModel && configTrackedByGit(repoRoot)
+        ? { ...parsed.data, multiModel: false }
+        : parsed.data;
+    }
   } catch {
     // fall through — malformed JSON degrades to the default
   }

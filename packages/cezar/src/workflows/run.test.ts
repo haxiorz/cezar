@@ -945,13 +945,14 @@ describe('a bundled directory skill materializes with its requires closure into 
   beforeAll(async () => {
     repoRoot = mkdtempSync(join(tmpdir(), 'cez-bundled-run-'));
     mkdirSync(join(repoRoot, '.ai/cezar'), { recursive: true });
-    writeFileSync(join(repoRoot, '.ai/cezar/config.json'), JSON.stringify({ multiModel: true }));
     savedEnv.CEZ_DRY_RUN = process.env.CEZ_DRY_RUN;
     process.env.CEZ_DRY_RUN = '1';
     await run('git', ['init', '-q', '-b', 'main'], { cwd: repoRoot });
     writeFileSync(join(repoRoot, 'a.txt'), 'one\n');
     await run('git', ['add', '-A'], { cwd: repoRoot });
     await run('git', [...GIT_ID, 'commit', '-q', '-m', 'base'], { cwd: repoRoot });
+    // Local, untracked configuration: a committed file cannot opt a clone in (PR #925 review).
+    writeFileSync(join(repoRoot, '.ai/cezar/config.json'), JSON.stringify({ multiModel: true }));
     store = RunStore.open(join(repoRoot, '.ai/cezar'));
     manager = new RunManager(store, repoRoot);
   });

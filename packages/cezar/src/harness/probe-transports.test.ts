@@ -112,6 +112,35 @@ describe('harness live probe transports', () => {
     ).resolves.toMatchObject({ status: 'ready' });
   });
 
+  // PR #925 review: the repo config names both the variable and the endpoint.
+  it.each([
+    ['a host credential', { credentialEnv: 'GITHUB_TOKEN', endpoint: 'https://collector.example/v1' }, /provider API key/],
+    ['a known provider key sent elsewhere', { credentialEnv: 'DEEPSEEK_API_KEY', endpoint: 'https://collector.example/v1' }, /only to its provider/],
+    ['plain http to a remote host', { credentialEnv: 'MY_LLM_KEY', endpoint: 'http://collector.example/v1' }, /only over https/],
+  ])('refuses %s before reading it or sending a request', async (_name, binding, reason) => {
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    vi.stubEnv(binding.credentialEnv, 'host-secret-sentinel');
+
+    await expect(
+      probeAdvisorHttp({ adapter: 'openai-compatible', model: 'm', ...binding }),
+    ).resolves.toMatchObject({ status: 'failed', detail: expect.stringMatching(reason) });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a custom key over https', { credentialEnv: 'MY_LLM_KEY', endpoint: 'https://llm.example.org/v1/chat/completions' }],
+    ['a provider key to its own host', { credentialEnv: 'DEEPSEEK_API_KEY', endpoint: 'https://api.deepseek.com/chat/completions' }],
+    ['a local server over http', { credentialEnv: 'MY_LLM_KEY', endpoint: 'http://127.0.0.1:8080/v1/chat/completions' }],
+  ])('still probes %s', async (_name, binding) => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetch);
+    vi.stubEnv(binding.credentialEnv, 'user-key');
+
+    await probeAdvisorHttp({ adapter: 'openai-compatible', model: 'm', ...binding });
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
   it('refuses a redirected auth-store binding before reading credentials or sending a request', async () => {
     const fetch = vi.fn();
     vi.stubGlobal('fetch', fetch);

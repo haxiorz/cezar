@@ -1,5 +1,5 @@
 import type { HarnessProfile } from './types.js';
-import { advisorAuthStoreBindingIssue } from './advisor-identity.js';
+import { advisorCredentialBindingIssue } from './advisor-identity.js';
 
 export interface ResolvedRunnerRef {
   runner: 'claude' | 'codex' | 'opencode';
@@ -162,9 +162,9 @@ export function resolveHarnessPlan(
     if (!family) {
       return { ok: false, error: `reviewer "${reviewerId}" has no provider family` };
     }
-    const authStoreIssue = advisorAuthStoreBindingIssue(model);
-    if (authStoreIssue) {
-      return { ok: false, error: `reviewer "${reviewerId}" ${authStoreIssue}` };
+    const credentialIssue = advisorCredentialBindingIssue(model);
+    if (credentialIssue) {
+      return { ok: false, error: `reviewer "${reviewerId}" ${credentialIssue}` };
     }
     reviewers.push({ runner: 'harness', model: reviewerId, family });
   }

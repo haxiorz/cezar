@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -132,6 +133,23 @@ describe('loadConfig systemPrompt', () => {
       expect(config.multiModel).toBe(false);
       expect(multiModelEnabled(repoRoot)).toBe(false);
       expect(config.defaultRunner).toBe('codex');
+    });
+    // PR #925 review: a committed file speaks for every clone, so it cannot opt one in.
+    it('ignores multiModel in a git-tracked config, and honours it once untracked', async () => {
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd: repoRoot, stdio: 'ignore' });
+      git('init', '-q');
+      write({ multiModel: true, defaultRunner: 'codex' });
+      git('add', '.ai/cezar/config.json');
+      git('commit', '-q', '-m', 'commit cezar config');
+      const tracked = await loadConfig(repoRoot);
+      expect(tracked.multiModel).toBe(false);
+      expect(tracked.defaultRunner).toBe('codex');
+      expect(multiModelEnabled(repoRoot)).toBe(false);
+
+      git('rm', '-q', '--cached', '.ai/cezar/config.json');
+      expect((await loadConfig(repoRoot)).multiModel).toBe(true);
+      expect(multiModelEnabled(repoRoot)).toBe(true);
     });
     it('keeps synchronous admission and asynchronous config fail-closed on malformed files', async () => {
       for (const raw of ['{', 'null', '[]', '{"multiModel":true,"maxParallel":"invalid"}']) {
