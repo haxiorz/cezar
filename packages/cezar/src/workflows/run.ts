@@ -1038,7 +1038,10 @@ export function agentDirectories(
   libraryDir: string | undefined,
   env: Record<string, string>,
 ): string[] {
-  const dirs = [runsDir, ...(libraryDir ? [libraryDir] : []), ...(env.TMPDIR ? [env.TMPDIR] : [])];
+  // A stage-only harness phase gets its phase-output dir instead of the runs tree: on Linux every
+  // `--add-dir` is a sandbox write root, and the runs tree holds the guard and the ledger (PR #925 review).
+  const stageOnlyOutput = env.CEZ_HARNESS_STAGE_ONLY === '1' ? env.CEZ_HARNESS_OUTPUT_DIR : undefined;
+  const dirs = [stageOnlyOutput || runsDir, ...(libraryDir ? [libraryDir] : []), ...(env.TMPDIR ? [env.TMPDIR] : [])];
   // A dispatched run's tree directory (spec 2026-09-10-dispatch: the filesystem channel) — its
   // brief, its notes, its inbox. Same rule as TMPDIR: the env names it, so the file tools must
   // reach it.

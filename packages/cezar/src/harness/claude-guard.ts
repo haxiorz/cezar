@@ -190,6 +190,8 @@ export function createClaudeStageOnlySettings(
               filesystem: {
                 allowWrite: [outputDir],
                 denyRead: stageOnlyDeniedReads(),
+                // Host-side git follows the .git pointer, and the hook runs unsandboxed (PR #925 review).
+                denyWrite: [join(worktree, '.git'), guardDir],
               },
               // No egress: a stage-only phase has nothing to fetch (PR #925 review).
               network: {
@@ -223,8 +225,9 @@ export function createClaudeStageOnlySettings(
           filesystem: {
             denyRead: stageOnlyDeniedReads(),
             allowWrite: [worktree, outputDir, CLAUDE_CWD_MARKER_GLOB],
-            // Host-side git follows the worktree's .git pointer (git-pin.ts, PR #925 review).
-            denyWrite: [join(worktree, '.git')],
+            // Host-side git follows the worktree's .git pointer (git-pin.ts), and the hook runs
+            // unsandboxed (PR #925 review).
+            denyWrite: [join(worktree, '.git'), guardDir],
           },
           credentials: {
             envVars: [

@@ -272,19 +272,25 @@ describe('harness safety primitives', () => {
     const nativeArtifacts = join(root, 'native');
     const native = createClaudeStageOnlySettings(nativeArtifacts, worktree, join(nativeArtifacts, 'out'), 'linux');
     const nativeSandbox = (JSON.parse(readFileSync(native.settingsPath, 'utf8')) as {
-      sandbox: { network: { allowedDomains: string[] }; filesystem: { denyRead: string[] } };
+      sandbox: { network: { allowedDomains: string[] }; filesystem: { denyRead: string[]; denyWrite: string[] } };
     }).sandbox;
     expect(nativeSandbox.network.allowedDomains).toEqual([]);
     expect(nativeSandbox.filesystem.denyRead).toEqual(denied);
+    // The guard hook runs outside the sandbox; host git follows the pointer.
+    expect(nativeSandbox.filesystem.denyWrite).toEqual([
+      join(worktree, '.git'),
+      join(nativeArtifacts, 'claude-guard'),
+    ]);
 
     const macArtifacts = join(root, 'mac');
     createClaudeStageOnlySettings(macArtifacts, worktree, join(macArtifacts, 'out'), 'darwin');
     const runtime = JSON.parse(readFileSync(join(macArtifacts, 'claude-guard', 'sandbox-runtime.json'), 'utf8')) as {
       network: { allowedDomains: string[] };
-      filesystem: { denyRead: string[] };
+      filesystem: { denyRead: string[]; denyWrite: string[] };
     };
     expect(runtime.network.allowedDomains).toEqual([]);
     expect(runtime.filesystem.denyRead).toEqual(denied);
+    expect(runtime.filesystem.denyWrite).toEqual([join(worktree, '.git'), join(macArtifacts, 'claude-guard')]);
   });
 
   it('routes generic repositories to complete bundled Cezar skills by default', () => {
