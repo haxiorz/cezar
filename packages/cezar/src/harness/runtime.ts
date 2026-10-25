@@ -832,6 +832,9 @@ export async function runValidationCommands(
         continue;
       }
       const timeoutMs = opts.timeoutMs ?? VALIDATION_TIMEOUT_MS;
+      // Thrown from the child's 'close' listener it was an uncaught exception that took the whole
+      // server down; rethrown after the await it fails this run only (PR #925 review).
+      let exitRecordError: unknown;
       const result = await new Promise<{
         code: number | null;
         output: string;
@@ -903,7 +906,11 @@ export async function runValidationCommands(
           settled = true;
           clearTimeout(timer);
           opts.signal?.removeEventListener('abort', abort);
-          opts.onExit?.(command, index);
+          try {
+            opts.onExit?.(command, index);
+          } catch (error) {
+            exitRecordError = error;
+          }
           const captured = snapshot();
           resolve({
             code,
@@ -931,6 +938,7 @@ export async function runValidationCommands(
           settle(code);
         });
       });
+      if (exitRecordError !== undefined) throw exitRecordError;
       opts.onOutput?.(command, result.output);
       const passed = result.code === 0 && !result.timedOut;
       if (!passed) failed = true;

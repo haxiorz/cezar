@@ -316,6 +316,18 @@ describe('harness runtime bridge', () => {
     },
   );
 
+  // PR #925 review: a ledger write failing at a command's exit (ENOSPC, EACCES) threw from the
+  // child's 'close' listener — an uncaught exception that killed every run in every project.
+  it('fails the gate, not the process, when recording a command exit throws', async () => {
+    await expect(
+      runValidationCommands(['true'], dir, {
+        onExit: () => {
+          throw new Error('ENOSPC: no space left on device');
+        },
+      }),
+    ).rejects.toThrow(/ENOSPC/);
+  }, 10_000);
+
   // PR #925 review: a blocking read here froze the whole server, and again on every resume.
   it.skipIf(process.platform === 'win32')('runs the gate past a FIFO planted at package.json', async () => {
     execFileSync('mkfifo', [join(dir, 'package.json')]);
