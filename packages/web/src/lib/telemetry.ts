@@ -57,6 +57,11 @@ export function trackMessageSent(surface: Exclude<MessageSurface, 'cli'>): void 
   send('/api/v1/telemetry/event', { event: 'message_sent', label: surface })
 }
 
+/** Design Mode was switched on in a task's Preview (switching it off is not counted). */
+export function trackDesignModeEnabled(how: 'button' | 'shortcut'): void {
+  send('/api/v1/telemetry/event', { event: 'design_mode_enabled', label: how })
+}
+
 /** The new-task start-time menu (the arrow beside Send) was opened. */
 export function trackScheduleMenuOpened(): void {
   send('/api/v1/telemetry/event', { event: 'schedule_menu_opened', label: 'new_task' })

@@ -148,6 +148,7 @@ import { PROJECT_ID_RE } from '../workspace/config.ts';
 import { prunePrHeadRefs } from '../automations/pr-head.ts';
 import { MIN_SECRET_LEN } from '../core/secret-redaction.ts';
 import { track } from '../telemetry.ts';
+import { skillLabel, taskOriginOf, workflowLabel, type TaskOrigin } from '../feature-telemetry.ts';
 import { UiEventSink } from '../runs/ui-event-sink.ts';
 import type { UiEvent } from '../core/ui-events.ts';
 import {
@@ -514,6 +515,9 @@ interface ContinueRunOptions {
 interface ActiveRun {
   /** Existing harness runs keep their private skill catalog when the feature is disabled. */
   includeHarnessSkills: boolean;
+  /** Skills this session already counted as `skill_used` (telemetry); lazily created, so neither
+   *  construction site (`execute`, `runContinuation`) has to know about it. */
+  trackedSkills?: Set<string>;
   /** Identity of this async owner; stale promises must not mutate a replacement owner. */
   ownerToken: symbol;
   cancelled: boolean;
@@ -890,6 +894,8 @@ export interface StartRunInput {
   task: string;
   /** The cockpit device that started this task (telemetry only, `x-cezar-sid`). */
   deviceSid?: string;
+  /** Where the task came from (telemetry only, `task_origin`); unset = derived in `taskOriginOf`. */
+  origin?: TaskOrigin;
   model?: string;
   /** Agent backend chosen for this task (GUI). Unset = the config default. */
   runner?: RunnerId;
@@ -1890,6 +1896,12 @@ export class RunManager {
       { label: `${input.runner ?? 'default'}/${effectiveInput.model ?? 'default'}` },
       { sid: input.deviceSid },
     );
+    // Feature usage (docs/telemetry.md): one label per event, so the source and the workflow ride
+    // their own events beside `task_start`.
+    const origin = taskOriginOf(input);
+    track('task_origin', { label: origin }, { sid: input.deviceSid });
+    track('workflow_used', { label: workflowLabel(workflow, Boolean(input.dispatch?.parentRunId)) }, { sid: input.deviceSid });
+    if (input.dispatchIntent && !group) track('dispatch_tree_started', { label: 'toggle' }, { sid: input.deviceSid });
     this.pendingJobs.set(run.id, { workflow, input: effectiveInput });
     this.queue.push(run.id);
     void this.pump();
@@ -1905,7 +1917,9 @@ export class RunManager {
    */
   startVariants(workflow: WorkflowDef, input: StartRunInput, count: number): RunRecord[] {
     const groupId = randomUUID();
-    return VARIANT_LETTERS.slice(0, Math.min(Math.max(count, 1), VARIANT_LETTERS.length)).map(
+    const variants = Math.min(Math.max(count, 1), VARIANT_LETTERS.length);
+    if (variants > 1) track('variants_started', { label: String(variants) }, { sid: input.deviceSid });
+    return VARIANT_LETTERS.slice(0, variants).map(
       (variant) => {
         const hint = VARIANT_HINTS[variant];
         const task = hint ? `${input.task}\n\n${hint}` : input.task;
@@ -2908,7 +2922,10 @@ export class RunManager {
 
     // The parent becomes a root on its first dispatch; a dispatched parent keeps its tree.
     const rootRunId = parent.dispatch?.rootRunId ?? parent.id;
-    if (!parent.dispatch) this.store.updateRun(parentId, { dispatch: { rootRunId } });
+    if (!parent.dispatch) {
+      this.store.updateRun(parentId, { dispatch: { rootRunId } });
+      track('dispatch_tree_started', { label: 'agent' });
+    }
 
     const budget = this.carveChildBudget(this.store.getRun(parentId) ?? parent, runs, input.max_cost ?? intent?.budgetUsd);
     if ('refused' in budget) {
@@ -6958,6 +6975,12 @@ export class RunManager {
       if (!roots.length) {
         if (stepSkillMissing) track('skills_provisioned', { label: 'root_not_found', value: 0 });
         return [];
+      }
+      state.trackedSkills ??= new Set();
+      for (const skill of roots) {
+        if (state.trackedSkills.has(skill.name)) continue;
+        state.trackedSkills.add(skill.name);
+        track('skill_used', { label: skillLabel(skill) });
       }
       let installed: string[];
       if (inPlace) {
