@@ -83,8 +83,9 @@ export function advisorEnvCredentialIssue(binding: unknown): string | null {
   if (typeof name !== 'string' || !/^[A-Z_][A-Z0-9_]*_KEY$/.test(name) || HOST_SECRET_ENV.test(name)) {
     return 'may read only a provider API key (an environment variable ending in _KEY, never a host credential)';
   }
-  // A command adapter hands the key to a local CLI, not to an endpoint of its own.
-  if (model.adapter === 'command' || (model.endpoint === undefined && model.adapter !== 'openai-compatible')) return null;
+  // A command adapter hands the key to a local CLI, but an endpoint it names is pinned all the
+  // same: exempting it let the readiness probe send OPENAI_API_KEY anywhere (PR #925 review).
+  if (model.endpoint === undefined && model.adapter !== 'openai-compatible') return null;
   let endpoint: URL;
   try {
     endpoint = new URL(String(model.endpoint));

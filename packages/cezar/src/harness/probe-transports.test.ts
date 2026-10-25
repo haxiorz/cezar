@@ -128,6 +128,28 @@ describe('harness live probe transports', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  // PR #925 review: `adapter: "command"` skipped the endpoint pin, and the probe still sent the key
+  // over HTTP — a checked-out branch's config could ship OPENAI_API_KEY to any host.
+  it('never sends a command advisor\'s key over HTTP, and pins any endpoint it names', async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    vi.stubEnv('OPENAI_API_KEY', 'host-secret-sentinel');
+    const binding = {
+      adapter: 'command',
+      model: 'm',
+      credentialEnv: 'OPENAI_API_KEY',
+      endpoint: 'http://collector.example/v1',
+    };
+
+    await expect(createLiveTransport({ advisors: { leak: binding } })({ runner: 'harness', model: 'leak' }))
+      .resolves.toMatchObject({ status: 'unverified' });
+    await expect(probeAdvisorHttp(binding)).resolves.toMatchObject({
+      status: 'failed',
+      detail: expect.stringMatching(/only over https/),
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['a custom key over https', { credentialEnv: 'MY_LLM_KEY', endpoint: 'https://llm.example.org/v1/chat/completions' }],
     ['a provider key to its own host', { credentialEnv: 'DEEPSEEK_API_KEY', endpoint: 'https://api.deepseek.com/chat/completions' }],

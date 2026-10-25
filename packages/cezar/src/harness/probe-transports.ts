@@ -430,6 +430,11 @@ export function createLiveTransport(deps: {
       if (advisor.preset === 'kimi-subscription') {
         return probeKimiSubscription(advisor, { timeoutMs: deps.timeoutMs });
       }
+      // Only an adapter that calls an endpoint is probed over HTTP, as the runtime does: a command
+      // adapter never sends its key to one (PR #925 review).
+      if (advisor.adapter !== 'openai-compatible' && advisor.adapter !== 'preset') {
+        return { status: 'unverified', detail: `a ${advisor.adapter ?? 'command'} advisor is verified when its council runs` };
+      }
       return probeAdvisorHttp(advisor, { timeoutMs: deps.timeoutMs });
     }
     return { status: 'failed', detail: `unsupported harness probe transport: ${ref.runner}` };
