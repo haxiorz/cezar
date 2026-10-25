@@ -1,3 +1,7 @@
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { parse as parseToml } from 'smol-toml';
 import { codexReasoningEffortOf } from './reasoning-effort.ts';
 import { emitUsageWindows, normalizeCodexUsageWindows } from './usage-windows.ts';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -174,9 +178,7 @@ class CodexSession implements AgentSession {
       // runs tree, which holds the guard script and the run ledger (PR #925).
       const stageOnlyOutput =
         spec.env?.CEZ_HARNESS_STAGE_ONLY === '1' ? spec.env.CEZ_HARNESS_OUTPUT_DIR : undefined;
-      const writableRoots = stageOnlyOutput
-        ? ['-c', `sandbox_workspace_write.writable_roots=${JSON.stringify([stageOnlyOutput])}`]
-        : [];
+      const writableRoots = stageOnlyOutput ? codexStageOnlyArgs(spec.cwd, spec.env, stageOnlyOutput) : [];
       this.child = spawnCodexAppServer(bin, spec.cwd, spec.env, writableRoots);
       this.rpc = new CodexAppServerRpc(this.child);
     } catch (err) {
@@ -818,4 +820,41 @@ function safeStringify(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+/**
+ * Spawn-time config for a stage-only harness phase: its one extra writable root, no network from
+ * the sandbox, and none of the user's or project's MCP servers, whose tools run outside it (PR #925
+ * review). An override cannot remove a table, so each configured server is disabled by name; a
+ * name `-c` cannot address fails the phase instead of leaving the server live.
+ */
+export function codexStageOnlyArgs(cwd: string, env: Record<string, string> | undefined, outputDir: string): string[] {
+  const names = new Set<string>();
+  const home = env?.CODEX_HOME ?? process.env.CODEX_HOME ?? join(homedir(), '.codex');
+  for (const file of [join(home, 'config.toml'), join(cwd, '.codex', 'config.toml')]) {
+    let text: string;
+    try {
+      text = readFileSync(file, 'utf8');
+    } catch {
+      continue; // absent: nothing configured there
+    }
+    const servers = (parseToml(text) as { mcp_servers?: unknown }).mcp_servers;
+    if (servers && typeof servers === 'object') for (const name of Object.keys(servers)) names.add(name);
+  }
+  const args = [
+    '-c',
+    `sandbox_workspace_write.writable_roots=${JSON.stringify([outputDir])}`,
+    '-c',
+    'sandbox_workspace_write.network_access=false',
+  ];
+  for (const name of names) {
+    // `-c` splits its path on "." and its value on "="; spaces are fine (an argv element, no shell).
+    if (/[.=\n]/.test(name)) {
+      throw new Error(
+        `codex: a stage-only harness phase cannot disable MCP server "${name}" — rename it without "." or "="`,
+      );
+    }
+    args.push('-c', `mcp_servers.${name}.enabled=false`);
+  }
+  return args;
 }

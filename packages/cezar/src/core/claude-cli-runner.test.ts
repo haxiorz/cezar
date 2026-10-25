@@ -132,6 +132,9 @@ describe('buildClaudeArgs approval gate', () => {
       '--setting-sources',
       '',
     ]);
+    // PR #925 review: no user, project or private MCP server — their tools pass no guard.
+    expect(args).toContain('--strict-mcp-config');
+    expect(buildClaudeArgs(spec)).not.toContain('--strict-mcp-config');
   });
 });
 

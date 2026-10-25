@@ -186,6 +186,16 @@ describe('harness safety primitives', () => {
     expect(() => invoke({ command: 'gh issue view 42 --json title' })).not.toThrow();
     expect(() => invoke({ command: 'gh api -X POST repos/o/r/pulls' })).toThrow();
     expect(() => invoke({ command: 'gh api --method=DELETE repos/o/r/git/refs/heads/x' })).toThrow();
+    // PR #925 review: MCP tools run outside the sandbox and the path checks alike.
+    const invokeTool = (toolName: string) =>
+      execFileSync(process.execPath, [guardPath], {
+        input: JSON.stringify({ tool_name: toolName, tool_input: {} }),
+        env: { ...process.env, ...guard.env },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    expect((settings.hooks.PreToolUse[0] as { matcher?: string }).matcher).toContain('mcp__.*');
+    expect(() => invokeTool('mcp__github__create_pull_request')).toThrow();
+    expect(() => invokeTool('Read')).not.toThrow();
     expect(() => invoke({ command: 'gh api repos/o/r/issues/1/comments -f body=hi' })).toThrow();
     expect(() => invoke({ command: "gh api graphql -f query='mutation { closeIssue }'" })).toThrow();
     expect(() => invoke({ command: 'gh api repos/o/r/issues/1 --jq .title' })).not.toThrow();

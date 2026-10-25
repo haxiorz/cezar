@@ -1,6 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import type { AgentEvent } from './agent-runner.js';
 import { EOF_KILL_GRACE_MS, EOF_TERM_GRACE_MS, KILL_GRACE_MS } from './claude-cli-runner.js';
-import { CodexAppServerRunner, userInputAnswers } from './codex-app-server-runner.js';
+import { CodexAppServerRunner, codexStageOnlyArgs, userInputAnswers } from './codex-app-server-runner.js';
 import { RunStore } from '../runs/store.ts';
 
 /** Only the escalation tests below swap the child out; every other test in this
@@ -135,6 +135,31 @@ describe('a teardown cezar initiated (codex app-server)', () => {
     );
     await expect(session.result).resolves.toMatchObject({ sessionId: 'th_mock_1' });
   }, 15_000);
+
+  // PR #925 review: the user's [mcp_servers] and network setting carried into stage-only phases,
+  // and MCP tools run outside the workspace-write sandbox.
+  it('disables every configured MCP server and the network for a stage-only phase', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cez-codex-home-'));
+    const cwd = mkdtempSync(join(tmpdir(), 'cez-codex-cwd-'));
+    try {
+      writeFileSync(join(home, 'config.toml'), '[mcp_servers.github]\ncommand = "gh-mcp"\n\n[mcp_servers."Figma Desktop"]\nurl = "http://127.0.0.1:3845/mcp"\n');
+      mkdirSync(join(cwd, '.codex'));
+      writeFileSync(join(cwd, '.codex', 'config.toml'), '[mcp_servers.docs-2]\nurl = "https://x"\n');
+      expect(codexStageOnlyArgs(cwd, { CODEX_HOME: home }, '/out')).toEqual([
+        '-c', 'sandbox_workspace_write.writable_roots=["/out"]',
+        '-c', 'sandbox_workspace_write.network_access=false',
+        '-c', 'mcp_servers.github.enabled=false',
+        '-c', 'mcp_servers.Figma Desktop.enabled=false',
+        '-c', 'mcp_servers.docs-2.enabled=false',
+      ]);
+      // `-c` cannot address a dotted name: refuse rather than leave that server live.
+      writeFileSync(join(home, 'config.toml'), '[mcp_servers."odd.name"]\ncommand = "x"\n');
+      expect(() => codexStageOnlyArgs(cwd, { CODEX_HOME: home }, '/out')).toThrow(/cannot disable MCP server "odd.name"/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 
   it('surfaces a failed turn as an AgentEvent error', async () => {
     const runner = new CodexAppServerRunner({ bin: mockBin, timeoutMs: 0 });

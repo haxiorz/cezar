@@ -453,6 +453,8 @@ export function buildClaudeArgs(
     // Claude settings (for example sandbox allowWrite/excludedCommands).
     // `--settings` above remains the sole invocation-specific policy source.
     args.push('--setting-sources', '');
+    // Nor by any MCP server: their tools pass neither the guard nor the sandbox (PR #925 review).
+    args.push('--strict-mcp-config');
   }
   // Pin the session so the user can `claude --resume <sessionId>` in the repo
   // to take over interactively after a run. With `resume` we reopen the

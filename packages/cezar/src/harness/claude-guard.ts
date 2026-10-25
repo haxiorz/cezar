@@ -18,6 +18,10 @@ const refuse = (message) => {
   process.stderr.write(\`[cez-harness] \${message}\\n\`)
   process.exit(2)
 }
+// MCP tools run outside the sandbox and this guard's path checks alike.
+if (typeof input?.tool_name === 'string' && input.tool_name.startsWith('mcp__')) {
+  refuse(\`\${input.tool_name} is not available in a stage-only harness phase\`)
+}
 let worktree
 let outputDir
 try {
@@ -170,7 +174,7 @@ export function createClaudeStageOnlySettings(
   const hooks = {
     PreToolUse: [
       {
-        matcher: 'Bash|Edit|Write',
+        matcher: 'Bash|Edit|Write|mcp__.*',
         hooks: [{ type: 'command', command: `node ${JSON.stringify(guardPath)}` }],
       },
     ],

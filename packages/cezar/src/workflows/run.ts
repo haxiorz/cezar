@@ -1643,11 +1643,18 @@ export class RunManager {
   private async privateMcpForLaunch(
     backend: RunnerId,
     onEvent: (event: AgentEvent) => void,
+    stageOnly = false,
   ): Promise<PrivateMcpServer[] | undefined> {
     const { servers, problems } = await loadPrivateMcp(this.repoRoot);
     for (const problem of problems) onEvent({ type: 'note', message: `private MCP: ${problem}` });
     if (servers.length === 0) return undefined;
     const names = servers.map((s) => s.name);
+    // MCP tools pass neither the stage-only guard nor its sandbox: a GitHub server could publish
+    // from a run that promises it never does (PR #925 review).
+    if (stageOnly) {
+      onEvent({ type: 'note', message: skippedServersNote(backend, names, 'a stage-only harness phase gets no MCP servers') });
+      return undefined;
+    }
     if (!supportsPrivateMcp(backend)) {
       onEvent({ type: 'note', message: skippedServersNote(backend, names, `${backend} has no launch-time MCP channel`) });
       return undefined;
@@ -7708,7 +7715,7 @@ export class RunManager {
     this.store.updateStep(runId, step.id, { profileId: stepProfile.profileId });
 
     const runner = createRunner(stepBackend);
-    const stepMcp = await this.privateMcpForLaunch(stepBackend, onEvent);
+    const stepMcp = await this.privateMcpForLaunch(stepBackend, onEvent, opts.env?.CEZ_HARNESS_STAGE_ONLY === '1');
     let session: AgentSession;
     state.currentStepId = step.id;
     this.beginUsageInvocation(runId, state, step.id);
