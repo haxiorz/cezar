@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { lstatSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { readHarnessFsEntry } from './harness/fs-read.ts';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 
 /**
@@ -74,25 +75,30 @@ export function pinnedGitEnv(cwd: string): Record<string, string> | undefined {
  * the host, not editing code.
  */
 export function verifyWorktreeGitPointer(workTree: string, gitDir: string): { ok: true } | { ok: false; error: string } {
-  const pointer = join(workTree, '.git');
+  // One no-follow descriptor read (CodeQL js/file-system-race): the model owns this path.
   try {
-    const stat = lstatSync(pointer);
-    if (stat.isFile()) {
-      const line = readFileSync(pointer, 'utf8').trim();
-      const match = /^gitdir:\s*(.+)$/.exec(line);
-      if (match) {
-        const named = isAbsolute(match[1]!) ? match[1]! : resolve(workTree, match[1]!);
-        if (realpathSync(named) === realpathSync(gitDir)) return { ok: true };
-      }
+    const entry = readHarnessFsEntry(join(workTree, '.git'), 64 * 1024);
+    const match = entry.kind === 'file' && entry.content
+      ? /^gitdir:\s*(.+)$/.exec(entry.content.toString('utf8').trim())
+      : null;
+    if (match) {
+      const named = isAbsolute(match[1]!) ? match[1]! : resolve(workTree, match[1]!);
+      if (realpathSync(named) === realpathSync(gitDir)) return { ok: true };
     }
   } catch {
     // missing, unreadable or dangling: tampered all the same
   }
+  return { ok: false, error: `the worktree's .git pointer was rewritten (${restoreGitPointer(workTree, gitDir)}) — restored; refusing to continue` };
+}
+
+/** Put git's own pointer back, whatever stands in its place. Returns the pointer's path. */
+function restoreGitPointer(workTree: string, gitDir: string): string {
+  const pointer = join(workTree, '.git');
   try {
     rmSync(pointer, { recursive: true, force: true });
     writeFileSync(pointer, `gitdir: ${gitDir}\n`, 'utf8');
   } catch {
     // unwritable: the run still fails closed
   }
-  return { ok: false, error: `the worktree's .git pointer was rewritten (${pointer}) — restored; refusing to continue` };
+  return pointer;
 }
