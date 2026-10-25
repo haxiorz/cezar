@@ -17,8 +17,10 @@ if (mode === 'handled') {
 }
 if (spawner === 'harness') {
   // A harness spawn (validation gate, probe, runtime op): detached by its own code, not a runner's.
+  // A constant command, never argv (CodeQL js/indirect-command-line-injection): the test copies
+  // the fake agent into `cwd`.
   const { runValidationCommands } = await import('../../../harness/runtime.ts');
-  void runValidationCommands([bin], cwd);
+  void runValidationCommands(['./fake-agent.mjs'], cwd);
 } else {
   const { spawnCodexAppServer } = await import('../../codex-app-server-transport.ts');
   const child = spawnCodexAppServer(bin, cwd);
