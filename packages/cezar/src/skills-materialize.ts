@@ -50,8 +50,14 @@ async function materializeOne(cwd: string, skill: Skill): Promise<boolean> {
   // Frontmatter verbatim, joined into the target path: `../x` would write outside the worktree
   // from the host process, past every agent sandbox (PR #925 review). Covers `requires:` too.
   if (!isSafeSkillName(skill.name)) return false;
+  // Every copy is ignored in THIS worktree (a self-ignoring .gitignore); the shared info/exclude
+  // would also hide the path in the user's own checkout (PR #925 review).
+  const ignoreHere = () =>
+    ignoreProvisioned(cwd, '.claude/skills', skill.name).catch(() =>
+      excludeFromGit(cwd, `.claude/skills/${skill.name}/`),
+    );
   if (skill.source === 'team') {
-    return skill.team?.dir ? materializeSkillDir(cwd, skill).catch(() => false) : true;
+    return skill.team?.dir ? materializeSkillDir(cwd, skill, '.claude/skills', ignoreHere).catch(() => false) : true;
   }
   if (!skill.path.endsWith('SKILL.md')) return true;
   let srcDir: string;
@@ -66,10 +72,7 @@ async function materializeOne(cwd: string, skill: Skill): Promise<boolean> {
     const existing = await stat(target).catch(() => null);
     if (existing?.isDirectory()) return true; // idempotent across phases/restarts
     await cp(srcDir, target, { recursive: true, dereference: true });
-    // Worktree-local: the shared info/exclude would hide the path in the user's checkout too.
-    await ignoreProvisioned(cwd, '.claude/skills', skill.name).catch(() =>
-      excludeFromGit(cwd, `.claude/skills/${skill.name}/`),
-    );
+    await ignoreHere();
     return true;
   } catch {
     return false;

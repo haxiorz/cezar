@@ -3,9 +3,10 @@ import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Skill } from './skills.js';
 import { ensureSkillOnDisk } from './skills-materialize.js';
+import { bareDirFor } from './skills-remote.js';
 
 const run = promisify(execFile);
 const tempDirs: string[] = [];
@@ -63,6 +64,39 @@ describe('ensureSkillOnDisk', () => {
     expect(exclude).not.toContain('cez-harness');
     const { stdout } = await run('git', ['status', '--porcelain', '--untracked-files=all'], { cwd });
     expect(stdout).toBe('');
+  });
+
+  // PR #925 review (fourth round): team skills took materializeSkillDir's default ignore, the
+  // shared info/exclude — on the default path of every worktree run with a team step skill.
+  it('ignores a team skill copy in this worktree only, never the shared info/exclude', async () => {
+    vi.stubEnv('HOME', await tmp('cez-mat-home-'));
+    try {
+      const repo = 'https://example.invalid/org/team-skills';
+      const src = await tmp('cez-mat-team-src-');
+      await run('git', ['init', '-q', '-b', 'main'], { cwd: src });
+      await writeDirSkill(src, 'team-skill');
+      await run('git', ['add', '-A'], { cwd: src });
+      await run('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'skill'], { cwd: src });
+      await run('git', ['clone', '-q', '--bare', src, bareDirFor(repo)]);
+      const cwd = await tmp('cez-mat-cwd-');
+      await run('git', ['init', '-q'], { cwd });
+      const skill: Skill = {
+        name: 'team-skill',
+        body: 'team-skill body',
+        path: `${repo}@main:team-skill/SKILL.md`,
+        source: 'team',
+        team: { repo, ref: 'main', path: 'team-skill/SKILL.md', dir: true },
+      };
+
+      expect(await ensureSkillOnDisk(cwd, skill, [skill])).toBe(true);
+      expect((await stat(join(cwd, '.claude', 'skills', 'team-skill', 'references', 'a.md'))).isFile()).toBe(true);
+      const exclude = await readFile(join(cwd, '.git', 'info', 'exclude'), 'utf8').catch(() => '');
+      expect(exclude).not.toContain('team-skill');
+      const { stdout } = await run('git', ['status', '--porcelain', '--untracked-files=all'], { cwd });
+      expect(stdout).toBe('');
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   // PR #925 review: the frontmatter name is joined into the target path.
