@@ -2575,6 +2575,31 @@ describe('harness driver — standard fix-issue graph', () => {
   });
 
   // PR #925 review (D5): a Stop or a crash ends no attempt, so it must not spend the retry budget.
+  // PR #925 review (fifth round): a usage limit or runner error spent the budget, so after two
+  // every resume failed at once and auto-resume stopped re-arming.
+  it('does not charge runner failures like a usage limit to the two-attempt budget', async () => {
+    let implementCalls = 0;
+    const entry = () => {
+      const h = makeHarness(dir);
+      h.agentBehavior.set('implement', (req) => {
+        implementCalls += 1;
+        if (implementCalls <= 2) return 'claude CLI exited with code 1 — usage limit reached, resets at 5pm';
+        writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/a.ts'] }), 'utf8');
+        return null;
+      });
+      return h;
+    };
+    for (let limited = 0; limited < 2; limited += 1) {
+      const h = entry();
+      expect(await runHarnessDriver(h.host, input, h.deps)).toMatch(/usage limit/);
+    }
+    const resumed = entry();
+
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+    expect(implementCalls).toBe(3);
+    expect(loadLedger(resumed.host.dataDir, resumed.host.runId)?.stage.status).toBe('staged');
+  });
+
   it('does not charge cancelled implement attempts to the two-attempt budget', async () => {
     let cancelled = false;
     let implementCalls = 0;

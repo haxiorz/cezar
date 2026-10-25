@@ -725,6 +725,8 @@ export async function runHarnessDriver(
   };
   const entryPointerIssue = gitPointerIssue();
   if (entryPointerIssue) return entryPointerIssue;
+  /** Failures that are evidence against the phase, not a runner that could not deliver. */
+  const integrityFailures = new Set<string>();
 
   const ledgerRead = readLedger(host.dataDir, host.runId);
   if (ledgerRead.status === 'corrupt') {
@@ -1074,7 +1076,10 @@ export async function runHarnessDriver(
     // An agent CLI runs its own git outside the tool sandbox at session start: check the pointer
     // before every phase, and after it before any host-side git reads the worktree.
     const pointerBefore = gitPointerIssue();
-    if (pointerBefore) return pointerBefore;
+    if (pointerBefore) {
+      integrityFailures.add(pointerBefore);
+      return pointerBefore;
+    }
     const failure = await host.runAgent({
       ...request,
       ...(trustedPrompt ? { skillSystemPrompt: trustedPrompt } : {}),
@@ -1103,7 +1108,9 @@ export async function runHarnessDriver(
         emitInvocation(invocation);
       },
     });
-    return gitPointerIssue() ?? failure;
+    const pointerAfter = gitPointerIssue();
+    if (pointerAfter) integrityFailures.add(pointerAfter);
+    return pointerAfter ?? failure;
   };
 
   const emitPhase = (phaseId: string) => {
@@ -1638,6 +1645,7 @@ export async function runHarnessDriver(
             : {}),
         });
       }
+      const runnerFailure = failure;
       if (reviewSubjectBefore !== undefined) {
         try {
           const after = await snapshotReviewSubject(host.cwd);
@@ -1656,7 +1664,11 @@ export async function runHarnessDriver(
         return { cancelled: true };
       }
       if (failure) {
-        finishInvocation(invocation, 'failed', { error: failure });
+        // A runner that never delivered (usage limit, crash, network) spent no contract attempt,
+        // or two such failures left every later resume dead (PR #925 review); an integrity
+        // failure — a mutated subject, a rewritten .git pointer — still counts.
+        const spent = failure !== runnerFailure || integrityFailures.has(failure);
+        finishInvocation(invocation, spent ? 'failed' : 'interrupted', { error: failure });
         finishPhase(ledger, phaseId, 'failed', failure);
         persist();
         host.setStepStatus(phaseId, 'failed', failure);
