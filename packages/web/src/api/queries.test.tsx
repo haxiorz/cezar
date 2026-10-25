@@ -39,6 +39,7 @@ import {
   STAR_COUNT_REFRESH_MS,
   workspaceQueryKeys,
   __clearRememberedStatusesForTests,
+  useHarnessStatus,
 } from './queries'
 
 const fetchMock = vi.fn<typeof fetch>()
@@ -76,6 +77,22 @@ function wrapper() {
     return <QueryClientProvider client={client}>{children}</QueryClientProvider>
   }
 }
+
+// PR #925 review: "Configure models" rewrites the roster on disk, and a cached status hid it.
+it('refetches the harness status on every mount', async () => {
+  fetchMock.mockImplementation(async () => json({ enabled: true, models: [], profiles: [], driven: [] }))
+  const client = createQueryClient()
+  const shared = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  )
+  const statusCalls = () => fetchMock.mock.calls.filter((call) => String(call[0]).endsWith('/harness/status')).length
+  const first = renderHook(() => useHarnessStatus(), { wrapper: shared })
+  await waitFor(() => expect(first.result.current.isSuccess).toBe(true))
+  first.unmount()
+  const second = renderHook(() => useHarnessStatus(), { wrapper: shared })
+  await waitFor(() => expect(statusCalls()).toBe(2))
+  second.unmount()
+})
 
 it('refreshes a reviewer conversation when feedback reuses its invocation id', async () => {
   fetchMock.mockResolvedValueOnce(json({ result: 'old review' }))

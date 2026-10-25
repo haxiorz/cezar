@@ -328,6 +328,16 @@ export function findSubagent(
  * The children the sheet renders for one agent — the same cross-turn relation the dock counts,
  * exposed so the drill-down and the row count can never drift apart.
  */
+/**
+ * The open agent's sheet body. The paged history has the agent's full transcript once its Task
+ * anchor is loaded; a long-running agent's anchor can still sit before the loaded pages, and then
+ * the current-state feed's retained tail beats an empty sheet (PR #925 review).
+ */
+export function subagentSheetChildren(paged: ThreadTurn[], current: ThreadTurn[], parentId: string): ThreadEntry[] {
+  const anchored = paged.some((turn) => turn.items.some((entry) => entry.id === parentId && isRootTaskItem(entry)))
+  return subagentChildren(anchored ? paged : current, parentId)
+}
+
 export function subagentChildren(turns: ThreadTurn[], parentId: string): ThreadEntry[] {
   const anchorIndex = turns.findIndex((turn) =>
     turn.items.some((entry) => entry.id === parentId && isRootTaskItem(entry)),

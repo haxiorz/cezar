@@ -10,6 +10,7 @@ import {
   subagentActivityText,
   subagentChildren,
   subagentCounts,
+  subagentSheetChildren,
 } from './subagent-dock'
 import type { ThreadEntry, ThreadTurn } from './thread-state'
 
@@ -287,6 +288,17 @@ describe('collectSubagents — children', () => {
     expect(collectSubagents(turns)[0]!.toolCalls).toBe(1)
     expect(collectSubagents(turns)[0]!.activity).toBe('Ran npm test')
     expect(subagentChildren(turns, 'a').map((c) => c.id)).toEqual(['c1'])
+  })
+
+  // PR #925 review: the sheet read only the paged history, so an agent whose Task start had
+  // scrolled before the loaded pages opened a blank sheet.
+  it('reads the sheet from the paged history once it holds the anchor, else the current feed', () => {
+    const current = [turn('turn-1', [task('a', 'running'), childTool('c-tail', 'a', 'Tail tool')])]
+    const pagedWithoutAnchor = [turn('turn-9', [childTool('c-paged', 'a', 'Paged tool')])]
+    expect(subagentSheetChildren(pagedWithoutAnchor, current, 'a').map((c) => c.id)).toEqual(['c-tail'])
+
+    const pagedWithAnchor = [turn('turn-1', [task('a', 'running'), childTool('c1', 'a', 'One'), childTool('c2', 'a', 'Two')])]
+    expect(subagentSheetChildren(pagedWithAnchor, current, 'a').map((c) => c.id)).toEqual(['c1', 'c2'])
   })
 
   it('leaves activity undefined when the agent has no children yet', () => {

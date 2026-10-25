@@ -42,7 +42,7 @@ import { useDeliverPrompt } from './deliver-prompt'
 import { AgentsDock } from './agents-dock'
 import { PlanDock, planCounts } from './plan-dock'
 import { SkillsDock } from './skills-dock'
-import { collectSkills, collectSubagents, findSubagent, subagentChildren } from './subagent-dock'
+import { collectSkills, collectSubagents, findSubagent, subagentSheetChildren } from './subagent-dock'
 import { SubagentSheet } from './subagent-sheet'
 import { AcceptCelebration, ReviewPanel } from './review-panel'
 import { queuePosition } from './run-actions'
@@ -325,8 +325,8 @@ export function ThreadView({
   // it from the visible paged thread. Otherwise progressive history reduces a long-running
   // agent to the few tail items retained by `/history-context`.
   const openAgentChildren = useMemo(
-    () => (openAgentId === undefined ? [] : subagentChildren(thread.turns, openAgentId)),
-    [thread.turns, openAgentId],
+    () => (openAgentId === undefined ? [] : subagentSheetChildren(thread.turns, currentThread.turns, openAgentId)),
+    [thread.turns, currentThread.turns, openAgentId],
   )
   // The reply composer's unsent content (#939) — server-side, per run, restored on return.
   const draft = useDraft(run.id, 'composer')

@@ -1629,11 +1629,14 @@ export function useHarnessStatus(enabled = true) {
     queryKey: queryKeys.harness.status,
     queryFn: ({ signal }) => getHarnessStatus({ signal }),
     enabled,
+    // "Configure models" rewrites the roster on disk; a cached answer hid it for five minutes
+    // (PR #925 review). Status is a cheap config read — the billed probe keeps its cache.
+    refetchOnMount: 'always',
   })
 }
 
 /** Probe one profile's readiness. Keyed per profile so switching the segment shows each
- *  profile's own cached answer instantly; a fresh probe still runs on mount. */
+ *  profile's own cached answer instantly; probes are live model calls, so the cache stands. */
 export function useHarnessProbe(
   profile: HarnessProfile | undefined,
   roles: HarnessRoles | undefined,

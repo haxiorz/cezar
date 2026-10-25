@@ -268,6 +268,18 @@ describe('harness review route', () => {
     expect(container.querySelector('main')).toBeNull()
   })
 
+  // PR #925 review: a blocked outcome offered "Accept risk", which the server always refuses.
+  it('offers risk acceptance only for a contested outcome', async () => {
+    stubApi(() => ({
+      ...ledger(),
+      outcome: { status: 'blocked', blockingReasons: ['implementation council did not reach quorum'] },
+    }))
+    renderRoute('review')
+    await screen.findByText('This run is blocked')
+    expect(screen.queryByRole('button', { name: 'Accept risk' })).toBeNull()
+    expect(screen.queryByLabelText('Reason for accepting contested result')).toBeNull()
+  })
+
   it('refreshes the cached ledger after feedback and shows the new first review round', async () => {
     let snapshot = ledger()
     snapshot.councils[0]!.round = 3

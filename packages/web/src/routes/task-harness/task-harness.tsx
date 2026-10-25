@@ -521,7 +521,9 @@ function OutcomeBanner({ runId, ledger }: { runId: string; ledger: HarnessLedger
               ? `Accepted ${ledger.outcome.acceptedAt}: ${ledger.outcome.acceptanceReason}`
               : specPaused
                 ? 'No implementation has started. Accepting records the decision and resumes the same hash-bound run.'
-                : 'The staged work is preserved. Send the run back to resolve these, or record why publishing is safe anyway.'}
+                : status === 'contested'
+                  ? 'The staged work is preserved. Send the run back to resolve these, or record why publishing is safe anyway.'
+                  : 'The staged work is preserved. Resolve these and continue the run.'}
           </p>
 
           {!accepted ? (
@@ -540,7 +542,8 @@ function OutcomeBanner({ runId, ledger }: { runId: string; ledger: HarnessLedger
             </ul>
           ) : null}
 
-          {!accepted ? (
+          {/* Only a contested outcome can be accepted; the server refuses every other (PR #925 review). */}
+          {!accepted && status === 'contested' ? (
             <form
               className="mt-3 flex flex-col gap-2 sm:flex-row"
               onSubmit={(event) => {
