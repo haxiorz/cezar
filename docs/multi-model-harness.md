@@ -215,8 +215,11 @@ prompt instructions are how you get 8/10 worktree escapes. It's enforced in laye
 4. **The validation gate is not sandboxed.** It runs the base ref's commands the
    way CI would, in the worktree the implementer wrote — so the scripts behind
    `npm test` are model-authored code. It gets no provider credentials
-   (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, advisor keys), but it does run as you,
-   with your home directory, like any other cezar task's agent.
+   (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, advisor keys), and the default push paths
+   are closed as in writing phases: no ssh-agent, askpass, gh login or credential
+   helper, and git may use only local transports. It still runs as you, with your
+   home directory, so code that goes looking for credentials on disk is not stopped —
+   only sandboxing the gate would close that.
 5. **Server-side twin.** Push and PR routes 409 until the ledger proves
    `stage.status === 'staged'` and the outcome is `ready` (or a `contested`
    outcome the human explicitly accepted).
@@ -333,6 +336,15 @@ to the existing `.ai/cezar/config.json` object, preserving its other keys (or cr
 `{ "multiModel": true }` when the file does not exist). Reload the cockpit to reveal
 the **Multi-model** composer and **Harness** settings. The project config API also
 accepts `PUT /api/v1/p/:projectId/config` with `{ "multiModel": true }`.
+
+The key counts only in local, untracked configuration. Turning the feature on trusts the
+repository's harness config — its reviewer endpoints and commands — so a git-tracked
+`.ai/cezar/config.json` cannot do it for every clone: the key is ignored there and the
+config API answers 409, the same rule as worktree scripts and auto-land. A reviewer's
+`credentialEnv` must name a provider API key (`…_KEY`, never a GitHub, cloud, npm, SSH or
+Anthropic credential); a known provider's key goes only to that provider's host, presets
+only to their official endpoint, and anything else only over `https:` (or `http:` to a
+loopback server).
 
 Set the key to `false`, remove it, or send `null` through the config API to disable
 new harness runs and live model probes. Missing, malformed and unreadable config

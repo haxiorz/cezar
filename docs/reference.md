@@ -725,8 +725,8 @@ works and how to redeploy new versions.
 ## Configuration (optional)
 
 The experimental multi-model harness is hidden by default. Enable it per repository
-with `"multiModel": true` in `.ai/cezar/config.json`; see
-[the opt-in and recovery behavior](multi-model-harness.md#enabling-the-feature).
+with `"multiModel": true` in a local, untracked `.ai/cezar/config.json` (a git-tracked file
+cannot enable it); see [the opt-in and recovery behavior](multi-model-harness.md#enabling-the-feature).
 
 Zero config is the default — everything below is opt-in via
 `.ai/cezar/config.json` (a missing or invalid file simply uses the defaults, and
