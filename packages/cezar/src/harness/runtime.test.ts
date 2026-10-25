@@ -225,6 +225,33 @@ describe('harness runtime bridge', () => {
     expect(checks[2]).toMatchObject({ command: 'echo never', status: 'skipped', exitCode: null });
   });
 
+  // PR #925 review (third round): a model-written test could push with the user's ssh-agent.
+  it.skipIf(process.platform === 'win32')(
+    'runValidationCommands closes the default push paths but keeps local git working',
+    async () => {
+      vi.stubEnv('SSH_AUTH_SOCK', '/tmp/user-agent.sock');
+      try {
+        const remote = join(dir, 'remote.git');
+        execFileSync('git', ['init', '-q', '--bare', remote]);
+        const [check] = await runValidationCommands(
+          [
+            [
+              'test -z "$SSH_AUTH_SOCK"',
+              'test "$GIT_ASKPASS" = /usr/bin/false',
+              'test -d "$GH_CONFIG_DIR" && test -z "$(ls -A "$GH_CONFIG_DIR")"',
+              '! git ls-remote ssh://git@example.invalid/org/repo.git 2>ssh.err && grep -q "not allowed" ssh.err',
+              `git ls-remote ${JSON.stringify(remote)} >/dev/null`,
+            ].join(' && '),
+          ],
+          dir,
+        );
+        expect(check).toMatchObject({ status: 'passed', exitCode: 0 });
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
   // PR #925 security review: `npm test` runs model-written scripts unsandboxed.
   it('runValidationCommands never hands provider credentials to the validated code', async () => {
     vi.stubEnv('ANTHROPIC_API_KEY', 'sk-ant-test');

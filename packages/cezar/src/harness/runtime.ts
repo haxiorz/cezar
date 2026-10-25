@@ -759,8 +759,21 @@ export async function runValidationCommands(
   let failed = false;
   const inherited = harnessChildEnvironment();
   for (const name of HARNESS_PROVIDER_CREDENTIAL_ENV) delete inherited[name];
-  const baseEnvironment = {
+  // The gate runs model-written scripts unsandboxed, so the default push paths are closed as in
+  // writing phases — no ssh-agent, askpass, gh login or credential helper — and git may use only
+  // local transports, which test suites cloning fixtures still need (PR #925 review).
+  const noGitHubAuthDir = mkdtempSync(join(tmpdir(), 'cez-gate-no-gh-'));
+  const baseEnvironment: Record<string, string> = {
     ...inherited,
+    SSH_AUTH_SOCK: '',
+    GIT_ASKPASS: '/usr/bin/false',
+    SSH_ASKPASS: '/usr/bin/false',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_ALLOW_PROTOCOL: 'file',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'credential.helper',
+    GIT_CONFIG_VALUE_0: '',
+    GH_CONFIG_DIR: noGitHubAuthDir,
     ...opts.env,
   };
   let corepackShimDir: string | undefined;
@@ -970,6 +983,7 @@ export async function runValidationCommands(
     if (corepackShimDir) {
       rmSync(corepackShimDir, { recursive: true, force: true });
     }
+    rmSync(noGitHubAuthDir, { recursive: true, force: true });
   }
   return checks;
 }
