@@ -54,6 +54,76 @@ describe('harness lifecycle boundaries', () => {
     vi.unstubAllEnvs();
   });
 
+  // PR #925 review (fourth round): the harness Continue path re-queued without retiring a pending
+  // usage-limit resume, so a later failure re-armed it without the user.
+  it('retires a pending usage-limit resume when a harness run is continued', () => {
+    manager.dispose();
+    manager = new RunManager(store, root, { semaphore: new WorkspaceSemaphore({ initial: { maxParallel: 0 } }) });
+    const run = store.createRun({ title: 't', workflow: workflow.name, task: 'Fix issue #642', steps: [] });
+    store.updateRun(run.id, {
+      status: 'failed',
+      workflowDef: workflow,
+      harness: { profile: 'standard', workflow: workflow.name, issueId: '642' },
+      autoResumeAt: new Date(Date.now() + 3_600_000).toISOString(),
+      autoResumeAttempts: 1,
+    });
+
+    expect(manager.continueRun(run.id)).toEqual({ ok: true });
+
+    expect(store.getRun(run.id)?.autoResumeAt).toBeUndefined();
+    expect(store.getRun(run.id)?.autoResumeAttempts).toBeUndefined();
+  });
+
+  // PR #925 review (fourth round): the usage-limit resume path armed periodic autosave without
+  // the stage-only flag, so a resumed harness run committed mid-run.
+  it('never arms periodic autosave for a harness run, from any call site', () => {
+    vi.stubEnv('CEZ_AUTOSAVE', '1');
+    const arm = (manager as unknown as {
+      armAutosave(runId: string, state: { cwd: string; autosaveTimer?: ReturnType<typeof setInterval>; includeHarnessSkills: boolean }): void;
+    }).armAutosave.bind(manager);
+    const harnessRun = store.createRun({ title: 't', workflow: workflow.name, task: 'x', steps: [] });
+    store.updateRun(harnessRun.id, { harness: { profile: 'standard', workflow: workflow.name } });
+    const harnessState = { cwd: join(root, 'wt'), includeHarnessSkills: false } as { cwd: string; autosaveTimer?: ReturnType<typeof setInterval>; includeHarnessSkills: boolean };
+    arm(harnessRun.id, harnessState);
+    expect(harnessState.autosaveTimer).toBeUndefined();
+
+    const plainRun = store.createRun({ title: 't', workflow: 'quick-task', task: 'x', steps: [] });
+    const plainState = { cwd: join(root, 'wt2'), includeHarnessSkills: false } as typeof harnessState;
+    arm(plainRun.id, plainState);
+    expect(plainState.autosaveTimer).toBeDefined();
+    clearInterval(plainState.autosaveTimer);
+  });
+
+  // PR #925 review (fourth round): the usage-limit auto-resume sent its prompt as a Continue
+  // message, which a harness run treats as operator feedback — refused for implemented packets.
+  it('auto-resumes a usage-limited harness run from its ledger, sending no feedback', async () => {
+    const run = store.createRun({ title: 't', workflow: workflow.name, task: 'Fix issue #642', steps: [] });
+    store.updateRun(run.id, {
+      status: 'failed',
+      error: 'phase "fix-2" failed: rate limit exceeded — try again in 42 minutes',
+      workflowDef: workflow,
+      autoResumeAt: new Date(Date.now() - 1_000).toISOString(),
+      harness: { profile: 'high-assurance', workflow: workflow.name },
+      steps: [{
+        id: 'fix-2',
+        name: 'Fix',
+        kind: 'agent',
+        status: 'failed',
+        sessionId: 'session-1',
+        error: 'rate limit exceeded — try again in 42 minutes',
+      }],
+    } as never);
+    const ledger = createLedger({ workflow: workflow.name, requestedProfile: 'high-assurance', subject: { kind: 'issue', id: '642', text: 'Fix issue #642' } });
+    ledger.phases.push({ id: 'implement', name: 'Implement', kind: 'agent', status: 'done', attempts: 1, artifacts: {} });
+    saveLedger(join(root, '.ai/cezar'), run.id, ledger);
+
+    (manager as unknown as { fireAutoResume(runId: string): void }).fireAutoResume(run.id);
+
+    await vi.waitFor(() => expect(runHarnessDriver).toHaveBeenCalled(), { timeout: 10_000 });
+    expect(loadLedger(join(root, '.ai/cezar'), run.id)?.pendingMessages).toEqual([]);
+    expect(store.getRun(run.id)?.autoResumeAt).toBeUndefined();
+  });
+
   it('keeps harness changes isolated and staged in an auto-landing trunk project', async () => {
     config({ multiModel: true, taskWorkspace: 'in-place', landing: 'auto', skillsRepos: [] });
     vi.mocked(runHarnessDriver).mockImplementation(async (host) => {

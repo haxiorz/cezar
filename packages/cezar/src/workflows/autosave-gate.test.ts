@@ -20,7 +20,7 @@ interface TimerState {
 }
 
 interface TimerSeam {
-  armAutosave(runId: string, state: TimerState, stageOnlyHarness?: boolean): void;
+  armAutosave(runId: string, state: TimerState): void;
   clearAutosaveTimer(state: TimerState): void;
   active: Map<string, unknown>;
 }
@@ -96,9 +96,11 @@ describe('periodic autosave gate (#471)', () => {
 
   it('never arms the timer for a stage-only harness run', () => {
     process.env.CEZ_AUTOSAVE = '1';
+    // Decided from the record, so no call site can forget it (PR #925 review).
+    store.updateRun(runId, { harness: { profile: 'standard', workflow: 'harness-fix-issue' } });
     const state: TimerState = { cancelled: false, interrupt: () => undefined, cwd: worktreePath };
     manager.active.set(runId, state);
-    manager.armAutosave(runId, state, true);
+    manager.armAutosave(runId, state);
     manager.active.delete(runId);
     expect(state.autosaveTimer).toBeUndefined();
   });

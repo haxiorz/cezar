@@ -89,6 +89,7 @@ import {
   worktreeDiff,
   worktreeShortstat,
 } from '../git-worktree.ts';
+import { pinWorktreeGitDir, resolveTrustedGitDir } from '../git-pin.ts';
 import { commentOnIssue, commentOnPr, fetchGithubChecks, updatePr } from '../server/forge/github.ts';
 import { createDraftPr } from '../server/pr.ts';
 import { createOrSwitchBranch } from '../server/git-changes.ts';
@@ -1484,6 +1485,13 @@ export class RunManager {
     // the runs table; piggyback on it to enforce the per-task memory ceiling.
     this.offUsage = onUsage((snapshot) => void this.enforceMemoryLimit(snapshot));
     this.queueWatchdog = setInterval(() => void this.rescueStalledQueue(), QUEUE_WATCHDOG_MS);
+    // Host-side git in a harness worktree never follows its model-writable `.git` pointer, even
+    // before the driver re-enters after a restart (git-pin.ts, PR #925 review).
+    for (const run of store.listRuns()) {
+      if (!run.harness || !run.worktreePath || run.worktreeReclaimedAt) continue;
+      const gitDir = resolveTrustedGitDir(repoRoot, run.worktreePath);
+      if (gitDir) pinWorktreeGitDir(run.worktreePath, gitDir);
+    }
     this.queueWatchdog.unref?.();
   }
 
@@ -3234,6 +3242,10 @@ export class RunManager {
         status: 'queued', error: undefined, finishedAt: undefined, currentStepId: undefined,
       });
       resumed = { ok: true };
+    } else if (run.harness) {
+      // The driver resumes from its ledger; prompt text would arrive as operator feedback and
+      // restart implementation — or be refused outright for implemented packet work (PR #925 review).
+      resumed = this.continueRun(runId, {}, true);
     } else {
       // Legacy records without a recoverable definition and standalone continuations retain
       // their existing session recovery. Manual Continue also keeps its existing semantics.
@@ -3264,6 +3276,8 @@ export class RunManager {
 
   /** Recover the failed workflow agent from the existing durable step/session checkpoint. */
   private interruptedWorkflowStep(run: RunRecord): StepState | undefined {
+    // A harness run resumes from its ledger, never by re-entering a step (PR #925 review).
+    if (run.harness) return undefined;
     // Later steps can retain old session ids when a check loops back to an earlier agent.
     // Only the failed agent is the interruption; a pending retry is not a newer session.
     const step = [...run.steps].reverse().find((candidate) => candidate.kind === 'agent' && candidate.status === 'failed');
@@ -4564,6 +4578,9 @@ export class RunManager {
           });
         }
       }
+      // As on the ordinary path: this IS the pending usage-limit resume, or a human superseded
+      // it — either way its deadline must not re-arm on a later failure (PR #925 review).
+      this.clearAutoResume(runId);
       this.pendingJobs.set(runId, {
         workflow,
         input: this.hydrateQueuedInput(runId, {
@@ -5582,7 +5599,7 @@ export class RunManager {
         if (wt.seeded?.length) emit({ type: 'note', message: `seeded personal agent config: ${wt.seeded.join(', ')}` });
         // Seed from this manager's project root: each multi-project context has
         // its own manager/repoRoot and must never copy another project's layer.
-        this.armAutosave(runId, state, isHarnessWorkflow(workflow.name));
+        this.armAutosave(runId, state);
       } catch (err) {
         if (state.cancelled) {
           this.dropActive(runId, state);
@@ -8974,8 +8991,10 @@ export class RunManager {
 
   /** Autosave-commit the worktree every 90 s while the run lives (spec 006).
    *  Opt-in via CEZ_AUTOSAVE=1 (#471) — see periodicAutosaveEnabled. */
-  private armAutosave(runId: string, state: ActiveRun, stageOnlyHarness = false): void {
-    if (stageOnlyHarness) return;
+  private armAutosave(runId: string, state: ActiveRun): void {
+    // A harness run never commits (stage-only): decided here from the record, once, so no
+    // caller can forget it — the usage-limit resume path did (PR #925 review).
+    if (state.includeHarnessSkills || this.store.getRun(runId)?.harness) return;
     if (!periodicAutosaveEnabled()) return;
     if (state.cwd === this.repoRoot || state.autosaveTimer) return;
     state.autosaveTimer = setInterval(() => {
