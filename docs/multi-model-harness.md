@@ -198,8 +198,11 @@ prompt instructions are how you get 8/10 worktree escapes. It's enforced in laye
    (defense in depth: it matches the command text, so the layers below are what
    actually hold), plus sandboxed Bash (sandbox-runtime on macOS, native sandbox
    elsewhere, `failIfUnavailable`) with writes confined to the worktree and the
-   phase-output directory. On macOS the sandbox also denies credentials
-   (`ANTHROPIC_API_KEY`, OAuth, GitHub tokens) to Bash. Codex phases get the
+   phase-output directory, no network egress, and no reads of host credential
+   stores (`~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.netrc`, `~/.aws`,
+   the agents' auth files). On macOS the sandbox also strips credential
+   environment variables (`ANTHROPIC_API_KEY`, OAuth, GitHub tokens) from Bash;
+   elsewhere the environment hardening below is what removes them. Codex phases get the
    workspace-write sandbox with the phase-output directory as their only extra
    writable root. Environment is hardened for every phase:
    `GIT_ALLOW_PROTOCOL=''`, `GIT_ASKPASS=/usr/bin/false`, `SSH_AUTH_SOCK=''`, an

@@ -7,7 +7,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { canonicalizeAdvisorRefs } from './advisor-identity.js';
@@ -19,7 +19,7 @@ import {
 } from './prompt-budget.js';
 import { harnessStageResultSchema, samePathSet } from './stage-result.js';
 import { harnessPhaseSkills } from './skill-routing.js';
-import { createClaudeStageOnlySettings } from './claude-guard.js';
+import { createClaudeStageOnlySettings, stageOnlyDeniedReads } from './claude-guard.js';
 
 const temporary: string[] = [];
 
@@ -254,6 +254,37 @@ describe('harness safety primitives', () => {
     });
     expect(guard.env.CLAUDE_CODE_SHELL_PREFIX).toBeUndefined();
     expect(guard.sandboxWrapperPath).toBeUndefined();
+  });
+
+  // PR #925 review: a readable gh/git token plus GitHub egress publishes without moving a local ref.
+  it('gives sandboxed Bash no egress and no host credential stores on either platform', () => {
+    const root = tempDir('cez-claude-sandbox-egress-');
+    const worktree = join(root, 'worktree');
+    mkdirSync(worktree);
+    const denied = stageOnlyDeniedReads();
+    expect(denied).toEqual(expect.arrayContaining([
+      join(homedir(), '.ssh'),
+      join(homedir(), '.config', 'gh'),
+      join(homedir(), '.git-credentials'),
+      join(homedir(), '.netrc'),
+    ]));
+
+    const nativeArtifacts = join(root, 'native');
+    const native = createClaudeStageOnlySettings(nativeArtifacts, worktree, join(nativeArtifacts, 'out'), 'linux');
+    const nativeSandbox = (JSON.parse(readFileSync(native.settingsPath, 'utf8')) as {
+      sandbox: { network: { allowedDomains: string[] }; filesystem: { denyRead: string[] } };
+    }).sandbox;
+    expect(nativeSandbox.network.allowedDomains).toEqual([]);
+    expect(nativeSandbox.filesystem.denyRead).toEqual(denied);
+
+    const macArtifacts = join(root, 'mac');
+    createClaudeStageOnlySettings(macArtifacts, worktree, join(macArtifacts, 'out'), 'darwin');
+    const runtime = JSON.parse(readFileSync(join(macArtifacts, 'claude-guard', 'sandbox-runtime.json'), 'utf8')) as {
+      network: { allowedDomains: string[] };
+      filesystem: { denyRead: string[] };
+    };
+    expect(runtime.network.allowedDomains).toEqual([]);
+    expect(runtime.filesystem.denyRead).toEqual(denied);
   });
 
   it('routes generic repositories to complete bundled Cezar skills by default', () => {

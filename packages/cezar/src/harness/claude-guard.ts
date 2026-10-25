@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 const GUARD_SCRIPT = `#!/usr/bin/env node
@@ -134,6 +135,22 @@ child.on('exit', (code, signal) => {
  * Anthropic's standalone sandbox runtime via Claude's shell-prefix seam. Other
  * platforms retain Claude's native sandbox. Both variants enforce the same two
  * writable roots; the hook adds explicit git/PR and built-in Edit/Write guards. */
+/** Host credential stores sandboxed Bash must not read: a token there reaches GitHub without any
+ * local ref moving (PR #925 review). Agent auth is read by the agent process, outside the sandbox. */
+export function stageOnlyDeniedReads(home: string = homedir()): string[] {
+  return [
+    '.ssh',
+    '.config/gh',
+    '.git-credentials',
+    '.config/git/credentials',
+    '.netrc',
+    '.aws',
+    '.claude/.credentials.json',
+    '.codex/auth.json',
+    '.local/share/opencode/auth.json',
+  ].map((path) => join(home, path));
+}
+
 export function createClaudeStageOnlySettings(
   artifactDir: string,
   worktree: string,
@@ -172,9 +189,11 @@ export function createClaudeStageOnlySettings(
               allowUnsandboxedCommands: false,
               filesystem: {
                 allowWrite: [outputDir],
+                denyRead: stageOnlyDeniedReads(),
               },
+              // No egress: a stage-only phase has nothing to fetch (PR #925 review).
               network: {
-                allowedDomains: ['github.com', 'api.github.com'],
+                allowedDomains: [],
               },
             },
             hooks,
@@ -198,11 +217,11 @@ export function createClaudeStageOnlySettings(
       `${JSON.stringify(
         {
           network: {
-            allowedDomains: ['github.com', 'api.github.com'],
+            allowedDomains: [],
             deniedDomains: [],
           },
           filesystem: {
-            denyRead: [],
+            denyRead: stageOnlyDeniedReads(),
             allowWrite: [worktree, outputDir, CLAUDE_CWD_MARKER_GLOB],
             // Host-side git follows the worktree's .git pointer (git-pin.ts, PR #925 review).
             denyWrite: [join(worktree, '.git')],
