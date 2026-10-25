@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, openSync, readdirSync, readFileSync, realpathSync, rmSync, writeSync } from 'node:fs';
 import { readHarnessFsEntry } from './harness/fs-read.ts';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 
@@ -96,9 +96,16 @@ function restoreGitPointer(workTree: string, gitDir: string): string {
   const pointer = join(workTree, '.git');
   try {
     rmSync(pointer, { recursive: true, force: true });
-    writeFileSync(pointer, `gitdir: ${gitDir}\n`, 'utf8');
+    // Exclusive and no-follow: a symlink recreated after the removal fails the open instead of
+    // redirecting the write to a host file (PR #925 review). The run fails closed either way.
+    const fd = openSync(pointer, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o644);
+    try {
+      writeSync(fd, `gitdir: ${gitDir}\n`);
+    } finally {
+      closeSync(fd);
+    }
   } catch {
-    // unwritable: the run still fails closed
+    // unwritable or raced: the run still fails closed
   }
   return pointer;
 }

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -67,6 +67,20 @@ describe.skipIf(process.platform === 'win32')('harness worktree git pinning', ()
     expect(await worktreeChangedFiles(wt, 'main')).toContain('b.txt');
     execFileSync('git', ['status', '--porcelain'], { cwd: wt, env: { ...process.env, ...pinnedGitEnv(wt) } });
     expect(existsSync(marker)).toBe(false);
+  });
+
+  // PR #925 review (fifth round): the restore must never write through a symlink at the path.
+  it('restores a pointer replaced by a symlink without writing through it', () => {
+    const trusted = resolveTrustedGitDir(repo, wt)!;
+    const hostFile = join(root, 'host-file');
+    writeFileSync(hostFile, 'host content\n');
+    rmSync(join(wt, '.git'));
+    symlinkSync(hostFile, join(wt, '.git'));
+
+    expect(verifyWorktreeGitPointer(wt, trusted)).toMatchObject({ ok: false });
+    expect(readFileSync(hostFile, 'utf8')).toBe('host content\n');
+    expect(lstatSync(join(wt, '.git')).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(wt, '.git'), 'utf8').trim()).toBe(`gitdir: ${trusted}`);
   });
 
   it('restores a rewritten pointer and reports it', () => {
