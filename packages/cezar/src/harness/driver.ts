@@ -2450,6 +2450,33 @@ export async function runHarnessDriver(
     );
   };
 
+  /** One council reviewer that throws fails alone, as `pool` requires: the rejected pool unwound
+   *  the driver while its siblings' sessions ran on, unstoppable and billing (PR #925 review). */
+  const containReviewerThrow =
+    <R extends HarnessReviewerRef>(
+      phaseId: string,
+      outcomes: CouncilOutcome[],
+      reviewers: Array<Record<string, unknown>>,
+      work: (reviewer: R, idx: number) => Promise<void>,
+    ) =>
+    async (reviewer: R, idx: number): Promise<void> => {
+      try {
+        await work(reviewer, idx);
+      } catch (error) {
+        const label = roleRefId(reviewer);
+        const reason = `reviewer ${label} failed: ${error instanceof Error ? error.message : String(error)}`;
+        const open = ledger.invocations.find(
+          (invocation) =>
+            invocation.phaseId === phaseId && invocation.reviewerId === label && invocation.status === 'running',
+        );
+        if (open) finishInvocation(open, 'failed', { error: reason });
+        if (!outcomes.some((outcome) => outcome.label === label)) {
+          outcomes.push({ label, family: councilFamilyOf(reviewer), status: 'failed', reason });
+          reviewers.push({ id: label, status: 'failed', reason });
+        }
+      }
+    };
+
   /** One packet-less advisor council op (spec 2026-07-24-advisor-reviewers):
    *  a runtime `review` over a profile synthesized to exactly the given
    *  bindings. `artifact` overrides the subject (spec councils review the
@@ -4154,7 +4181,7 @@ export async function runHarnessDriver(
           // multiplied the wall clock by the reviewer count. The advisor
           // council launches alongside this pool (2026-07-29) for the same
           // reason — the groups share nothing but the read-only subject.
-          const specRunnerWork = pool(specRunnerReviewers, MAX_PARALLEL_REVIEWERS, async (reviewer, idx) => {
+          const specRunnerWork = pool(specRunnerReviewers, MAX_PARALLEL_REVIEWERS, containReviewerThrow(councilId, outcomes, councilReviewers, async (reviewer, idx) => {
             if (host.isCancelled()) return;
             const label = roleRefId(reviewer);
             const resultPath = join(agentOutputDir, `phase-${councilId}-r${idx + 1}-result.json`);
@@ -4308,7 +4335,7 @@ export async function runHarnessDriver(
               stepId: councilId,
               council: { round: sround, kind: 'spec', reviewers: councilReviewers, verdict: null },
             });
-          });
+          }));
           const specAdvisorWork =
             specCouncilMembers.length > 0 && !host.isCancelled()
               ? runAdvisorCouncilOpWithRetry({
@@ -5054,7 +5081,7 @@ export async function runHarnessDriver(
         // the advisor council launches ALONGSIDE this pool (2026-07-29): the
         // two groups review the same read-only subject, so serializing them
         // only added the slower group's wall clock to the faster one's.
-        const runnerReviewerWork = pool(runnerReviewers, MAX_PARALLEL_REVIEWERS, async (reviewer, idx) => {
+        const runnerReviewerWork = pool(runnerReviewers, MAX_PARALLEL_REVIEWERS, containReviewerThrow(reviewId, outcomes, councilReviewers, async (reviewer, idx) => {
           if (host.isCancelled()) return;
           const label = roleRefId(reviewer);
           const resultPath = join(agentOutputDir, `phase-${reviewId}-r${idx + 1}-result.json`);
@@ -5216,7 +5243,7 @@ export async function runHarnessDriver(
             stepId: reviewId,
             council: { round, kind: 'implementation', reviewers: councilReviewers, verdict: null },
           });
-        });
+        }));
         // Advisor reviewers (spec 2026-07-24-advisor-reviewers): one
         // packet-less runtime council over the worktree diff — the same
         // subject the runner sessions reviewed, launched concurrently with them.

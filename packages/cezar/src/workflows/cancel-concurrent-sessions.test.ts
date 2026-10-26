@@ -239,15 +239,21 @@ describe('cancel() reaches handlers that outlive a phase', () => {
 describe('the real implementation still honours the contract', () => {
   const source = readFileSync(join(import.meta.dirname, 'run.ts'), 'utf8');
 
+  const methodBody = (signature: string): string => {
+    const start = source.indexOf(signature);
+    expect(start).toBeGreaterThanOrEqual(0);
+    return source.slice(start, source.indexOf('\n  }\n', start));
+  };
+  const liveWork = () => methodBody('  private interruptLiveWork(state: ActiveRun): void {');
+
   it('cancel() interrupts every live session, not only state.interrupt', () => {
-    const cancelBody = source.slice(source.indexOf('  cancel(runId: string): boolean {'));
-    expect(cancelBody).toMatch(/for \(const session of state\.liveSessions\)/);
-    expect(cancelBody).toMatch(/session\.interrupt\(\)/);
+    expect(methodBody('  private cancelOne(runId: string): boolean {')).toMatch(/this\.interruptLiveWork\(state\)/);
+    expect(liveWork()).toMatch(/for \(const session of state\.liveSessions\)/);
+    expect(liveWork()).toMatch(/session\.interrupt\(\)/);
   });
 
   it('cancel() runs the phase-independent interrupt handlers', () => {
-    const cancelBody = source.slice(source.indexOf('  cancel(runId: string): boolean {'));
-    expect(cancelBody).toMatch(/for \(const handler of state\.interruptHandlers\)/);
+    expect(liveWork()).toMatch(/for \(const handler of state\.interruptHandlers\)/);
   });
 
   it('onInterrupt registers in the durable set instead of chaining onto the slot', () => {

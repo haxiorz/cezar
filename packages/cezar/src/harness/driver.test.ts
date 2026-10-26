@@ -2972,6 +2972,38 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(attempts.get(planted)).toBe(2);
   });
 
+  // PR #925 review: one reviewer that threw rejected the council pool, so the driver unwound while
+  // its sibling's session ran on, unstoppable and billing.
+  it('fails a council reviewer that throws alone, after its sibling session settles', async () => {
+    const h = makeHarness(dir);
+    for (const phase of ['qualify', 'diagnose', 'implement']) {
+      h.agentBehavior.set(phase, (req) => {
+        writeFileSync(req.resultPath, JSON.stringify(phaseDefaults[phase]), 'utf8');
+        return null;
+      });
+    }
+    let siblingSettled = false;
+    h.agentBehavior.set('review', async (req) => {
+      if (req.model === 'sonnet') throw new Error('ENOSPC: no space left on device');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      writeFileSync(req.resultPath, JSON.stringify({ verdict: 'approve', findings: [] }), 'utf8');
+      siblingSettled = true;
+      return null;
+    });
+    const reviewers = [
+      { runner: 'claude' as const, model: 'opus' },
+      { runner: 'claude' as const, model: 'sonnet' },
+      { runner: 'codex' as const, model: '' },
+    ];
+
+    expect(await runHarnessDriver(h.host, { ...input, roles: { ...roles, reviewers } }, h.deps)).toBeNull();
+    expect(siblingSettled).toBe(true);
+    const thrown = loadLedger(h.host.dataDir, h.host.runId)?.invocations.find(
+      (invocation) => invocation.reviewerId === 'claude/sonnet',
+    );
+    expect(thrown).toMatchObject({ status: 'failed', error: expect.stringContaining('ENOSPC') });
+  });
+
   // PR #925 review: a usage limit spent both reviewer attempts at once (attempt 2 fired into the same
   // closed window), so the auto-resume at reset ran no reviewer and the run stayed parked.
   it('leaves a usage-limited reviewer unspent, so the resume at reset runs it again', async () => {
@@ -3668,9 +3700,11 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
    *  (2026-07-29): the session reviewer here refuses to finish until the
    *  advisor op has been observed starting. Under the old sequential order
    *  that observation never happens and the flag stays false. */
-  // PR #925 review (D10): a rejected runner pool used to strand the advisor promise unhandled.
+  // PR #925 review (D10): a rejected runner pool used to strand the advisor promise unhandled. A
+  // runner reviewer's own crash is now contained as its outcome, so the advisor's failure is the one
+  // that propagates, still with nothing left unhandled.
   for (const workflow of [HARNESS_FIX_ISSUE, HARNESS_IMPLEMENT_FEATURE]) {
-    it(`settles the advisor council before a runner-pool failure propagates (${workflow})`, async () => {
+    it(`settles both council groups before a council failure propagates (${workflow})`, async () => {
       const h = makeHarness(dir);
       const strays: unknown[] = [];
       const onStray = (reason: unknown) => strays.push(reason);
@@ -3711,10 +3745,15 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
       });
       try {
         await expect(runHarnessDriver(h.host, { ...input, workflow }, h.deps)).rejects.toThrow(
-          'runner reviewer crashed',
+          'advisor ledger write failed',
         );
         await new Promise((resolve) => setTimeout(resolve, 20));
         expect(strays).toEqual([]);
+        expect(
+          loadLedger(h.host.dataDir, h.host.runId)?.invocations.find((invocation) =>
+            invocation.id.startsWith('reviewer:'),
+          ),
+        ).toMatchObject({ status: 'failed', error: expect.stringContaining('runner reviewer crashed') });
       } finally {
         process.off('unhandledRejection', onStray);
       }

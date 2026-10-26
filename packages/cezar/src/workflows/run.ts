@@ -2152,18 +2152,7 @@ export class RunManager {
           const workflow = catalog ? this.refreshQueuedWorkflow(runId, job.workflow, catalog) : job.workflow;
           const ownerToken = Symbol('run-owner');
           void this.execute(runId, workflow, input, ownerToken).catch((err: unknown) => {
-            const message = err instanceof Error ? err.message : String(err);
-            const state = this.active.get(runId);
-            if (!state || state.ownerToken !== ownerToken || state.cancelled) return;
-            this.store.updateRun(runId, {
-              status: 'failed',
-              error: `engine crashed: ${message}`,
-              finishedAt: new Date().toISOString(),
-            });
-            this.clearIdleTimer(state);
-            this.clearAutosaveTimer(state);
-            this.starting.delete(runId);
-            if (state && !state.cancelled) this.dropActive(runId, state);
+            this.failCrashedRun(runId, ownerToken, err instanceof Error ? err.message : String(err));
           });
         }
       } while (this.pumpAgain);
@@ -2504,6 +2493,21 @@ export class RunManager {
   }
 
   /** Fence a continuation failure to the async owner that started it. */
+  private failCrashedRun(runId: string, ownerToken: symbol, message: string): void {
+    const state = this.active.get(runId);
+    if (!state || state.ownerToken !== ownerToken || state.cancelled) return;
+    this.store.updateRun(runId, {
+      status: 'failed',
+      error: `engine crashed: ${message}`,
+      finishedAt: new Date().toISOString(),
+    });
+    this.clearIdleTimer(state);
+    this.clearAutosaveTimer(state);
+    this.starting.delete(runId);
+    this.interruptLiveWork(state);
+    this.dropActive(runId, state);
+  }
+
   private failOwnedContinuation(runId: string, ownerToken: symbol, message: string): void {
     const state = this.active.get(runId);
     if (!state || state.ownerToken !== ownerToken || state.cancelled) return;
@@ -2512,7 +2516,25 @@ export class RunManager {
       error: `continue crashed: ${message}`,
       finishedAt: new Date().toISOString(),
     });
+    this.interruptLiveWork(state);
     this.dropActive(runId, state);
+  }
+
+  /** Concurrent harness reviewers live only in `liveSessions`: a crash that dropped the run left
+   *  them running, unstoppable and billing, holding no slot (PR #925 review). */
+  private interruptLiveWork(state: ActiveRun): void {
+    for (const handler of state.interruptHandlers) {
+      try {
+        handler();
+      } catch {
+      }
+    }
+    for (const session of state.liveSessions) {
+      try {
+        session.interrupt();
+      } catch {
+      }
+    }
   }
 
   /** Remove a run from the live registries — keeps `waiting ⊆ active`. */
@@ -3840,18 +3862,7 @@ export class RunManager {
     } catch {
       // Cancellation is terminal even if a provider's interrupt hook is already tearing down.
     }
-    for (const handler of state.interruptHandlers) {
-      try {
-        handler();
-      } catch {
-      }
-    }
-    for (const session of state.liveSessions) {
-      try {
-        session.interrupt();
-      } catch {
-      }
-    }
+    this.interruptLiveWork(state);
     const finishedAt = new Date().toISOString();
     for (const step of this.store.getRun(runId)?.steps ?? []) {
       if (step.status === 'running' || step.status === 'waiting') {
