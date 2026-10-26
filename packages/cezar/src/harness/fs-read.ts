@@ -36,11 +36,14 @@ export function readHarnessFsEntry(path: string, maxBytes = Number.POSITIVE_INFI
 }
 
 /** A regular file's bytes (following symlinks — for trusted, cezar-owned trees), read through one
- *  descriptor; null for anything that is not a regular file. */
-export function readRegularFileFollowing(path: string): Buffer | null {
+ *  descriptor; null for anything that is not a regular file or is larger than `maxBytes`. */
+export function readRegularFileFollowing(path: string, maxBytes = Number.POSITIVE_INFINITY): Buffer | null {
   const fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
   try {
-    return fstatSync(fd).isFile() ? readFileSync(fd) : null;
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > maxBytes) return null;
+    const content = readFileSync(fd);
+    return content.length > maxBytes ? null : content;
   } finally {
     closeSync(fd);
   }

@@ -1,7 +1,7 @@
-import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
+import { readHarnessFsEntry, readRegularFileFollowing } from '../harness/fs-read.ts';
 import { codexReasoningEffortOf } from './reasoning-effort.ts';
 import { emitUsageWindows, normalizeCodexUsageWindows } from './usage-windows.ts';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -822,6 +822,8 @@ function safeStringify(value: unknown): string {
   }
 }
 
+const CODEX_CONFIG_MAX_BYTES = 1024 * 1024;
+
 /**
  * Spawn-time config for a stage-only harness phase: its one extra writable root, no network from
  * the sandbox, and none of the user's or project's MCP servers, whose tools run outside it (PR #925
@@ -831,15 +833,31 @@ function safeStringify(value: unknown): string {
 export function codexStageOnlyArgs(cwd: string, env: Record<string, string> | undefined, outputDir: string): string[] {
   const names = new Set<string>();
   const home = env?.CODEX_HOME ?? process.env.CODEX_HOME ?? join(homedir(), '.codex');
-  for (const file of [join(home, 'config.toml'), join(cwd, '.codex', 'config.toml')]) {
-    let text: string;
-    try {
-      text = readFileSync(file, 'utf8');
-    } catch {
-      continue; // absent: nothing configured there
-    }
-    const servers = (parseToml(text) as { mcp_servers?: unknown }).mcp_servers;
+  const addServers = (content: Buffer) => {
+    const servers = (parseToml(content.toString('utf8')) as { mcp_servers?: unknown }).mcp_servers;
     if (servers && typeof servers === 'object') for (const name of Object.keys(servers)) names.add(name);
+  };
+  const unreadable = (file: string) =>
+    new Error(`codex: ${file} is not a readable regular file, so a stage-only harness phase cannot rule out its MCP servers`);
+  // The user's own config may be a dotfiles symlink; a FIFO or a /dev/zero link still never blocks
+  // or grows this read (PR #925 review).
+  const userConfig = join(home, 'config.toml');
+  try {
+    const content = readRegularFileFollowing(userConfig, CODEX_CONFIG_MAX_BYTES);
+    if (!content) throw unreadable(userConfig);
+    addServers(content);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  // The worktree is model-writable: one no-follow, non-blocking, bounded read, and anything but a
+  // regular file fails the phase rather than hiding a server (PR #925 review).
+  const projectConfig = join(cwd, '.codex', 'config.toml');
+  try {
+    const entry = readHarnessFsEntry(projectConfig, CODEX_CONFIG_MAX_BYTES);
+    if (entry.kind !== 'file' || !entry.content) throw unreadable(projectConfig);
+    addServers(entry.content);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
   const args = [
     '-c',

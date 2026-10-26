@@ -1,6 +1,6 @@
-import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -160,6 +160,30 @@ describe('a teardown cezar initiated (codex app-server)', () => {
       rmSync(cwd, { recursive: true, force: true });
     }
   });
+
+  // PR #925 review: the worktree config was read with a plain readFileSync, so a model-planted FIFO
+  // froze the server's thread and a /dev/zero link grew without bound.
+  it.skipIf(process.platform === 'win32')('refuses a worktree config that is not a regular file, without blocking', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cez-codex-home-'));
+    const cwd = mkdtempSync(join(tmpdir(), 'cez-codex-cwd-'));
+    try {
+      const dotfiles = join(home, 'dotfiles.toml');
+      writeFileSync(dotfiles, '[mcp_servers.github]\ncommand = "gh-mcp"\n');
+      symlinkSync(dotfiles, join(home, 'config.toml'));
+      mkdirSync(join(cwd, '.codex'));
+      // A symlinked user config is a dotfiles habit: followed.
+      expect(codexStageOnlyArgs(cwd, { CODEX_HOME: home }, '/out')).toContain('mcp_servers.github.enabled=false');
+
+      execFileSync('mkfifo', [join(cwd, '.codex', 'config.toml')]);
+      expect(() => codexStageOnlyArgs(cwd, { CODEX_HOME: home }, '/out')).toThrow(/not a readable regular file/);
+      rmSync(join(cwd, '.codex', 'config.toml'));
+      symlinkSync('/dev/zero', join(cwd, '.codex', 'config.toml'));
+      expect(() => codexStageOnlyArgs(cwd, { CODEX_HOME: home }, '/out')).toThrow(/not a readable regular file/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 10_000);
 
   it('surfaces a failed turn as an AgentEvent error', async () => {
     const runner = new CodexAppServerRunner({ bin: mockBin, timeoutMs: 0 });
