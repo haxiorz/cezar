@@ -1,10 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { pinnedGitEnv, pinWorktreeGitDir, resolveTrustedGitDir, verifyWorktreeGitPointer } from './git-pin.ts';
-import { worktreeChangedFiles } from './git-worktree.ts';
+import { worktreeChangedFiles, worktreeShortstat } from './git-worktree.ts';
 
 const GIT_ID = ['-c', 'user.email=t@t', '-c', 'user.name=t'];
 
@@ -66,6 +66,24 @@ describe.skipIf(process.platform === 'win32')('harness worktree git pinning', ()
     writeFileSync(join(wt, 'b.txt'), 'two\n');
     expect(await worktreeChangedFiles(wt, 'main')).toContain('b.txt');
     execFileSync('git', ['status', '--porcelain'], { cwd: wt, env: { ...process.env, ...pinnedGitEnv(wt) } });
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  // PR #925 review: a relative core.hooksPath (husky's `.husky/_`) resolves inside the model-writable
+  // worktree, so a planted hook ran on cezar's own index writes, unsandboxed, with its environment.
+  it('runs no hook a model planted in the worktree on pinned index writes', async () => {
+    git(repo, 'config', 'core.hooksPath', '.husky/_');
+    const hooks = join(wt, '.husky', '_');
+    mkdirSync(hooks, { recursive: true });
+    for (const hook of ['post-index-change', 'pre-commit']) {
+      writeFileSync(join(hooks, hook), `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`);
+      chmodSync(join(hooks, hook), 0o755);
+    }
+    writeFileSync(join(wt, 'b.txt'), 'two\n');
+    pinWorktreeGitDir(wt, resolveTrustedGitDir(repo, wt)!);
+
+    expect(await worktreeShortstat(wt, 'main')).not.toBeNull();
+    expect(await worktreeChangedFiles(wt, 'main')).toContain('b.txt');
     expect(existsSync(marker)).toBe(false);
   });
 

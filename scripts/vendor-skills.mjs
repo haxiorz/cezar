@@ -659,7 +659,20 @@ const VALID_POLICY = new Set(['advisory', 'quorum', 'all-required'])`,
     const rel = relative(realpathSync(workTree), realpathSync(cwd))
     inside = !rel.startsWith('..') && !isAbsolute(rel)
   } catch { return {} }
-  return inside ? { GIT_DIR: gitDir, GIT_WORK_TREE: realpathSync(workTree), GIT_NO_REPLACE_OBJECTS: '1' } : {}
+  if (!inside) return {}
+  // Config a model can reach must not run programs: a relative core.hooksPath resolves inside the
+  // worktree, and core.fsmonitor names a program (PR #925 review).
+  const offset = Number.parseInt(process.env.GIT_CONFIG_COUNT || '', 10) || 0
+  return {
+    GIT_DIR: gitDir,
+    GIT_WORK_TREE: realpathSync(workTree),
+    GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_CONFIG_COUNT: String(offset + 2),
+    [\`GIT_CONFIG_KEY_\${offset}\`]: 'core.hooksPath',
+    [\`GIT_CONFIG_VALUE_\${offset}\`]: '/dev/null',
+    [\`GIT_CONFIG_KEY_\${offset + 1}\`]: 'core.fsmonitor',
+    [\`GIT_CONFIG_VALUE_\${offset + 1}\`]: 'false',
+  }
 }
 
 function git(args, cwd, options = {}) {

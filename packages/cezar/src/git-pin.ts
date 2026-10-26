@@ -38,9 +38,33 @@ export function resolveTrustedGitDir(repoRoot: string, workTree: string): string
   return null;
 }
 
-/** The environment that makes git use `gitDir` for `workTree` without discovering anything. */
-export function gitEnvFor(gitDir: string, workTree: string): Record<string, string> {
-  return { GIT_DIR: gitDir, GIT_WORK_TREE: workTree, GIT_NO_REPLACE_OBJECTS: '1' };
+/** Config a model can reach must not run programs: a relative `core.hooksPath` (husky's `.husky/_`)
+ *  resolves inside the model-writable worktree, so a planted hook ran on cezar's own index writes
+ *  with its full environment (PR #925 review); `core.fsmonitor` names a program too. */
+const NEUTRALIZED_CONFIG: ReadonlyArray<readonly [string, string]> = [
+  ['core.hooksPath', '/dev/null'],
+  ['core.fsmonitor', 'false'],
+];
+
+/** The environment that makes git use `gitDir` for `workTree` without discovering anything or
+ *  running hooks. Its config entries follow any `GIT_CONFIG_*` the base environment carries. */
+export function gitEnvFor(
+  gitDir: string,
+  workTree: string,
+  base: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const offset = Number.parseInt(base.GIT_CONFIG_COUNT ?? '', 10) || 0;
+  const env: Record<string, string> = {
+    GIT_DIR: gitDir,
+    GIT_WORK_TREE: workTree,
+    GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_CONFIG_COUNT: String(offset + NEUTRALIZED_CONFIG.length),
+  };
+  NEUTRALIZED_CONFIG.forEach(([key, value], index) => {
+    env[`GIT_CONFIG_KEY_${offset + index}`] = key;
+    env[`GIT_CONFIG_VALUE_${offset + index}`] = value;
+  });
+  return env;
 }
 
 const pinned = new Map<string, string>();
