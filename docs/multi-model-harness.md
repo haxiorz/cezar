@@ -200,15 +200,20 @@ prompt instructions are how you get 8/10 worktree escapes. It's enforced in laye
    elsewhere, `failIfUnavailable`) with writes confined to the worktree and the
    phase-output directory, no network egress, and no reads of host credential
    stores (`~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.netrc`, `~/.aws`,
-   the agents' auth files). On macOS the sandbox also strips credential
-   environment variables (`ANTHROPIC_API_KEY`, OAuth, GitHub tokens) from Bash;
-   elsewhere the environment hardening below is what removes them. Each phase
-   session has its own phase-output directory. Codex phases get the
-   workspace-write sandbox with that directory and the run's own temp directory
-   as their only extra writable roots; the shared `/tmp` and host `TMPDIR` are
-   excluded. Environment is hardened for every phase:
+   the agents' auth files). The same hook refuses Claude's `Read`, `Grep` and
+   `Glob` on those stores, since those tools run outside the Bash sandbox. On
+   macOS the sandbox also strips credential environment variables
+   (`ANTHROPIC_API_KEY`, OAuth, GitHub tokens) from Bash; elsewhere the
+   environment hardening below is what removes them. Each phase session has its
+   own phase-output directory. Codex phases get the workspace-write sandbox with
+   that directory and the run's own temp directory as their only extra writable
+   roots; the shared `/tmp` and host `TMPDIR` are excluded. Codex has no
+   read-deny setting, so a Codex phase **can** read those credential stores;
+   with no network, the only way out is the staged diff, which you review before
+   publishing. Environment is hardened for every phase:
    `GIT_ALLOW_PROTOCOL=''`, `GIT_ASKPASS=/usr/bin/false`, `SSH_AUTH_SOCK=''`, an
-   empty `GH_CONFIG_DIR`, and no GitHub token in the agent environment.
+   empty `GH_CONFIG_DIR`, no GitHub token, and no address for the dispatch CLI
+   (`CEZ_API_URL`, `CEZ_BIN`).
 2. **Git integrity.** `capture` snapshots HEAD, the task branch ref and their
    reflogs at start; `verify` re-checks between phases; `stage` refuses if any of
    them moved — including a commit that was made and then reset away, which the

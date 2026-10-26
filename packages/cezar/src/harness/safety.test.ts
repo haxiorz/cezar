@@ -136,6 +136,35 @@ describe('harness safety primitives', () => {
     expect(JSON.parse(readFileSync(taken.claim.path, 'utf8'))).toMatchObject({ runId: 'run-b', dataDir: '/p/one' });
   });
 
+  // PR #925 review: Read, Grep and Glob run in-process, outside the Bash sandbox and its denyRead,
+  // so a phase could read a host key and stage it.
+  it('refuses Read, Grep and Glob of host credential stores', () => {
+    const root = tempDir('cez-claude-reads-');
+    const worktree = join(root, 'worktree');
+    const artifacts = join(root, 'artifacts');
+    mkdirSync(worktree);
+    const guard = createClaudeStageOnlySettings(artifacts, worktree, join(artifacts, 'agent-output', 'phase-x'), 'linux');
+    const hook = (JSON.parse(readFileSync(guard.settingsPath, 'utf8')) as {
+      hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }> };
+    }).hooks.PreToolUse[0]!;
+    expect(hook.matcher.split('|')).toEqual(expect.arrayContaining(['Read', 'Grep', 'Glob']));
+    const guardPath = JSON.parse(hook.hooks[0]!.command.slice('node '.length)) as string;
+    const invoke = (tool_name: string, tool_input: Record<string, string>) =>
+      execFileSync(process.execPath, [guardPath], {
+        input: JSON.stringify({ tool_name, tool_input }),
+        env: { ...process.env, ...guard.env },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    const home = homedir();
+    expect(() => invoke('Read', { file_path: join(home, '.ssh', 'id_ed25519') })).toThrow();
+    expect(() => invoke('Read', { file_path: join(home, '.codex', 'auth.json') })).toThrow();
+    expect(() => invoke('Grep', { pattern: 'BEGIN', path: home })).toThrow();
+    expect(() => invoke('Glob', { pattern: '*', path: join(home, '.aws') })).toThrow();
+    expect(() => invoke('Read', { file_path: join(worktree, 'src', 'a.ts') })).not.toThrow();
+    expect(() => invoke('Grep', { pattern: 'x' })).not.toThrow();
+    expect(() => invoke('Read', { file_path: '/etc/hosts' })).not.toThrow();
+  });
+
   // PR #925 review: every reviewer shared one writable output root, so one could write another's
   // verdict and the driver counted it toward quorum.
   it('confines each session to its own output directory', () => {

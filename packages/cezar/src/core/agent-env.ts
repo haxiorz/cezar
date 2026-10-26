@@ -409,6 +409,12 @@ export function buildChildEnv(opts: BuildChildEnvOptions): NodeJS.ProcessEnv {
       'GH_ENTERPRISE_TOKEN',
       'SSH_AUTH_SOCK',
       'SSH_AGENT_PID',
+      // The dispatch CLI's address: a phase could start an unsandboxed task through the server
+      // (PR #925 review). Only the network sandbox stood in the way.
+      'CEZ_API_URL',
+      'CEZ_BIN',
+      'CEZ_PROJECT_ID',
+      'CEZ_TREE_DIR',
     ]) {
       delete env[key];
     }

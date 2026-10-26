@@ -12,8 +12,12 @@ const chunks = []
 for await (const chunk of process.stdin) chunks.push(chunk)
 let input = {}
 try { input = JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch {}
+const toolName = typeof input?.tool_name === 'string' ? input.tool_name : ''
 const command = typeof input?.tool_input?.command === 'string' ? input.tool_input.command : ''
 const filePath = typeof input?.tool_input?.file_path === 'string' ? input.tool_input.file_path : ''
+// Read, Grep and Glob run in-process, outside the Bash sandbox and its denyRead (PR #925 review).
+const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'NotebookRead'])
+const readTool = READ_TOOLS.has(toolName)
 
 const refuse = (message) => {
   process.stderr.write(\`[cez-harness] \${message}\\n\`)
@@ -78,6 +82,28 @@ const ghApiWrite =
   /(?:^|[^A-Za-z0-9_.-])gh(?:\\.exe)?(?=$|[^A-Za-z0-9_.-])[^;&|()\\n]{0,1000}\\bapi\\b[^;&|()\\n]{0,1000}(?:(?:-X|--method)[\\s=]*['"]?(?:POST|PUT|PATCH|DELETE)\\b|\\bmutation\\b|(?:^|\\s)(?:-[fF]|--field|--raw-field|--input)(?=[\\s=]|$))/i.test(command)
 if (command && (gitWrite || ghWrite || ghApiWrite)) {
   refuse('stage-only boundary: git ref and GitHub tracker writes are disabled')
+}
+const contains = (root, target) => !outside(root, target)
+if (readTool) {
+  let denied = []
+  try {
+    denied = JSON.parse(process.env.CEZ_HARNESS_DENIED_READS || '[]').map((path) => canonicalTarget(path))
+  } catch (error) {
+    refuse('read guard initialization failed: ' + (error instanceof Error ? error.message : String(error)))
+  }
+  const raw = filePath || (typeof input?.tool_input?.path === 'string' ? input.tool_input.path : '') ||
+    (typeof input?.tool_input?.notebook_path === 'string' ? input.tool_input.notebook_path : '') || '.'
+  try {
+    const target = canonicalTarget(raw)
+    // A search rooted above a credential store reads it too.
+    const searches = toolName === 'Grep' || toolName === 'Glob'
+    if (denied.some((store) => contains(store, target) || (searches && contains(target, store)))) {
+      refuse(\`reading host credential stores is disabled in a stage-only harness phase: \${raw}\`)
+    }
+  } catch (error) {
+    refuse('read target could not be validated: ' + (error instanceof Error ? error.message : String(error)))
+  }
+  process.exit(0)
 }
 if (filePath) {
   try {
@@ -191,7 +217,7 @@ export function createClaudeStageOnlySettings(
   const hooks = {
     PreToolUse: [
       {
-        matcher: 'Bash|Edit|Write|mcp__.*',
+        matcher: 'Bash|Edit|Write|Read|Grep|Glob|NotebookRead|mcp__.*',
         hooks: [{ type: 'command', command: `node ${JSON.stringify(guardPath)}` }],
       },
     ],
@@ -230,6 +256,7 @@ export function createClaudeStageOnlySettings(
     CEZ_HARNESS_CLAUDE_SETTINGS: settingsPath,
     CEZ_HARNESS_WORKTREE: worktree,
     CEZ_HARNESS_OUTPUT_DIR: outputDir,
+    CEZ_HARNESS_DENIED_READS: JSON.stringify(stageOnlyDeniedReads()),
   };
   let sandboxWrapperPath: string | undefined;
   if (useStandaloneSandbox) {

@@ -162,6 +162,9 @@ describe('private MCP servers at launch', () => {
     );
     expect((await specAt(1)).mcpServers).toBeUndefined();
     expect(emitted).toContain('private MCP: claude cannot attach github — a stage-only harness phase gets no MCP servers');
+    // PR #925 review: nor the handoff, dispatch or automations parts it cannot act on.
+    expect((await specAt(0)).systemPrompt).toContain('## Handoff (cezar)');
+    expect((await specAt(1)).systemPrompt ?? '').not.toContain('## Handoff (cezar)');
     manager!.cancel(record.id);
   });
 

@@ -42,6 +42,7 @@ import {
   type ReconcileHarnessProcessResult,
 } from './runtime.js';
 import { excludeFromGit } from '../skills-remote.js';
+import { ignoreProvisioned } from '../skills-provision.js';
 import {
   bundledSkillsDir,
   discoverSkillCandidates,
@@ -1446,7 +1447,9 @@ export async function runHarnessDriver(
       ? join(host.cwd, '.ai', 'qa', `cez-worker-${host.runId}-${phaseId}.json`)
       : resultPath;
     if (ref?.adapterId) {
-      await excludeFromGit(host.cwd, '.ai/qa/');
+      // Only the worker's own result files: the shared info/exclude also hides paths in the user's
+      // checkout, where `.ai/qa/` holds real QA evidence (PR #925 review).
+      await excludeFromGit(host.cwd, '/.ai/qa/cez-worker-*.json');
       mkdirSync(dirname(sessionResultPath), { recursive: true });
     }
     const phasePrompt = `${prompt}${boundaryAppendix}`;
@@ -2018,7 +2021,8 @@ export async function runHarnessDriver(
           );
         }
       }
-      if (!tracked) await excludeFromGit(host.cwd, `.claude/skills/${phaseSkills.codeReview}/`);
+      // Ignored in this worktree only, like every materialized skill (PR #925 review).
+      if (!tracked) await ignoreProvisioned(host.cwd, '.claude/skills', phaseSkills.codeReview);
       return null;
     };
     for (const name of needed) {
@@ -2031,7 +2035,7 @@ export async function runHarnessDriver(
             const target = join(host.cwd, '.claude', 'skills', name);
             rmSync(target, { recursive: true, force: true });
             cpSync(bundledSkill, target, { recursive: true });
-            await excludeFromGit(host.cwd, `.claude/skills/${name}/`);
+            await ignoreProvisioned(host.cwd, '.claude/skills', name);
             pinMaterializedSkill(name);
           }
           continue;

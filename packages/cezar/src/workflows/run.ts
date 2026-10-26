@@ -7746,15 +7746,19 @@ export class RunManager {
           // — how a task creates a GitHub automation), then the run's extra
           // prompt (POST override or config default, which may amend any of them), then the
           // handoff/todos contract — every agent step.
-          systemPrompt: composeSystemPrompt(
-            systemPrompt,
-            dispatchPromptPart(state.dispatchPrompt, extraSystemPrompt),
-            state.automationsPrompt,
-            extraSystemPrompt,
-            followupsEnabled() && input.generateFollowups !== false
-              ? HANDOFF_INSTRUCTIONS
-              : HANDOFF_ONLY_INSTRUCTIONS,
-          ),
+          // A stage-only harness phase can dispatch, automate and hand off nothing: those parts
+          // only cost it turns and contradict its phase contract (PR #925 review).
+          systemPrompt: opts.env?.CEZ_HARNESS_STAGE_ONLY === '1'
+            ? composeSystemPrompt(systemPrompt, extraSystemPrompt)
+            : composeSystemPrompt(
+                systemPrompt,
+                dispatchPromptPart(state.dispatchPrompt, extraSystemPrompt),
+                state.automationsPrompt,
+                extraSystemPrompt,
+                followupsEnabled() && input.generateFollowups !== false
+                  ? HANDOFF_INSTRUCTIONS
+                  : HANDOFF_ONLY_INSTRUCTIONS,
+              ),
           userPrompt: prompt,
           images,
           cwd: state.cwd,

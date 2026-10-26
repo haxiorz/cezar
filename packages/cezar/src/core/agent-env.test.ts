@@ -98,6 +98,21 @@ describe('buildChildEnv — least-privilege child env (#427)', () => {
     expect(env.GIT_TERMINAL_PROMPT).toBe('0');
   });
 
+  // PR #925 review: a stage-only phase kept the dispatch CLI's address, so it could ask the
+  // unsandboxed server to start a task that may push; only the network sandbox stood in the way.
+  it('removes the dispatch channel from stage-only harness phases, and only from them', () => {
+    const dispatch = {
+      CEZ_API_URL: 'http://127.0.0.1:4321',
+      CEZ_BIN: '/opt/cezar/dist/index.js',
+      CEZ_PROJECT_ID: 'proj',
+      CEZ_TREE_DIR: '/data/tree',
+    };
+    const staged = buildChildEnv({ backend: 'codex', source: HOST, extraEnv: { ...dispatch, CEZ_HARNESS_STAGE_ONLY: '1' } });
+    for (const key of Object.keys(dispatch)) expect(staged[key]).toBeUndefined();
+    const ordinary = buildChildEnv({ backend: 'codex', source: HOST, extraEnv: dispatch });
+    expect(ordinary).toMatchObject(dispatch);
+  });
+
   /**
    * #785: the run's own temp directory is delivered as `extraEnv`, and it only
    * works if it genuinely REPLACES the host's. The host copy must be gone, not

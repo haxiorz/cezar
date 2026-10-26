@@ -1283,6 +1283,28 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(readFileSync(ledger!.runtimeScript!.path, 'utf8')).toBe(pinnedRuntime);
   });
 
+  // PR #925 review: the driver's skill copies went into the shared info/exclude, which also hid
+  // those paths in the user's own checkout.
+  it('ignores its skill copies in the worktree, never in the shared info/exclude', async () => {
+    const bundledRoot = join(dir, 'pinned-bundled');
+    writeTestSkill(bundledRoot, 'cez-harness');
+    mkdirSync(join(bundledRoot, 'cez-harness', 'scripts'), { recursive: true });
+    writeFileSync(join(bundledRoot, 'cez-harness', 'scripts', 'harness.mjs'), '// runtime\n', 'utf8');
+    const h = makeHarness(dir);
+    h.deps.bundledSkillsRoot = bundledRoot;
+    delete h.deps.sealRuntime;
+    delete h.deps.scriptDigest;
+    h.host.ensureSkill = async (name) => {
+      materializeTestSkill(dir, name);
+      return true;
+    };
+
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    const exclude = join(dir, '.git', 'info', 'exclude');
+    expect(existsSync(exclude) ? readFileSync(exclude, 'utf8') : '').not.toContain('.claude/skills/');
+    expect(readFileSync(join(dir, '.claude', 'skills', '.gitignore'), 'utf8')).toContain('cez-harness');
+  });
+
   // PR #925 review: preflight rm+cp'd over a tracked `.claude/skills/<name>`, and the handoff,
   // derived from git, staged cezar's copy as part of the user's change.
   // PR #925 review: a phase that repoints the worktree's `.git` makes host git load its config.
