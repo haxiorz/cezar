@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { ToolStatus, UiToolItem } from '@open-mercato/cezar-api-client'
+import type { RunEvent, ToolStatus, UiToolItem } from '@open-mercato/cezar-api-client'
 
 import {
   activeSubagent,
@@ -11,7 +11,7 @@ import {
   subagentChildren,
   subagentCounts,
 } from './subagent-dock'
-import type { ThreadEntry, ThreadTurn } from './thread-state'
+import { reduceThread, type ThreadEntry, type ThreadTurn } from './thread-state'
 
 /** A `Task` spawn in the shape the claude mapper emits (title precomputed by `toolDisplay`). */
 const task = (id: string, status: ToolStatus, extra: Partial<UiToolItem> = {}): UiToolItem => ({
@@ -533,5 +533,66 @@ describe('skills are not agents (#1202)', () => {
   it('collectSkills falls back to the whole title when it carries no skill name', () => {
     const bare: UiToolItem = { kind: 'tool', id: 's', name: 'Skill', toolKind: 'skill', title: 'Skill', status: 'completed' }
     expect(collectSkills([turn('turn-1', [bare])])).toEqual([{ id: 's', name: 'Skill' }])
+  })
+})
+
+
+describe('subagents — scoped source identities', () => {
+  const scopedTurns = (scopes: Array<Record<string, string>>): ThreadTurn[] => {
+    let seq = 0
+    const events: RunEvent[] = []
+    for (const [index, scope] of scopes.entries()) {
+      const emit = (type: string, extra: Record<string, unknown>) => {
+        seq += 1
+        events.push({ seq, type, ts: '2026-07-14T12:00:00.000Z', ...scope, ...extra } as RunEvent)
+      }
+      emit('turn.started', { turnId: `turn_${index}` })
+      emit('item.started', { item: task('item_1', 'running', { title: `Task: reviewer ${index}` }) })
+      emit('item.completed', { item: childTool('item_2', 'item_1', `Ran reviewer ${index}`) })
+    }
+    return reduceThread(events).turns
+  }
+
+  const cases: Array<[string, Array<Record<string, string>>, string[]]> = [
+    ['concurrent sessions', [{ stepId: 'review', sessionKey: 'a' }, { stepId: 'review', sessionKey: 'b' }], ['review:a:item_1', 'review:b:item_1']],
+    ['workflow steps', [{ stepId: 'spec' }, { stepId: 'review' }], ['spec:item_1', 'review:item_1']],
+    ['sessions without step stamps', [{ sessionKey: 'a' }, { sessionKey: 'b' }], ['a:item_1', 'b:item_1']],
+  ]
+
+  it.each(cases)('keeps dock row keys unique across %s', (_name, scopes, ids) => {
+    const turns = scopedTurns(scopes)
+    expect(collectSubagents(turns).map((agent) => agent.id)).toEqual(ids)
+  })
+
+  it.each(cases)('keeps dock child counts and activity separate across %s', (_name, scopes) => {
+    const agents = collectSubagents(scopedTurns(scopes))
+    expect(agents.map((agent) => [agent.toolCalls, agent.activity])).toEqual([
+      [1, 'Ran reviewer 0'],
+      [1, 'Ran reviewer 1'],
+    ])
+  })
+
+  it.each(cases)('resolves each sheet and its children across %s', (_name, scopes, ids) => {
+    const turns = scopedTurns(scopes)
+    for (const [index, id] of ids.entries()) {
+      expect(findSubagent(turns, id)).toEqual(collectSubagents(turns)[index])
+      expect(subagentChildren(turns, id)).toEqual([childTool('item_2', 'item_1', `Ran reviewer ${index}`)])
+    }
+  })
+
+  it('keeps attributed children across later turns of the same reviewer only', () => {
+    const turns = scopedTurns([{ stepId: 'review', sessionKey: 'a' }, { stepId: 'review', sessionKey: 'b' }])
+    turns.push({ id: 'later-a', stepId: 'review', sessionKey: 'a', items: [childText('item_3', 'item_1', 'A follow-up')] })
+    const agents = collectSubagents(turns)
+    expect(agents.map((agent) => agent.activity)).toEqual(['A follow-up', 'Ran reviewer 1'])
+    expect(subagentChildren(turns, agents[0]!.id).map((item) => item.id)).toEqual(['item_2', 'item_3'])
+    expect(subagentChildren(turns, agents[1]!.id).map((item) => item.id)).toEqual(['item_2'])
+  })
+
+  it('guard: leaves bare legacy keys and cross-turn child joins unchanged', () => {
+    const turns = [turn('first', [task('a', 'running')]), turn('later', [childTool('c', 'a', 'Ran later')])]
+    expect(collectSubagents(turns)).toEqual([{ id: 'a', title: 'review a', status: 'running', toolCalls: 1, activity: 'Ran later' }])
+    expect(findSubagent(turns, 'a')).toEqual(collectSubagents(turns)[0])
+    expect(subagentChildren(turns, 'a')).toEqual([childTool('c', 'a', 'Ran later')])
   })
 })

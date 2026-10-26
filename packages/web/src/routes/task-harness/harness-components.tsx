@@ -109,17 +109,17 @@ export function HarnessModelsDock({ ledger }: { ledger: HarnessLedgerResponse })
           return (
             <div
               key={model.id}
-              className="grid min-w-0 grid-cols-[auto_minmax(5rem,.8fr)_minmax(7rem,1fr)_minmax(0,2fr)_auto] items-center gap-2 border-b border-border/70 py-2 text-xs last:border-0 max-sm:grid-cols-[auto_1fr_auto]"
+              className="grid min-w-0 grid-cols-[auto_minmax(5rem,.8fr)_minmax(7rem,1fr)_minmax(0,2fr)_auto] items-center gap-2 border-b border-border/70 py-2 text-xs last:border-0 @max-sm/run:grid-cols-[auto_1fr_auto]"
             >
               <StatusDot
                 tone={toneOf(invocation?.status ?? model.readiness)}
                 pulse={invocation?.status === 'running'}
               />
               <span className="truncate font-semibold text-foreground">{model.id}</span>
-              <span className="truncate font-mono text-[10.5px] text-soft-foreground max-sm:hidden">
+              <span className="truncate font-mono text-[10.5px] text-soft-foreground @max-sm/run:hidden">
                 {model.binding ?? model.family ?? 'default'}
               </span>
-              <span className="min-w-0 truncate text-muted-foreground max-sm:col-start-2">
+              <span className="min-w-0 truncate text-muted-foreground @max-sm/run:col-start-2">
                 <span className="mr-2 rounded bg-muted px-1.5 py-0.5 text-[9px] font-semibold tracking-wide uppercase">
                   {modelRole(model)}
                 </span>

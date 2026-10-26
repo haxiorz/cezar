@@ -138,6 +138,55 @@ describe('reduceThread — item ids across workflow steps', () => {
     expect(turns[1]!.completed).toBeUndefined()
   })
 
+  it.each<[string, Record<string, unknown>, Record<string, unknown>]>([
+    ['note', { message: 'A note' }, { kind: 'note', text: 'A note' }],
+    ['lifecycle', { message: 'A lifecycle' }, { kind: 'note', text: 'A lifecycle' }],
+    ['session.error', { message: 'A session error' }, { kind: 'note', text: 'A session error', tone: 'danger' }],
+    ['error', { message: 'A error' }, { kind: 'note', text: 'A error', tone: 'danger' }],
+    ['image', { url: '/images/a.png' }, { kind: 'image', url: '/images/a.png' }],
+    ['ask.requested', { requestId: 'ask-a', questions: [{ id: 'q', header: 'Choice', question: 'Continue?', options: [] }] }, { kind: 'ask', id: 'ask-a' }],
+    ['provider-auth-required', { provider: 'codex', authFailureId: 'auth-a' }, { kind: 'provider-auth-required', authFailureId: 'auth-a' }],
+    ['check-output', { command: 'npm test', text: 'A check', exitCode: 1 }, { kind: 'tool', output: 'A check', status: 'failed' }],
+    ['step-end', { status: 'failed', error: 'A failure' }, { kind: 'note', text: 'step review failed — A failure' }],
+  ])('routes %s metadata to its concurrent reviewer', (type, payload, expected) => {
+    const at = (sessionKey: string) => ({ stepId: 'review', sessionKey })
+    const { turns } = reduceThread([
+      line(1, 'turn.started', { turnId: 'turn_1', ...at('a') }),
+      line(2, 'turn.started', { turnId: 'turn_1', ...at('b') }),
+      line(3, 'item.completed', { item: { kind: 'message', id: 'item_1', role: 'assistant', text: 'A' }, ...at('a') }),
+      line(4, type, { ...payload, ...at('a') }),
+      line(5, 'item.completed', { item: { kind: 'message', id: 'item_1', role: 'assistant', text: 'B' }, ...at('b') }),
+    ])
+    expect(turns[0]!.items).toContainEqual(expect.objectContaining(expected))
+    expect(turns[1]!.items).toEqual([{ kind: 'message', id: 'item_1', role: 'assistant', text: 'B' }])
+  })
+
+  it('routes plan snapshots to their concurrent reviewer', () => {
+    const entries = [{ content: 'A plan', status: 'in_progress' }]
+    const { turns } = reduceThread([
+      line(1, 'turn.started', { turnId: 'turn_1', sessionKey: 'a' }),
+      line(2, 'turn.started', { turnId: 'turn_1', sessionKey: 'b' }),
+      line(3, 'plan.updated', { entries, sessionKey: 'a' }),
+    ])
+    expect(turns[0]!.planEntries).toEqual(entries)
+    expect(turns[1]!.planEntries).toBeUndefined()
+  })
+
+  it('offers an agent update in each concurrent reviewer turn, deduplicating its error twins', () => {
+    const message = 'OpenCode 1.18.0 or newer is required to use the free tier'
+    const { turns } = reduceThread([
+      line(1, 'turn.started', { turnId: 'turn_1', sessionKey: 'a' }),
+      line(2, 'turn.started', { turnId: 'turn_1', sessionKey: 'b' }),
+      line(3, 'session.error', { message, sessionKey: 'a' }),
+      line(4, 'error', { message, sessionKey: 'a' }),
+      line(5, 'error', { message, sessionKey: 'b' }),
+    ], { runner: 'opencode' })
+    expect(turns.map((turn) => turn.items.filter((item) => item.kind === 'agent-update-required'))).toEqual([
+      [{ kind: 'agent-update-required', id: 'v2:3:update', provider: 'opencode' }],
+      [{ kind: 'agent-update-required', id: 'v1:5:update', provider: 'opencode' }],
+    ])
+  })
+
   it('retains bare-id lifecycle updates for legacy events without stepId', () => {
     const { turns } = reduceThread([
       line(1, 'turn.started', { turnId: 'turn_1' }),
@@ -157,6 +206,53 @@ describe('reduceThread — item ids across workflow steps', () => {
 })
 
 describe('reduceThread — stable source identities under history prepend', () => {
+  it('keeps a harness window’s first turn key after an older phase is prepended', () => {
+    const stepNames = new Map([['spec', 'Specify'], ['review', 'Review']])
+    const tail = [
+      line(100, 'turn.started', { turnId: 'review-turn', stepId: 'review' }),
+      line(101, 'item.completed', { stepId: 'review', item: { kind: 'tool', id: 'tool', name: 'Bash', toolKind: 'execute', title: 'Ran npm test', status: 'completed' } }),
+    ]
+    const window = reduceThread(tail, { stepNames })
+    const prepended = reduceThread([
+      line(10, 'turn.started', { turnId: 'spec-turn', stepId: 'spec' }),
+      line(11, 'turn.completed', { turnId: 'spec-turn', stepId: 'spec' }),
+      ...tail,
+    ], { stepNames })
+    expect(window.turns[0]!.id).toBe('turn-seq-100')
+    expect(window.turns[0]!.items.map((item) => item.id)).toEqual(['tool'])
+    expect(prepended.turns.find((turn) => turn.turnId === 'review-turn')!.id).toBe(window.turns[0]!.id)
+  })
+
+  it('seeds a harness window from its first stamped event without a top divider', () => {
+    const thread = reduceThread([
+      line(90, 'token-usage', { tokensUsed: 1 }),
+      line(100, 'turn.started', { turnId: 'review-turn', stepId: 'review', sessionKey: 'a' }),
+      line(101, 'note', { message: 'reviewing', stepId: 'review', sessionKey: 'a' }),
+    ], { stepNames: new Map([['review', 'Review']]) })
+    expect(thread.turns.map((turn) => turn.id)).toEqual(['turn-seq-100'])
+    expect(thread.turns[0]!.items.map((item) => item.id)).toEqual(['v1:101'])
+  })
+
+  it('keeps re-entered harness divider keys after history prepend', () => {
+    const stepNames = new Map([['spec', 'Specify'], ['implement', 'Implement']])
+    const tail = [
+      line(100, 'note', { message: 'spec', stepId: 'spec' }),
+      line(101, 'note', { message: 'implement', stepId: 'implement' }),
+      line(102, 'note', { message: 'retry', stepId: 'spec' }),
+    ]
+    const markers = (events: RunEvent[]) => reduceThread(events, { stepNames }).turns
+      .flatMap((turn) => turn.items)
+      .filter((item) => item.kind === 'note' && item.marker === 'step-start')
+      .map((item) => item.id)
+    const windowIds = markers(tail)
+    expect(windowIds).toEqual(['step-start:101', 'step-start:102'])
+    expect(markers([
+      line(10, 'note', { message: 'older spec', stepId: 'spec' }),
+      line(11, 'note', { message: 'older implement', stepId: 'implement' }),
+      ...tail,
+    ]).filter((id) => windowIds.includes(id))).toEqual(windowIds)
+  })
+
   it('keeps an existing turn key when an older page is prepended', () => {
     const tail = [
       line(100, 'turn.started', { turnId: 'tail' }),
@@ -1109,16 +1205,16 @@ describe('step-start markers', () => {
       { stepNames },
     )
     expect(markersOf(thread).map((marker) => [marker.id, marker.text])).toEqual([
-      ['step-start:spec', 'Specify'],
-      ['step-start:implement', 'Implement'],
+      ['step-start:3', 'Implement'],
     ])
     // The marker precedes the step's first item in the turn.
-    expect(thread.turns[0]!.items[0]).toMatchObject({ kind: 'note', id: 'step-start:spec' })
+    expect(thread.turns[0]!.items[1]).toMatchObject({ kind: 'note', id: 'step-start:3' })
   })
 
   it('names a council round after its phase, and an unlisted step by its id', () => {
     const thread = reduceThread(
       [
+        line(0, 'step-start', { stepId: 'spec' }),
         line(1, 'note', { message: 'round one', stepId: 'spec-review-1' }),
         line(2, 'note', { message: 'packet', stepId: 'packet-PK-01' }),
       ],
@@ -1138,9 +1234,8 @@ describe('step-start markers', () => {
     )
     const ids = turns.flatMap((turn) => turn.items.map((item) => item.id))
     expect(ids.filter((id) => id.startsWith('step-start:'))).toEqual([
-      'step-start:spec',
-      'step-start:implement',
-      'step-start:spec#2',
+      'step-start:2',
+      'step-start:3',
     ])
     expect(new Set(ids).size).toBe(ids.length)
   })

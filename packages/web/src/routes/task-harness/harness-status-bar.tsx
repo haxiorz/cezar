@@ -62,7 +62,7 @@ export function HarnessStatusBar({
 
       <span
         aria-hidden="true"
-        className="hidden h-[3px] min-w-[60px] max-w-[240px] flex-1 overflow-hidden rounded-full bg-muted sm:block"
+        className="hidden h-[3px] min-w-[60px] max-w-[240px] flex-1 overflow-hidden rounded-full bg-muted @sm/run:block"
       >
         <i
           className="block h-full rounded-full bg-primary transition-[width] duration-500"
@@ -71,7 +71,7 @@ export function HarnessStatusBar({
       </span>
 
       {council ? (
-        <span className="min-w-0 truncate text-muted-foreground max-sm:hidden">
+        <span className="min-w-0 truncate text-muted-foreground @max-sm/run:hidden">
           council round {council.round} ·{' '}
           <span className="tabular-nums">
             {completed}/{reviewers.length || '—'}

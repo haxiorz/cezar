@@ -894,6 +894,16 @@ function HistoryBoundary({
 export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefined {
   const last = thread.turns.at(-1)
   if (last === undefined) return run.startedAt
+  // PR #925 review: the last-started reviewer may finish before its peers.
+  if (last.sessionKey !== undefined) {
+    const peers = thread.turns.filter((turn) => turn.sessionKey !== undefined && turn.stepId === last.stepId)
+    const open = peers.find((turn) => turn.completed === undefined)
+    if (open !== undefined) return open.startedAt ?? run.startedAt
+    return peers.reduce<string | undefined>((latest, turn) => {
+      const endedAt = turn.completed?.ts
+      return endedAt !== undefined && (latest === undefined || Date.parse(endedAt) > Date.parse(latest)) ? endedAt : latest
+    }, undefined) ?? run.startedAt
+  }
   if (last.completed === undefined) return last.startedAt ?? run.startedAt
   return last.completed.ts ?? run.startedAt
 }
