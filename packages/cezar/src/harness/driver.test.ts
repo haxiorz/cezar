@@ -2948,6 +2948,30 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(h.ops.some((o) => o.id === 'review')).toBe(true);
   });
 
+  // PR #925 review: a phase that left a directory at its result path made the retry's cleanup throw
+  // EISDIR out of the driver, and every Continue crashed the run the same way.
+  it.each(['qualify', 'review'])('retries a %s attempt that left a directory at its result path', async (planted) => {
+    const h = makeHarness(dir);
+    const attempts = new Map<string, number>();
+    for (const phase of ['qualify', 'diagnose', 'implement', 'review']) {
+      h.agentBehavior.set(phase, (req) => {
+        const attempt = (attempts.get(phase) ?? 0) + 1;
+        attempts.set(phase, attempt);
+        if (phase === planted && attempt === 1) {
+          mkdirSync(join(req.resultPath, 'nested'), { recursive: true });
+          writeFileSync(join(req.resultPath, 'nested', 'result.json'), '{}', 'utf8');
+          return null;
+        }
+        const result = phase === 'review' ? { verdict: 'approve', findings: [] } : phaseDefaults[phase];
+        writeFileSync(req.resultPath, JSON.stringify(result), 'utf8');
+        return null;
+      });
+    }
+
+    expect(await runHarnessDriver(h.host, { ...input, roles }, h.deps)).toBeNull();
+    expect(attempts.get(planted)).toBe(2);
+  });
+
   // PR #925 review: a usage limit spent both reviewer attempts at once (attempt 2 fired into the same
   // closed window), so the auto-resume at reset ran no reviewer and the run stayed parked.
   it('leaves a usage-limited reviewer unspent, so the resume at reset runs it again', async () => {

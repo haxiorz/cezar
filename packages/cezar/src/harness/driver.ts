@@ -1600,10 +1600,11 @@ export async function runHarnessDriver(
       });
       // A pre-created empty file makes Claude's built-in Write tool demand a
       // Read before it will write. Start absent instead: appearance of the
-      // file is also the turn-driven session's completion signal.
-      rmSync(resultPath, { force: true });
+      // file is also the turn-driven session's completion signal. `recursive`: a phase that left a
+      // directory here made every Continue throw EISDIR (PR #925 review).
+      rmSync(resultPath, { recursive: true, force: true });
       if (sessionResultPath !== resultPath) {
-        rmSync(sessionResultPath, { force: true });
+        rmSync(sessionResultPath, { recursive: true, force: true });
       }
       const reviewSubjectBefore = reviewSubjectSha256;
       let failure: string | null;
@@ -4228,7 +4229,7 @@ export async function runHarnessDriver(
               // A failed prior attempt can leave a result file behind; attempt 2 of run
               // 0fe16fb7 read one, announced "the file already exists", and set about
               // editing it instead of writing the contract. Every attempt starts clean.
-              rmSync(resultPath, { force: true });
+              rmSync(resultPath, { recursive: true, force: true });
               const failure = await runReadOnlyReviewer(invocation, {
                 concurrent: true,
                 phaseId: councilId,
@@ -5130,7 +5131,7 @@ export async function runHarnessDriver(
             });
             // Same lesson as the spec council (run 0fe16fb7): a failed prior
             // attempt can leave a result file behind that derails attempt 2.
-            rmSync(resultPath, { force: true });
+            rmSync(resultPath, { recursive: true, force: true });
             const failure = await runReadOnlyReviewer(invocation, {
               concurrent: true,
               phaseId: reviewId,
