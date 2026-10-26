@@ -178,7 +178,7 @@ export function modelsForRunner(
   customIds: readonly (string | null | undefined)[] = [],
 ): readonly ModelPreset[] {
   const presets = MODELS_BY_RUNNER[runner] ?? MODELS_BY_RUNNER.claude
-  const discovered = runnerDiscoversModels(runner) && catalog?.runner === runner ? catalog.models : []
+  const discovered = runnerDiscoversModels(runner) ? (catalog?.models ?? []) : []
   // A live catalog REPLACES the presets rather than extending them: the whole point is that the
   // host CLI, not this file, decides which models exist. The presets come back the moment
   // discovery has nothing — a missing, old or logged-out CLI leaves a usable picker, never an
@@ -224,7 +224,6 @@ export function modelCatalogStatus(
   failed = false,
 ): string | undefined {
   if (!runnerDiscoversModels(runner)) return undefined
-  if (catalog && catalog.runner !== runner) return undefined
   const name = DISCOVERY_RUNNER_LABEL[runner]
   if (catalog?.stale) return `Using cached ${name} model list`
   if (failed || catalog?.source === 'unavailable') return `Latest ${name} models unavailable`

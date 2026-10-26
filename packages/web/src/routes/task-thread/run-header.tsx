@@ -208,9 +208,11 @@ function RunHeaderView({
   const refs = useRunReferences(run)
   const [collapsed, setCollapsed] = useHeaderCollapsed()
 
+  // Only the harness rail reads the header height; ordinary runs skip the observer (PR #925 review).
+  const harnessRun = Boolean(run.harness)
   useEffect(() => {
     const el = headerRef.current
-    if (!el) return
+    if (!el || !harnessRun) return
     const publish = () => {
       document.documentElement.style.setProperty(
         '--run-header-h',
@@ -231,7 +233,7 @@ function RunHeaderView({
       observer.disconnect()
       document.documentElement.style.removeProperty('--run-header-h')
     }
-  }, [])
+  }, [harnessRun])
 
   return (
     <ReferenceStatusProvider projectId={refs.projectId} requests={refs.requests}>

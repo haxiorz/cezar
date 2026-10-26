@@ -53,6 +53,9 @@ import type {
   CreateProjectInput,
   GithubOwnersResponse,
   ConfigResponse,
+  ReclaimWorktreesResponse,
+  RemoveWorktreeResponse,
+  WorktreesResponse,
   ContinueResponse,
   CreatePrResponse,
   AdoptPrResponse,
@@ -61,7 +64,6 @@ import type {
   DeleteDraftResponse,
   DeleteRunResponse,
   DeleteWorkflowResponse,
-  EditQueuedMessageResponse,
   DraftEntry,
   DraftImage,
   DraftImageContent,
@@ -90,12 +92,13 @@ import type {
   HostUsage,
   AttachmentEntry,
   AttachmentInput,
-  ImportableSkill,
   DeleteUploadResponse,
   StagedUpload,
   LaunchKeyResponse,
   MessageInput,
+  EditQueuedMessageResponse,
   MessageResponse,
+  RemoveQueuedMessageResponse,
   OpenInCliResponse,
   OpenProjectInResponse,
   OpenTargetsResponse,
@@ -108,12 +111,11 @@ import type {
   ProviderId,
   ProviderStatusResponse,
   ProjectsResponse,
-  ReclaimWorktreesResponse,
   RegisterProjectResponse,
   RemoveProjectResponse,
-  RemoveQueuedMessageResponse,
+  UpdateProjectInput,
+  UpdateProjectResponse,
   RemoveTodoResponse,
-  RemoveWorktreeResponse,
   RepoBranchResponse,
   RepoSync,
   RepoSyncActionResponse,
@@ -122,11 +124,11 @@ import type {
   RunHistoryContext,
   RunHistoryPage,
   RepoResponse,
-  RunRecord,
   RepoTree,
   Runner,
   ModelDiscoveryRunner,
   RunnerModelCatalogResponse,
+  RunRecord,
   RunsIndexResponse,
   StarCountPayload,
   DesignProxyRequest,
@@ -136,26 +138,24 @@ import type {
   WorktreeEntry,
   SaveWorkflowInput,
   SaveWorkflowResponse,
-  SetAgentConfigInput,
   SaveWorkflowGraphInput,
   ValidateWorkflowGraphResponse,
   WorkflowGraph,
   WorkflowNodeCatalogResponse,
   SetConfigInput,
   SetConfigResponse,
+  SetAgentConfigInput,
   SetWorkspaceConfigInput,
   SetWorkspaceUiStateInput,
+  ImportableSkill,
   Skill,
   StartTodoResponse,
   TodoItem,
   UiState,
-  UpdateProjectInput,
-  UpdateProjectResponse,
   WorkflowsResponse,
   WorkspaceConfigResponse,
   WorkspaceUiState,
   SkillsUpdateState,
-  WorktreesResponse,
   SelfUpdateDevelopment,
   SelfUpdateStatus,
   UpdateChannel,
@@ -767,8 +767,6 @@ export async function getConfig(opts?: ReadOptions): Promise<ConfigResponse> {
 
 // ---- cez-harness (spec 2026-07-23-harness-orchestration) ---------------------------------
 
-
-
 /** The run's harness ledger — 404s (throws) when the run has none. */
 export async function getRunHarness(
   id: string,
@@ -782,9 +780,6 @@ export async function getRunHarness(
     runPath(id, '/harness'),
   ))
 }
-
-
-
 
 /** The selected project's agent-owned config catalog and current file state. */
 export async function getAgentConfig(opts: ReadOptions = {}): Promise<AgentConfigListing> {

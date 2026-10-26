@@ -1,6 +1,6 @@
 import { queueWaitLabel } from '@/lib/queue-wait-label'
 import { MessageSquareTextIcon, SearchXIcon } from 'lucide-react'
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useLocation, useParams } from 'react-router'
 
 import { Link } from '@/lib/project-router'
@@ -42,7 +42,7 @@ import { useDeliverPrompt } from './deliver-prompt'
 import { AgentsDock } from './agents-dock'
 import { PlanDock, planCounts } from './plan-dock'
 import { SkillsDock } from './skills-dock'
-import { collectSkills, collectSubagents, findSubagent, subagentSheetChildren } from './subagent-dock'
+import { collectSkills, collectSubagents, findSubagent, subagentChildren } from './subagent-dock'
 import { SubagentSheet } from './subagent-sheet'
 import { AcceptCelebration, ReviewPanel } from './review-panel'
 import { queuePosition } from './run-actions'
@@ -202,6 +202,18 @@ export function TaskThreadRoute() {
 
 const NO_EVENTS: readonly RunEvent[] = []
 
+/** The transcript column beside a harness run's rail; an ordinary run renders it bare, as on main
+ *  (PR #925 review). */
+function RailLayout({ rail, children }: { rail: ReactNode; children: ReactNode }) {
+  if (!rail) return <>{children}</>
+  return (
+    <div className={RUN_RAIL_GRID}>
+      <div className="flex min-w-0 flex-col gap-2.5 md:gap-3.5">{children}</div>
+      {rail}
+    </div>
+  )
+}
+
 /** A harness run's durable ledger with its live `harness.*` events folded in (spec
  *  2026-07-23-harness-orchestration). Off for every other run, and while `enabled` is false. */
 function useThreadHarnessLedger(
@@ -249,7 +261,7 @@ export function ThreadView({
   const footer = threadFooter(run.status, run.error, isAwaitingAnswer(run))
   const ownHarnessLedger = useThreadHarnessLedger(
     run,
-    history?.visibleEvents ?? NO_EVENTS,
+    run.harness ? (history?.visibleEvents ?? NO_EVENTS) : NO_EVENTS,
     givenHarnessLedger === undefined,
   )
   const harnessLedger = givenHarnessLedger ?? ownHarnessLedger
@@ -320,13 +332,9 @@ export function ThreadView({
       : findSubagent(currentThread.turns, openAgentId, runIsTerminal),
     [currentThread.turns, openAgentId, runIsTerminal],
   )
-  // Agent identity belongs to the compact current-state feed above, so a long transcript can
-  // still open its dock without loading every old page. The sheet body is history, though: read
-  // it from the visible paged thread. Otherwise progressive history reduces a long-running
-  // agent to the few tail items retained by `/history-context`.
   const openAgentChildren = useMemo(
-    () => (openAgentId === undefined ? [] : subagentSheetChildren(thread.turns, currentThread.turns, openAgentId)),
-    [thread.turns, currentThread.turns, openAgentId],
+    () => (openAgentId === undefined ? [] : subagentChildren(currentThread.turns, openAgentId)),
+    [currentThread.turns, openAgentId],
   )
   // The reply composer's unsent content (#939) — server-side, per run, restored on return.
   const draft = useDraft(run.id, 'composer')
@@ -446,10 +454,18 @@ export function ThreadView({
             />
           </Suspense>
         ) : null}
-        {/* The transcript column beside the run rail. Without a ledger both wrappers are
-            `contents`, so an ordinary run keeps the single flex column it always had. */}
-        <div className={harnessLedger ? RUN_RAIL_GRID : 'contents'}>
-          <div className={harnessLedger ? 'flex min-w-0 flex-col gap-2.5 md:gap-3.5' : 'contents'}>
+        <RailLayout
+          rail={harnessLedger ? (
+            <Suspense fallback={null}>
+              <HarnessRail
+                ledger={harnessLedger}
+                runId={run.id}
+                onOpenTimeline={() => setTimelineOpen((open) => !open)}
+                onOpenReviewer={setOpenReviewer}
+              />
+            </Suspense>
+          ) : null}
+        >
             {run.worktreeLifecycle ? <TaskLifecycleCard worktreeId={run.worktreeLifecycle.worktreeId} operationId={run.worktreeLifecycle.activeOperationId} worktreePath={run.worktreePath} taskTitle={run.title ?? run.task} /> : null}
             {history ? (
               <HistoryBoundary
@@ -552,23 +568,13 @@ export function ThreadView({
 
         {/* The review gate (spec 009): a finished run with changes parks here — nothing
             auto-merges. The panel exists exactly while the run rests at `review`. */}
-        {/* Send back carries the drafted line comments, like the composer does. */}
+        {/* Send back carries the drafted line comments, like the composer does. An in-place task
+            (trunk-based, spec 2026-10-20-trunk-based-projects) gets no panel: corrections go through
+            the composer and landing through the header's Commit step. */}
         {run.status === 'review' && !lifecycleGate && run.worktree !== false ? (
           <ReviewPanel run={run} diffComments={diffComments} publishBlockedReason={harnessPublishBlocked} />
         ) : null}
-          </div>
-
-          {harnessLedger ? (
-            <Suspense fallback={null}>
-              <HarnessRail
-                ledger={harnessLedger}
-                runId={run.id}
-                onOpenTimeline={() => setTimelineOpen((open) => !open)}
-                onOpenReviewer={setOpenReviewer}
-              />
-            </Suspense>
-          ) : null}
-        </div>
+        </RailLayout>
       </div>
 
       <AcceptCelebration status={run.status} />

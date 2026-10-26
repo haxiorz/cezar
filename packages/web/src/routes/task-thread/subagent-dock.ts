@@ -267,18 +267,10 @@ export function subagentCounts(agents: SubagentSummary[]): { done: number; total
 /**
  * The one-line readout for an agent, used by BOTH the collapsed head and the expanded row so
  * the two can never tell different stories about the same agent. A stalled agent is not
- * starting — the run ended under it, and the transcript will never move again. Neither is a
- * settled one: a harness skill session can complete without ever attributing children (run
- * 56633cdc closed with the head reading "starting…" over a staged, finished run), so a missing
- * activity line on a settled agent reports the outcome instead.
+ * starting — the run ended under it, and the transcript will never move again.
  */
 export function subagentActivityText(agent: SubagentSummary): string {
-  if (agent.activity !== undefined) return agent.activity
-  if (agent.stalled === true) return 'never finished'
-  if (agent.status === 'completed') return 'finished'
-  if (agent.status === 'failed') return 'failed'
-  if (agent.status === 'declined') return 'declined'
-  return 'starting…'
+  return agent.activity ?? (agent.stalled === true ? 'never finished' : 'starting…')
 }
 
 /**
@@ -328,16 +320,6 @@ export function findSubagent(
  * The children the sheet renders for one agent — the same cross-turn relation the dock counts,
  * exposed so the drill-down and the row count can never drift apart.
  */
-/**
- * The open agent's sheet body. The paged history has the agent's full transcript once its Task
- * anchor is loaded; a long-running agent's anchor can still sit before the loaded pages, and then
- * the current-state feed's retained tail beats an empty sheet (PR #925 review).
- */
-export function subagentSheetChildren(paged: ThreadTurn[], current: ThreadTurn[], parentId: string): ThreadEntry[] {
-  const anchored = paged.some((turn) => turn.items.some((entry) => entry.id === parentId && isRootTaskItem(entry)))
-  return subagentChildren(anchored ? paged : current, parentId)
-}
-
 export function subagentChildren(turns: ThreadTurn[], parentId: string): ThreadEntry[] {
   const anchorIndex = turns.findIndex((turn) =>
     turn.items.some((entry) => entry.id === parentId && isRootTaskItem(entry)),

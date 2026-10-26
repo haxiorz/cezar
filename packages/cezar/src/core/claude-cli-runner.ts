@@ -156,14 +156,7 @@ export class ClaudeCliRunner implements AgentRunner {
     let stdinOpen = true;
     let autoEndTimer: NodeJS.Timeout | undefined;
     let eofTermTimer: NodeJS.Timeout | undefined;
-    let eofKilled = false;
     let hardKillTimer: NodeJS.Timeout | undefined;
-
-    child.stdin.on('error', (err: NodeJS.ErrnoException) => {
-      stdinOpen = false;
-      if (err.code === 'EPIPE') return;
-      onEvent?.({ type: 'note', message: `claude: stdin error: ${err.message}` });
-    });
 
     // Protocol v2 emission — additive alongside v1 (`onEvent` keeps flowing
     // byte-identical); the channel is `opts.onUiEvent` (RunManager wiring
@@ -236,10 +229,7 @@ export class ClaudeCliRunner implements AgentRunner {
         // already gone
       }
       eofTermTimer = setTimeout(() => {
-        if (!hasExited()) {
-          eofKilled = true;
-          terminateChild(EOF_KILL_GRACE_MS);
-        }
+        if (!hasExited()) terminateChild(EOF_KILL_GRACE_MS);
       }, EOF_TERM_GRACE_MS);
       eofTermTimer.unref?.();
     };
@@ -367,28 +357,13 @@ export class ClaudeCliRunner implements AgentRunner {
       if (terminatedByCezar && isCezarTerminationExit(exitCode)) {
         onEvent?.({
           type: 'note',
-          message: eofKilled
-            ? `claude CLI ignored EOF after session end and was terminated (exit ${exitCode}) — result already delivered (known CLI bug)`
-            : `claude CLI did not exit on its own after close; terminated by cezar (code ${exitCode})`,
+          message: `claude CLI did not exit on its own after close; terminated by cezar (code ${exitCode})`,
         });
         onEvent?.({ type: 'done' });
         return { text, toolCalls, tokensUsed, sessionId: spec.sessionId };
       }
 
       if (exitCode !== 0 && exitCode !== null) {
-        if (eofKilled) {
-          // Seen live 2026-07-24: a harness spec phase finished its turn,
-          // `end()` closed stdin, claude ignored EOF (janitor-confirmed CLI
-          // bug), the watchdog SIGTERMed it — and the exit 143 failed a phase
-          // whose work had already succeeded. Our own cleanup kill is not an
-          // error.
-          onEvent?.({
-            type: 'note',
-            message: `claude CLI ignored EOF after session end and was terminated (exit ${exitCode}) — result already delivered (known CLI bug)`,
-          });
-          onEvent?.({ type: 'done' });
-          return { text, toolCalls, tokensUsed, sessionId: spec.sessionId };
-        }
         const msg = claudeExitMessage(exitCode, stderrChunks.join(''));
         onEvent?.({ type: 'error', message: msg });
         throw new Error(msg);

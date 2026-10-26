@@ -415,12 +415,7 @@ export async function excludeFromGit(repoRoot: string, pattern: string): Promise
       LIST_TIMEOUT_MS,
       repoRoot,
     );
-    // Not a repository → nothing to exclude FROM. Bail instead of fabricating
-    // a phantom `.git/info/` in a plain folder (seen 2026-07-24: a non-git
-    // project dir grew a `.git` holding only `info/exclude`, which then read
-    // as a broken repo to everything downstream).
-    if (!probe.ok || !probe.stdout.trim()) return;
-    const gitDir = probe.stdout.trim();
+    const gitDir = probe.ok && probe.stdout.trim() ? probe.stdout.trim() : join(repoRoot, '.git');
     const excludePath = join(gitDir, 'info', 'exclude');
     let prev = '';
     try {

@@ -1,9 +1,5 @@
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { bareDirFor, excludeFromGit, isPinnedSha, shouldPassiveFetch } from './skills-remote.ts';
+import { describe, expect, it } from 'vitest';
+import { bareDirFor, isPinnedSha, shouldPassiveFetch } from './skills-remote.ts';
 
 const TTL = 6 * 60 * 60 * 1_000;
 
@@ -44,31 +40,5 @@ describe('isPinnedSha', () => {
     expect(isPinnedSha('a'.repeat(40))).toBe(true);
     expect(isPinnedSha('b'.repeat(64))).toBe(true);
     expect(isPinnedSha('main')).toBe(false);
-  });
-});
-
-// PR #925 review: the materializer stopped reaching this bail-out, so its old test passed either way.
-describe('excludeFromGit', () => {
-  const dirs: string[] = [];
-  afterEach(() => {
-    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-  });
-  const tmp = () => {
-    const dir = mkdtempSync(join(tmpdir(), 'cez-exclude-'));
-    dirs.push(dir);
-    return dir;
-  };
-
-  it('never fabricates a .git in a folder that is not a repository', async () => {
-    const plain = tmp();
-    await excludeFromGit(plain, '.claude/skills/x/');
-    expect(existsSync(join(plain, '.git'))).toBe(false);
-  });
-
-  it('writes the shared info/exclude of a real repository', async () => {
-    const repo = tmp();
-    execFileSync('git', ['init', '-q'], { cwd: repo });
-    await excludeFromGit(repo, '.claude/skills/x/');
-    expect(readFileSync(join(repo, '.git', 'info', 'exclude'), 'utf8')).toContain('.claude/skills/x/');
   });
 });

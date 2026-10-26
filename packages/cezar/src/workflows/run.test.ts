@@ -41,7 +41,7 @@ type UsageAccountingHarness = {
     runId: string,
     state: Record<string, unknown>,
     sink: { handle(event: UiEvent): void },
-  event: UiEvent,
+    event: UiEvent,
   ): void;
 };
 

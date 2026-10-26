@@ -149,71 +149,17 @@ describe('discoverClaudeModels', () => {
     await expect(promise).resolves.toEqual([{ id: 'opus', label: 'opus', description: '' }]);
   });
 
-  const unsupported = (requestId: string, subtype: string) => ({
-    type: 'control_response',
-    response: {
-      subtype: 'error',
-      request_id: requestId,
-      error: `Unsupported control request subtype: ${subtype}`,
-    },
-  });
-
-  it('falls back to the initialize answer on a CLI that predates list_models', async () => {
-    // Claude Code 2.1.193, verbatim shape: `list_models` is refused, `initialize` carries the
-    // catalog next to commands, agents and account data.
-    const { fake, promise } = run((f) => {
-      f.write(...CHATTER, unsupported('cez-list-models-1', 'list_models'));
-      queueMicrotask(() =>
-        f.write({
-          type: 'control_response',
-          response: {
-            subtype: 'success',
-            request_id: 'cez-initialize-1',
-            response: {
-              commands: [],
-              agents: [],
-              models: [
-                { value: 'default', displayName: 'Default (recommended)', description: 'Opus 4.8 with 1M context' },
-                { value: 'opus[1m]', displayName: 'Opus', description: 'Opus 4.8 with 1M context', supportsEffort: true },
-                { value: 'claude-fable-5[1m]', displayName: 'Fable', description: 'Fable 5' },
-                { value: 'sonnet', displayName: 'Sonnet', description: 'Sonnet 4.6' },
-              ],
-              account: { email: 'someone@example.com' },
-            },
-          },
-        }),
-      );
-    });
-
-    await expect(promise).resolves.toEqual([
-      { id: 'opus[1m]', label: 'Opus', description: 'Opus 4.8 with 1M context' },
-      { id: 'claude-fable-5[1m]', label: 'Fable', description: 'Fable 5' },
-      { id: 'sonnet', label: 'Sonnet', description: 'Sonnet 4.6' },
-    ]);
-    expect(fake.requests.map((r) => (r.request as { subtype: string }).subtype)).toEqual([
-      'list_models',
-      'initialize',
-    ]);
-  });
-
-  it('reports a CLI that understands neither request as unavailable', async () => {
-    const { promise } = run((f) => {
-      f.write(unsupported('cez-list-models-1', 'list_models'));
-      queueMicrotask(() => f.write(unsupported('cez-initialize-1', 'initialize')));
-    });
-    await expect(promise).rejects.toThrow('unsupported by this CLI');
-  });
-
-  it('reports an initialize answer without a model list as unavailable', async () => {
-    const { promise } = run((f) => {
-      f.write(unsupported('cez-list-models-1', 'list_models'));
-      queueMicrotask(() =>
-        f.write({
-          type: 'control_response',
-          response: { subtype: 'success', request_id: 'cez-initialize-1', response: { commands: [] } },
-        }),
-      );
-    });
+  it('reports a CLI that does not know the request as unavailable', async () => {
+    const { promise } = run((f) =>
+      f.write({
+        type: 'control_response',
+        response: {
+          subtype: 'error',
+          request_id: 'cez-list-models-1',
+          error: 'Unsupported control request subtype: list_models',
+        },
+      }),
+    );
     await expect(promise).rejects.toThrow('unsupported by this CLI');
   });
 

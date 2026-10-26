@@ -14,7 +14,6 @@ import {
   continueRun,
   continueProjectRun,
   createAgentProfile,
-  editQueuedMessage,
   getAgentConfig,
   getAgentConfigFile,
   getAgentAccountDetails,
@@ -30,14 +29,13 @@ import {
   getGroup,
   getRunHarness,
   getHealth,
-  getImportableSkills,
-  getImportableSkillsWhenReady,
   getLaunchKey,
   getOpenTargets,
   getProviderStatus,
   getProjectRun,
   getProjectRuns,
   getProjects,
+  getRunnerModels,
   getRepo,
   getRunCommit,
   getRunCommits,
@@ -53,17 +51,14 @@ import {
   getRunDrafts,
   getRunFile,
   getRunHandoff,
-  getRunnerModels,
   getRuns,
   getRunsIndex,
+  getImportableSkills,
+  getImportableSkillsWhenReady,
   getSkills,
   getSkillsWhenReady,
   getTodos,
-  getTrackerAssociation,
-  getTrackerConnection,
-  getProjectSecrets,
-  getWorkspaceSecrets,
-  getE2eStatus,
+  getTrackerAssociation, getTrackerConnection, getProjectSecrets, getWorkspaceSecrets, getE2eStatus,
   getTrackerCandidates,
   getTrackerItem,
   getTrackerItems,
@@ -85,24 +80,25 @@ import {
   checkSkillsUpdate,
   applySkillsUpdate,
   getWorktrees,
+  editQueuedMessage,
   markRunSeen,
   markRunUnseen,
   patchRun,
-  putAgentConfigFile,
   pinProjectRun,
   pinRun,
   archiveProjectRun,
   archiveRun,
+  removeQueuedMessage,
   registerProject,
   openAgentAccountFile,
   removeAgentProfile,
   removeProject,
-  removeQueuedMessage,
   selectAgentProfile,
   updateAgentProfile,
+  updateProject,
   sendMessage,
   sendProjectRunMessage,
-  updateProject,
+  putAgentConfigFile,
   retryProviderAuth,
   searchTrackerItems,
   getRepoSync,
@@ -1186,9 +1182,6 @@ export function useRunHarness(id: string | undefined, enabled = true, events: re
   return query
 }
 
-
-
-
 /**
  * One run of a NAMED project — what a surface outside `/p/:projectId` has to use.
  *
@@ -1544,10 +1537,6 @@ export function useConfig(enabled = true) {
     enabled,
   })
 }
-
-// ---- cez-harness (spec 2026-07-23-harness-orchestration) -----------------------------------
-
-
 
 /** The worktree management panel (#483). Invalidated by the global event stream when a run
  *  finishes or is reclaimed, so the on-disk list and total stay live while the panel is open. */

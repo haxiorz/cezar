@@ -572,8 +572,8 @@ export function Composer({
     const transcript = dictation.finish()
     if (transcript === '') return
     const merged = text.trim() === '' ? transcript : `${text.replace(/\s*$/, '')} ${transcript}`
-    // A blocked send would return before its restore path, so the cleared draft would be lost.
-    if (alsoSend && !disabled && !submitDisabled && !busy) {
+    // A harness readiness block would return before the restore path and lose the cleared draft.
+    if (alsoSend && sendBlockedReason === undefined) {
       setText('')
       setImages([], 'submit')
       void send(merged, images, true)

@@ -153,9 +153,7 @@ const CONFIG: ConfigResponse = {
   branchNaming: null,
   defaultModels: {},
   modelsLocked: false,
-  // The multi-model feature flag is ON for this suite so the Multi-model surface stays
-  // exercised; the default-off gate has its own test.
-  multiModel: true,
+  multiModel: false,
   maxParallel: 2,
   memoryLimitMb: null,
   worktreeRetention: 10,
@@ -414,7 +412,7 @@ describe('the hero surface', () => {
   })
 
   it('switches composer mode with arrow keys and labels the active panel', async () => {
-    serve({ health: HEALTH_MULTI, providerStatus: PROVIDERS_MULTI })
+    serve({ config: { multiModel: true }, health: HEALTH_MULTI, providerStatus: PROVIDERS_MULTI })
     renderNewTask()
     await pillReady()
     const taskTab = screen.getByRole('tab', { name: 'Task' })
@@ -432,7 +430,7 @@ describe('the hero surface', () => {
   // PR #925 review: the setup prompt took the composer and the brief was gone for good.
   it('keeps an unsent brief when Configure models takes the composer', async () => {
     writeDraft({ ...readDraft(), text: 'My long brief', composerMode: 'multi' })
-    serve()
+    serve({ config: { multiModel: true } })
     renderNewTask()
     fireEvent.click(await screen.findByRole('button', { name: /configure models/i }))
     await waitFor(() => expect(textarea().value).toMatch(/Configure the multi-model agent harness/))
@@ -447,7 +445,7 @@ describe('the hero surface', () => {
       ...readDraft(),
       text: 'Fix the stale draft',
       composerMode: 'multi',
-      source: { source: 'workflow', ref: 'cez-harness-fix-issue' },
+      source: { source: 'workflow', ref: 'harness-fix-issue' },
     })
     serve({ config: { multiModel: false } })
     renderNewTask()
@@ -479,7 +477,7 @@ describe('the hero surface', () => {
 
 describe('picker data flows', () => {
   it('updates the harness role pickers when Claude model discovery changes', async () => {
-    serve({ health: HEALTH_MULTI, providerStatus: PROVIDERS_MULTI })
+    serve({ config: { multiModel: true }, health: HEALTH_MULTI, providerStatus: PROVIDERS_MULTI })
     const { client } = renderNewTask()
     await pillReady()
     fireEvent.mouseDown(screen.getByRole('tab', { name: 'Multi-model' }), { button: 0 })

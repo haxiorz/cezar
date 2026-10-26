@@ -40,9 +40,3 @@ skills-lock.json
 .e2e/logs/
 .e2e/videos/
 .e2e/cez-home/
-
-# macOS Finder litter
-.DS_Store
-
-# personal assistant tooling state (Serena MCP)
-.serena/

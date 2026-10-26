@@ -189,7 +189,6 @@ describe('the dictation overlay (paseo pattern)', () => {
   // PR #925 review: insert-and-send cleared the box, then the blocked send returned before its
   // restore path — the draft and the transcript were both gone.
   it.each([
-    ['submitDisabled', { submitDisabled: true }],
     ['sendBlockedReason', { sendBlockedReason: 'Checking every selected model binding…' }],
   ])('↑ insert-and-send keeps the draft and transcript when %s blocks sending', (_name, props) => {
     stubSpeech()

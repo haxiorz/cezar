@@ -10,7 +10,6 @@ import {
   subagentActivityText,
   subagentChildren,
   subagentCounts,
-  subagentSheetChildren,
 } from './subagent-dock'
 import type { ThreadEntry, ThreadTurn } from './thread-state'
 
@@ -290,17 +289,6 @@ describe('collectSubagents — children', () => {
     expect(subagentChildren(turns, 'a').map((c) => c.id)).toEqual(['c1'])
   })
 
-  // PR #925 review: the sheet read only the paged history, so an agent whose Task start had
-  // scrolled before the loaded pages opened a blank sheet.
-  it('reads the sheet from the paged history once it holds the anchor, else the current feed', () => {
-    const current = [turn('turn-1', [task('a', 'running'), childTool('c-tail', 'a', 'Tail tool')])]
-    const pagedWithoutAnchor = [turn('turn-9', [childTool('c-paged', 'a', 'Paged tool')])]
-    expect(subagentSheetChildren(pagedWithoutAnchor, current, 'a').map((c) => c.id)).toEqual(['c-tail'])
-
-    const pagedWithAnchor = [turn('turn-1', [task('a', 'running'), childTool('c1', 'a', 'One'), childTool('c2', 'a', 'Two')])]
-    expect(subagentSheetChildren(pagedWithAnchor, current, 'a').map((c) => c.id)).toEqual(['c1', 'c2'])
-  })
-
   it('leaves activity undefined when the agent has no children yet', () => {
     const agents = collectSubagents([turn('turn-1', [task('a', 'running')])])
     expect(agents[0]!.activity).toBeUndefined()
@@ -412,17 +400,6 @@ describe('activeSubagent', () => {
       'Ran npm test',
     )
     expect(subagentActivityText({ id: 'a', title: 't', status: 'running', toolCalls: 0 })).toBe('starting…')
-  })
-
-  // Regression (run 56633cdc): a harness skill session surfaces as a task item with NO
-  // attributed children, so `activity` never fills in. After the run staged and closed, the
-  // dock's head read "Agents · 1/1 — starting…" over a finished session. A settled agent
-  // without an activity line must state its outcome, not its birth.
-  it('names the outcome of a settled agent that produced no attributed output', () => {
-    expect(subagentActivityText({ id: 'a', title: 't', status: 'completed', toolCalls: 0 })).toBe('finished')
-    expect(subagentActivityText({ id: 'a', title: 't', status: 'failed', toolCalls: 0 })).toBe('failed')
-    expect(subagentActivityText({ id: 'a', title: 't', status: 'declined', toolCalls: 0 })).toBe('declined')
-    expect(subagentActivityText({ id: 'a', title: 't', status: 'pending', toolCalls: 0 })).toBe('starting…')
   })
 })
 

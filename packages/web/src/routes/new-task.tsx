@@ -142,6 +142,47 @@ const MultiModelSurface = lazy(() =>
   import('./new-task-multi').then((module) => ({ default: module.MultiModelSurface })),
 )
 
+/** Main's plain composer frame unless the Multi-model tab strip is on (PR #925 review). */
+function ComposerFrame({
+  tabs,
+  value,
+  onValueChange,
+  children,
+}: {
+  tabs: boolean
+  value: string
+  onValueChange: (value: string) => void
+  children: ReactNode
+}) {
+  if (!tabs) return <div className="w-full max-w-[720px]">{children}</div>
+  return (
+    <Tabs value={value} onValueChange={onValueChange} className="w-full max-w-[720px] gap-0">
+      {children}
+    </Tabs>
+  )
+}
+
+function ComposerPanel({
+  tabs,
+  value,
+  id,
+  labelledBy,
+  children,
+}: {
+  tabs: boolean
+  value: string
+  id: string
+  labelledBy: string
+  children: ReactNode
+}) {
+  if (!tabs) return <>{children}</>
+  return (
+    <TabsContent value={value} id={id} role="tabpanel" aria-labelledby={labelledBy} tabIndex={0}>
+      {children}
+    </TabsContent>
+  )
+}
+
 function HarnessPanelLoading() {
   return (
     <div
@@ -330,11 +371,7 @@ export function NewTaskRoute() {
   const modelsLocked = config.data?.modelsLocked === true
   const models = runner === null
     ? []
-    : modelsForRunner(
-        runner,
-        catalog.data,
-        [draft.model, config.data?.defaultModels?.[runner]],
-      )
+    : modelsForRunner(runner, catalog.data, [draft.model, config.data?.defaultModels?.[runner]])
   const model = runner === null
     ? ''
     : resolveModel(modelsLocked ? null : draft.model, runner, config.data?.defaultModels, catalog.data)
@@ -802,12 +839,12 @@ export function NewTaskRoute() {
       <TwinkleBackdrop />
       <GhostCodeBackdrop />
 
-      <Tabs
+      <ComposerFrame
+        tabs={multiModelEnabled}
         value={composerMode}
         onValueChange={(value) => update({ composerMode: value === 'multi' ? 'multi' : 'task' })}
-        className="w-full max-w-[720px] gap-0"
       >
-        <header className="mb-4 text-center max-md:mb-3">
+        <header className={multiModelEnabled ? 'mb-4 text-center max-md:mb-3' : 'mb-6 text-center max-md:mb-4'}>
           <h1 className="text-lg font-semibold tracking-tight max-md:text-base">
             What should the agent work on?
           </h1>
@@ -890,12 +927,11 @@ export function NewTaskRoute() {
         </div>
         ) : null}
 
-        <TabsContent
+        <ComposerPanel
+          tabs={multiModelEnabled}
           value={composerMode}
           id={`${composerTabsId}-panel`}
-          role={multiModelEnabled ? 'tabpanel' : undefined}
-          aria-labelledby={multiModelEnabled ? `${composerTabsId}-${composerMode}` : undefined}
-          tabIndex={multiModelEnabled ? 0 : undefined}
+          labelledBy={`${composerTabsId}-${composerMode}`}
         >
         <Composer
           ref={composerRef}
@@ -1165,8 +1201,8 @@ export function NewTaskRoute() {
         ) : (
           <SuggestedChips onPick={(text) => update({ text })} />
         )}
-        </TabsContent>
-      </Tabs>
+        </ComposerPanel>
+      </ComposerFrame>
 
     </div>
   )

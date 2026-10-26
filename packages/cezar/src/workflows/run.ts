@@ -1392,9 +1392,6 @@ export class RunManager {
   /** The stalled-queue watchdog (see `rescueStalledQueue`). */
   private readonly queueWatchdog: ReturnType<typeof setInterval>;
 
-  /** Stops an already-started watchdog sweep from mutating state after teardown. */
-  private disposed = false;
-
   /** Set by the watchdog for exactly one sweep: ignore the usage-limit hold and make progress. */
   private forceNextPump = false;
 
@@ -1514,7 +1511,6 @@ export class RunManager {
    * dispose only guarantees the manager makes no further moves on its own.
    */
   dispose(): void {
-    this.disposed = true;
     ++this.queueReasonRevision;
     this.store.off('run', this.onRunHoldInputs);
     this.store.off('deleted', this.onRunDeletedHolds);
@@ -2177,7 +2173,6 @@ export class RunManager {
    * left in the queue as a ghost.
    */
   private async reviveQueuedRun(run: RunRecord, reason: string): Promise<void> {
-    if (this.disposed || !existsSync(this.dataDir)) return;
     const queuedContinuation = [...run.steps]
       .reverse()
       .find((step) => step.status === 'pending' && step.id.startsWith('continue-'));
@@ -2206,10 +2201,6 @@ export class RunManager {
       return;
     }
     const workflow = await this.reviveWorkflow(run);
-    // `dispose()` can run (or the project can disappear) while workflow discovery
-    // is awaiting the filesystem. A watchdog sweep must not resurrect the run
-    // after its owning project context has been torn down.
-    if (this.disposed || !existsSync(this.dataDir)) return;
     if (!workflow) {
       this.store.updateRun(run.id, {
         status: 'failed',
@@ -3489,11 +3480,6 @@ export class RunManager {
    * Public so a test can drive the wedge directly instead of waiting out the interval.
    */
   async rescueStalledQueue(now = Date.now()): Promise<void> {
-    // Clearing the interval prevents future sweeps, but cannot cancel one whose
-    // callback has already started. The directory guard also makes a removed
-    // project degrade quietly instead of recreating `.ai/cezar` from a stale
-    // in-memory record.
-    if (this.disposed || !existsSync(this.dataDir)) return;
     // First, the worst shape: a record that says `queued` while the engine holds no job, no
     // continuation and no queue entry for it. `pump()` cannot see such a run — it iterates the
     // queue, and this one is not in it — so nothing will ever start it. Re-adopt it through the
@@ -3505,7 +3491,6 @@ export class RunManager {
       if (this.queue.includes(run.id)) continue;
       console.warn(`[cez] queue watchdog: re-adopting queued run ${run.id} the engine had lost`);
       await this.reviveQueuedRun(run, 'queue watchdog');
-      if (this.disposed || !existsSync(this.dataDir)) return;
     }
     if (this.queue.length === 0) return;
     if (this.busySlots() > 0 || this.starting.size > 0) return;

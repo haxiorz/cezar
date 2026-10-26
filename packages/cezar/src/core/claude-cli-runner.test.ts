@@ -494,7 +494,7 @@ say({ type: 'result', subtype: 'success', is_error: false, result: 'spec finishe
       expect(types).toContain('turn-end');
       expect(types).toContain('done');
       expect(types).not.toContain('error');
-      expect(events.some((e) => e.type === 'note' && String(e.message).includes('ignored EOF'))).toBe(true);
+      expect(events.some((e) => e.type === 'note' && String(e.message).includes('did not exit on its own after close'))).toBe(true);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

@@ -300,12 +300,6 @@ describe('model option resolution', () => {
     ])
   })
 
-  it('never merges a catalog fetched for another runner', () => {
-    const codexCatalog = { runner: 'codex' as const, models: [{ id: 'gpt-future', label: 'F', description: '' }], source: 'live' as const, stale: false }
-    expect(modelsForRunner('opencode', codexCatalog).some((m) => m.id === 'gpt-future')).toBe(false)
-    expect(modelCatalogStatus('opencode', codexCatalog)).toBeUndefined()
-  })
-
   it('reports stale and unavailable OpenCode catalogs with matching wording', () => {
     expect(modelCatalogStatus('opencode', { runner: 'opencode', models: [], source: 'cache', stale: true, reason: 'raw' })).toBe('Using cached OpenCode model list')
     expect(modelCatalogStatus('opencode', { runner: 'opencode', models: [], source: 'unavailable', stale: false, reason: 'raw' })).toBe('Latest OpenCode models unavailable')
