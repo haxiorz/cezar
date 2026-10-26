@@ -221,7 +221,7 @@ import {
   HARNESS_PROFILES,
   type HarnessProfile,
 } from '../harness/types.ts';
-import { HARNESS_FIX_ISSUE, isHarnessWorkflow } from '../harness/workflows.ts';
+import { HARNESS_FIX_ISSUE, HARNESS_TEXT_ONLY_ERROR, isHarnessWorkflow } from '../harness/workflows.ts';
 import { extractTaskRefs } from '../runs/task-refs.ts';
 import { checkoutGitStatus } from '../workflows/landing.ts';
 import { deleteUpload, readUpload, writeUpload } from '../uploads.ts';
@@ -5411,6 +5411,9 @@ export function createApp(deps: ServerDeps) {
       if (harnessInput && parsed.data.worktree === false) {
         return c.json({ error: 'harness workflows require an isolated git worktree' }, 400);
       }
+      if (harnessInput && parsed.data.images?.length) {
+        return c.json({ error: HARNESS_TEXT_ONLY_ERROR }, 400);
+      }
       if (harnessInput && workflow.name === HARNESS_FIX_ISSUE && !harnessInput.issueId) {
         const issueNumber = extractTaskRefs(parsed.data.task).issueNumber;
         if (issueNumber === undefined) {
@@ -5738,6 +5741,10 @@ export function createApp(deps: ServerDeps) {
       //   live session → delivered · still queued → folded into the prompt
       //   starting up  → buffered  · anything else → 409, exactly as before
       if (manager.sendMessage(id, content)) return c.json({ delivered: true });
+      // Only a live model session can take an image; a stacked or boundary message reaches no phase.
+      if (run.harness && parsed.data.images.length > 0) {
+        return c.json({ error: HARNESS_TEXT_ONLY_ERROR }, 409);
+      }
 
       // A harness run with a ledger resumes from it, never from its folded prompt: a message stacked
       // onto a resumed run waiting in the queue was acknowledged and never applied (PR #925 review).
@@ -5779,15 +5786,6 @@ export function createApp(deps: ServerDeps) {
         run.harness &&
         ['queued', 'running', 'waiting'].includes(store.getRun(id)?.status ?? '')
       ) {
-        if (parsed.data.images.length > 0) {
-          return c.json(
-            {
-              error:
-                'phase-boundary harness messages currently accept text only; send images while a model session is live',
-            },
-            409,
-          );
-        }
         const harnessDataDir = c.get('project').dataDir;
         let read = readLedger(harnessDataDir, id);
         if (read.status === 'missing') {
@@ -5904,6 +5902,7 @@ export function createApp(deps: ServerDeps) {
       }
 
       if (run.status !== 'queued') return c.json({ error: 'run already started' }, 409);
+      if (run.harness && parsed.data.images?.length) return c.json({ error: HARNESS_TEXT_ONLY_ERROR }, 409);
       const images = resolveAttachments(parsed.data.images);
       if (typeof images === 'string') return c.json({ error: images }, 400);
       if (images !== undefined) {

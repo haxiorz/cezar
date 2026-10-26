@@ -15,6 +15,9 @@ import type { WorkflowDef } from '../workflows/types.js';
 
 export const HARNESS_FIX_ISSUE = 'harness-fix-issue';
 export const HARNESS_IMPLEMENT_FEATURE = 'harness-implement-feature';
+/** No phase reads an attachment, so a harness run refuses one rather than drop it (PR #925 review). */
+export const HARNESS_TEXT_ONLY_ERROR =
+  'multi-model runs accept text only — no phase would see the attachment; attach it to a regular task instead';
 
 export function isHarnessWorkflow(name: string): boolean {
   return name === HARNESS_FIX_ISSUE || name === HARNESS_IMPLEMENT_FEATURE;

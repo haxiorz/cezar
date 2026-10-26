@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runHarnessDriver } from '../harness/driver.ts';
 import { acquireIssueClaim } from '../harness/issue-claim.ts';
 import { createLedger, loadLedger, saveLedger } from '../harness/ledger.ts';
-import { harnessWorkflowDefs, HARNESS_FIX_ISSUE } from '../harness/workflows.ts';
+import { harnessWorkflowDefs, HARNESS_FIX_ISSUE, HARNESS_TEXT_ONLY_ERROR } from '../harness/workflows.ts';
 import { RunStore } from '../runs/store.ts';
 import { WorkspaceSemaphore } from '../workspace/semaphore.ts';
 import { RunManager } from './run.ts';
@@ -78,6 +78,28 @@ describe('a harness run that ends without its driver', () => {
     expect(loadLedger(dataDir(), run.id)?.claim?.held).toBe(false);
     expect(existsSync(claimPath)).toBe(false);
     expect(acquireIssueClaim(root, 'fresh-run', '642', { dataDir: dataDir(), runExists: (id) => id === run.id }).ok).toBe(true);
+  });
+
+  // PR #925 review: a resumed harness run reads its brief from the ledger, so an edit to its queued
+  // prompt changed what the reviewers judge without the implementer ever seeing it.
+  it('refuses prompt edits on a harness run resuming from its ledger', async () => {
+    const { run } = claimedRun('pending');
+    await manager.recover();
+    expect(store.getRun(run.id)?.status).toBe('queued');
+
+    expect(manager.editTask(run.id, 'A different brief')).toBe(false);
+    expect(manager.enqueueMessage(run.id, [{ type: 'text', text: 'and this' }])).toBeNull();
+    expect(store.getRun(run.id)?.task).toBe('Fix issue #642');
+  });
+
+  // PR #925 review: no phase reads an attachment, so a harness start refuses one.
+  it('refuses an attachment on a harness start', () => {
+    expect(() =>
+      manager.startRun(workflow, {
+        task: 'Fix issue #642',
+        images: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'cG5n' } }],
+      }),
+    ).toThrow(HARNESS_TEXT_ONLY_ERROR);
   });
 
   it('keeps the claim of a run parked on its staged handoff', async () => {

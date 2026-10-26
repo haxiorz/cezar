@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { harnessLedgerResponseSchema, harnessProbeInputSchema, harnessStartInputSchema } from '@open-mercato/cezar-contract';
 import { createLedger, readLedger, saveLedger } from '../harness/ledger.js';
 import { acquireIssueClaim } from '../harness/issue-claim.js';
-import { HARNESS_FIX_ISSUE } from '../harness/workflows.js';
+import { HARNESS_FIX_ISSUE, HARNESS_TEXT_ONLY_ERROR } from '../harness/workflows.js';
 import { RunStore } from '../runs/store.js';
 import type { RunManager, StartRunInput } from '../workflows/run.js';
 import type { WorkflowDef } from '../workflows/types.js';
@@ -992,6 +992,36 @@ describe('harness API', () => {
       ]);
     });
 
+    // PR #925 review: no phase reads an attachment, yet a fresh queued harness run stacked one and
+    // dropped it at dequeue.
+    it('refuses an image for a queued harness run instead of stacking it', async () => {
+      const run = store.createRun({ title: 't', workflow: HARNESS_FIX_ISSUE, task: 'x', steps: [] });
+      store.updateRun(run.id, { status: 'queued', harness: { profile: 'standard', workflow: HARNESS_FIX_ISSUE } });
+      const enqueueMessage = vi.fn(() => ({ id: 'stacked', text: 'x', createdAt: new Date().toISOString() }));
+      const stacking = createApp({
+        repoRoot,
+        store,
+        version: '0.0.0-test',
+        providerAuth: connectedProviderAuth(),
+        manager: {
+          isActive: () => false,
+          sendMessage: () => false,
+          deferMessage: () => false,
+          enqueueMessage,
+        } as unknown as RunManager,
+      });
+
+      const res = await apiRequest(stacking, `/api/v1/runs/${run.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: 'See the screenshot.', images: [{ mediaType: 'image/png', data: Buffer.from('png').toString('base64') }] }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as { error: string }).error).toBe(HARNESS_TEXT_ONLY_ERROR);
+      expect(enqueueMessage).not.toHaveBeenCalled();
+    });
+
     // PR #925 review: a message queued after an HA run's last agent boundary blocked stage forever.
     it('refuses a message for implemented high-assurance packet work', async () => {
       const run = store.createRun({ title: 't', workflow: HARNESS_FIX_ISSUE, task: 'x', steps: [] });
@@ -1129,6 +1159,19 @@ describe('harness API', () => {
       const start = await send('/api/v1/runs', { task: 'Fix issue #642', workflow: HARNESS_FIX_ISSUE, harness: { roles } });
       expect(start.status).toBe(409);
       expect(probed).toEqual([]);
+    });
+
+    // PR #925 review: a harness start persisted its attachments and no phase ever saw them.
+    it('refuses an attachment on a harness start', async () => {
+      const res = await post('/api/v1/runs', {
+        task: 'Fix issue #642',
+        workflow: HARNESS_FIX_ISSUE,
+        harness: { roles },
+        images: [{ mediaType: 'image/png', data: Buffer.from('png').toString('base64') }],
+      });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe(HARNESS_TEXT_ONLY_ERROR);
+      expect(captured).toBeUndefined();
     });
 
     it('rejects fewer than 2 reviewers', async () => {

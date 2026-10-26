@@ -159,7 +159,7 @@ import {
 } from '../harness/driver.ts';
 import { createLedger, harnessFeedbackClosedReason, readLedger, saveLedger } from '../harness/ledger.ts';
 import { releaseLedgerIssueClaim, releaseLedgerIssueClaimUnlessParked } from '../harness/issue-claim.ts';
-import { HARNESS_FIX_ISSUE, isHarnessWorkflow } from '../harness/workflows.ts';
+import { HARNESS_FIX_ISSUE, HARNESS_TEXT_ONLY_ERROR, isHarnessWorkflow } from '../harness/workflows.ts';
 import {
   HARNESS_PROFILES,
   HARNESS_SKILL_PROFILES,
@@ -1770,6 +1770,7 @@ export class RunManager {
       if (!multiModelEnabled(this.repoRoot)) {
         throw new Error('multi-model workflows require the multiModel feature flag');
       }
+      if (input.images?.length) throw new Error(HARNESS_TEXT_ONLY_ERROR);
       if (input.readOnly) {
         throw new Error('harness workflows cannot run in read-only mode');
       }
@@ -4097,6 +4098,14 @@ export class RunManager {
     return this.pendingJobs.has(runId) || this.pendingContinuations.has(runId);
   }
 
+  /** A queued prompt is editable, unless this is a harness run resuming from its ledger: the
+   *  driver reads its brief from there, so an edit would change what the reviewers judge without
+   *  the implementer ever seeing it (PR #925 review). */
+  private promptEditable(runId: string): boolean {
+    const run = this.store.getRun(runId);
+    return this.isQueued(runId) && (!run?.harness || readLedger(this.dataDir, runId).status === 'missing');
+  }
+
   /** Split a pasted message into the persisted shape a stacked message holds. */
   private toQueuedMessage(runId: string, content: PastedContent[]): QueuedMessage {
     const text = content
@@ -4118,7 +4127,7 @@ export class RunManager {
    * through to `deferMessage`.
    */
   enqueueMessage(runId: string, content: PastedContent[]): QueuedMessage | null {
-    if (!this.isQueued(runId)) return null;
+    if (!this.promptEditable(runId)) return null;
     const run = this.store.getRun(runId);
     if (!run) return null;
     const message = this.toQueuedMessage(runId, content);
@@ -4132,7 +4141,7 @@ export class RunManager {
     msgId: string,
     edit: { text?: string; images?: PastedContent[] },
   ): QueuedMessage | null {
-    if (!this.isQueued(runId)) return null;
+    if (!this.promptEditable(runId)) return null;
     const run = this.store.getRun(runId);
     const stack = run?.queuedMessages;
     if (!stack) return null;
@@ -4158,7 +4167,7 @@ export class RunManager {
 
   /** Remove a stacked message and its now-orphaned attachments. */
   removeQueuedMessage(runId: string, msgId: string): boolean {
-    if (!this.isQueued(runId)) return false;
+    if (!this.promptEditable(runId)) return false;
     const run = this.store.getRun(runId);
     const stack = run?.queuedMessages;
     if (!stack) return false;
@@ -4201,7 +4210,7 @@ export class RunManager {
    * it already fired at creation and a second model call per edit is unjustified.
    */
   editTask(runId: string, task: string): boolean {
-    if (!this.isQueued(runId)) return false;
+    if (!this.promptEditable(runId)) return false;
     const run = this.store.getRun(runId);
     if (!run) return false;
     const workflow = this.pendingJobs.get(runId)?.workflow;
