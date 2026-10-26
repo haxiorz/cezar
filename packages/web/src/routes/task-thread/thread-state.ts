@@ -42,8 +42,7 @@ export interface ThreadNote {
   id: string
   text: string
   tone: 'dim' | 'danger'
-  /** A synthetic client-side phase boundary (2026-07-29): rendered as a step
-   *  divider, and the row the header's step panel jumps to. */
+  /** A synthetic harness phase boundary (2026-07-29), rendered as a step divider. */
   marker?: 'step-start'
 }
 
@@ -134,6 +133,9 @@ export interface ThreadReduceOptions {
   activeTurn?: boolean
   /** The run's runner, naming an outdated-CLI error raised before any `session.started`. */
   runner?: string
+  /** A harness run's step names by id: its phases share turns, so each phase boundary gets a
+   *  divider labelled with the phase. Absent for every other run, whose transcript has none. */
+  stepNames?: ReadonlyMap<string, string>
 }
 
 /** What the strip under the thread says. Pure so the mapping is table-testable. */
@@ -412,6 +414,15 @@ function planFromTodos(input: unknown): PlanEntry[] | undefined {
   return entries
 }
 
+/** A council round stamps its number onto the event's step id (`spec-review-1`). */
+function stepDividerLabel(names: ReadonlyMap<string, string>, stepId: string): string {
+  const exact = names.get(stepId)
+  if (exact) return exact
+  const round = /^(.+)-(\d+)$/.exec(stepId)
+  const base = round ? names.get(round[1]!) : undefined
+  return base ? `${base} · round ${round![2]}` : stepId
+}
+
 export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = {}): ThreadState {
   const turns: DraftTurn[] = []
   /** stepId:itemId → live item. Runner sessions restart ids at `item_1`, while every current
@@ -487,24 +498,21 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
     itemsById.set(key, { turn, entry: draft })
   }
 
-  /** The last workflow step whose events reached the transcript. Phases share
-   *  turns (a harness run folds several phases into one), so step boundaries
-   *  are their own synthetic entries: a marker note pushed the moment the
-   *  stream switches steps — the divider the step panel jumps to (2026-07-29). */
+  // A harness phase divider (2026-07-29) is pushed the moment the stream switches steps; a
+  // re-entered step gets a `#n` suffix so row keys stay unique.
+  const stepNames = options.stepNames
   let currentStepId: string | undefined
-  // An `onFail.retry` loop re-enters an earlier step; a repeat marker gets a `#n` suffix so row
-  // keys stay unique while the first divider keeps the id the step panel jumps to.
   const stepMarkerCounts = new Map<string, number>()
   for (const event of events) {
-    const eventStepId = str(event.stepId)
-    if (eventStepId !== undefined && eventStepId !== currentStepId) {
+    const eventStepId = stepNames ? str(event.stepId) : undefined
+    if (stepNames && eventStepId !== undefined && eventStepId !== currentStepId) {
       currentStepId = eventStepId
       const seen = (stepMarkerCounts.get(eventStepId) ?? 0) + 1
       stepMarkerCounts.set(eventStepId, seen)
       const id = seen === 1 ? `step-start:${eventStepId}` : `step-start:${eventStepId}#${seen}`
       currentTurn().entries.push({
         origin: 'meta',
-        entry: { kind: 'note', id, text: eventStepId, tone: 'dim', marker: 'step-start' },
+        entry: { kind: 'note', id, text: stepDividerLabel(stepNames, eventStepId), tone: 'dim', marker: 'step-start' },
       })
     }
     lastEventAt = stamp(event.ts) ?? lastEventAt

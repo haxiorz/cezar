@@ -3,6 +3,7 @@ import { useState } from 'react'
 
 import type { StepState, StepStatus } from '@open-mercato/cezar-api-client'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { cn } from '@/lib/utils'
 
 /**
@@ -48,57 +49,30 @@ export function railProgress(steps: ReadonlyArray<Pick<StepState, 'status'>>): n
   return score / steps.length
 }
 
-export function StepRail({
-  steps,
-  onSelectStep,
-}: {
-  steps: StepState[]
-  /** Makes each row a jump target — the thread scrolls to where the step
-   *  started (user request 2026-07-29). Absent = the rows stay inert. */
-  onSelectStep?: (id: string) => void
-}) {
+export function StepRail({ steps }: { steps: StepState[] }) {
   if (steps.length === 0) return null
   const pct = railProgress(steps) * 100
   return (
     <div data-slot="step-rail" className="flex min-w-0 flex-col gap-1">
-      {steps.map((step, index) => {
-        const body = (
-          <>
-            <RailIcon visual={railVisual(step.status)} />
-            <span className="min-w-0 truncate font-medium text-foreground">{step.name}</span>
-            {step.iterations > 1 ? (
-              <span data-slot="step-iterations" className="shrink-0 text-xs text-soft-foreground tabular-nums">
-                ×{step.iterations}
-              </span>
-            ) : null}
-            <span className="ml-auto shrink-0 pl-2 text-[11.5px] text-soft-foreground tabular-nums">
-              {step.kind} · step {index + 1} of {steps.length}
+      {steps.map((step, index) => (
+        <div
+          key={step.id}
+          data-slot="step-row"
+          data-visual={railVisual(step.status)}
+          className="flex min-h-[22px] min-w-0 items-center gap-2 text-[13px] text-muted-foreground"
+        >
+          <RailIcon visual={railVisual(step.status)} />
+          <span className="min-w-0 truncate font-medium text-foreground">{step.name}</span>
+          {step.iterations > 1 ? (
+            <span data-slot="step-iterations" className="shrink-0 text-xs text-soft-foreground tabular-nums">
+              ×{step.iterations}
             </span>
-          </>
-        )
-        return onSelectStep ? (
-          <button
-            key={step.id}
-            type="button"
-            data-slot="step-row"
-            data-visual={railVisual(step.status)}
-            title={`Jump to where "${step.name}" started`}
-            onClick={() => onSelectStep(step.id)}
-            className="-mx-1 flex min-h-[22px] w-[calc(100%+0.5rem)] min-w-0 items-center gap-2 rounded-md px-1 text-left text-[13px] text-muted-foreground hover:bg-muted"
-          >
-            {body}
-          </button>
-        ) : (
-          <div
-            key={step.id}
-            data-slot="step-row"
-            data-visual={railVisual(step.status)}
-            className="flex min-h-[22px] min-w-0 items-center gap-2 text-[13px] text-muted-foreground"
-          >
-            {body}
-          </div>
-        )
-      })}
+          ) : null}
+          <span className="ml-auto shrink-0 pl-2 text-[11.5px] text-soft-foreground tabular-nums">
+            {step.kind} · step {index + 1} of {steps.length}
+          </span>
+        </div>
+      ))}
       <div data-slot="step-progress" className="mt-1 h-0.5 overflow-hidden rounded-full bg-muted">
         <div className="h-full rounded-full bg-pending" style={{ width: `${pct}%` }} />
       </div>
@@ -177,69 +151,78 @@ const openByRun = new Map<string, boolean>()
 export function WorkflowSteps({
   runId,
   steps,
-  onJumpToStep,
+  overlay = false,
 }: {
   runId: string
   steps: StepState[]
-  /** Jump the transcript to a step's start; the panel closes on selection. */
-  onJumpToStep?: (id: string) => void
+  /** A harness run's 12–18 phases open in a popover instead of growing the header (user feedback
+   *  2026-07-29); it closes on Escape or an outside click and is never remembered. Every other run
+   *  keeps the inline expansion (PR #925 review). */
+  overlay?: boolean
 }) {
-  const [open, setOpen] = useState(() => openByRun.get(runId) ?? false)
+  const [open, setOpen] = useState(() => (overlay ? false : (openByRun.get(runId) ?? false)))
   if (steps.length === 0) return null
+  const index = activeStepIndex(steps)
+  const current = steps[index]!
+  const pct = railProgress(steps) * 100
+  const label = `Workflow: ${current.name}, step ${index + 1} of ${steps.length}`
+  // Keep the phone header's compact 28px footprint: the negative margins absorb the
+  // extra 16px of a 44px touch target without changing the surrounding row's height.
+  // The step rail is the only control in this bordered section, so the expanded hit box
+  // cannot overlap a neighboring action; desktop keeps its existing 30px row.
+  const triggerClass =
+    'group -my-2 flex min-h-11 w-full items-center gap-2 text-left text-xs text-muted-foreground hover:text-foreground md:my-0 md:min-h-[30px] md:gap-2.5'
+  const summary = (
+    <>
+      <span data-slot="step-dots" className="flex shrink-0 items-center gap-1">
+        {steps.map((step) => (
+          <StepDot key={step.id} visual={railVisual(step.status)} />
+        ))}
+      </span>
+      <span className="min-w-0 max-w-[45%] shrink truncate font-semibold text-foreground">{current.name}</span>
+      <span className="shrink-0 text-soft-foreground tabular-nums">
+        step {index + 1} of {steps.length}
+      </span>
+      <span data-slot="step-summary-progress" className="h-0.5 min-w-[36px] flex-1 overflow-hidden rounded-full bg-muted">
+        <span className="block h-full rounded-full bg-pending" style={{ width: `${pct}%` }} />
+      </span>
+      <ChevronDownIcon
+        aria-hidden
+        className="size-4 shrink-0 text-soft-foreground transition-transform group-data-[state=open]:rotate-180"
+      />
+    </>
+  )
+  if (overlay) {
+    return (
+      <Popover open={open} onOpenChange={setOpen}>
+        <div data-slot="workflow-steps" data-state={open ? 'open' : 'closed'} className="min-w-0">
+          <PopoverTrigger aria-label={label} className={triggerClass}>
+            {summary}
+          </PopoverTrigger>
+        </div>
+        <PopoverContent
+          data-slot="workflow-steps-panel"
+          align="start"
+          className="max-h-[min(55vh,380px)] w-(--radix-popover-trigger-width) overflow-y-auto rounded-xl bg-card p-2.5 shadow-lg"
+        >
+          <StepRail steps={steps} />
+        </PopoverContent>
+      </Popover>
+    )
+  }
   const toggle = (next: boolean) => {
     openByRun.set(runId, next)
     setOpen(next)
   }
-  const index = activeStepIndex(steps)
-  const current = steps[index]!
-  const pct = railProgress(steps) * 100
   return (
-    <Collapsible data-slot="workflow-steps" open={open} onOpenChange={toggle} className="relative min-w-0">
-      <CollapsibleTrigger
-        aria-label={`Workflow: ${current.name}, step ${index + 1} of ${steps.length}`}
-        // Keep the phone header's compact 28px footprint: the negative margins absorb the
-        // extra 16px of a 44px touch target without changing the surrounding row's height.
-        // The step rail is the only control in this bordered section, so the expanded hit box
-        // cannot overlap a neighboring action; desktop keeps its existing 30px row.
-        className="group -my-2 flex min-h-11 w-full items-center gap-2 text-left text-xs text-muted-foreground hover:text-foreground md:my-0 md:min-h-[30px] md:gap-2.5"
-      >
-        <span data-slot="step-dots" className="flex shrink-0 items-center gap-1">
-          {steps.map((step) => (
-            <StepDot key={step.id} visual={railVisual(step.status)} />
-          ))}
-        </span>
-        <span className="min-w-0 max-w-[45%] shrink truncate font-semibold text-foreground">{current.name}</span>
-        <span className="shrink-0 text-soft-foreground tabular-nums">
-          step {index + 1} of {steps.length}
-        </span>
-        <span data-slot="step-summary-progress" className="h-0.5 min-w-[36px] flex-1 overflow-hidden rounded-full bg-muted">
-          <span className="block h-full rounded-full bg-pending" style={{ width: `${pct}%` }} />
-        </span>
-        <ChevronDownIcon
-          aria-hidden
-          className="size-4 shrink-0 text-soft-foreground transition-transform group-data-[state=open]:rotate-180"
-        />
+    <Collapsible data-slot="workflow-steps" open={open} onOpenChange={toggle} className="min-w-0">
+      <CollapsibleTrigger aria-label={label} className={triggerClass}>
+        {summary}
       </CollapsibleTrigger>
-      {/* An OVERLAY panel, not an inline expansion (user feedback 2026-07-29):
-          a multi-modal harness run carries 12–18 steps, and expanding them in
-          the sticky header shoved the transcript below the fold. The panel
-          floats over the thread, bounded and scrollable, and a step click
-          closes it (jumping the transcript when the caller wires it). */}
-      <CollapsibleContent
-        data-slot="workflow-steps-panel"
-        className="absolute inset-x-0 top-full z-30 mt-1.5 max-h-[min(55vh,380px)] overflow-y-auto rounded-xl border border-border bg-card p-2.5 shadow-lg"
-      >
-        <StepRail
-          steps={steps}
-          onSelectStep={
-            onJumpToStep
-              ? (id) => {
-                  toggle(false)
-                  onJumpToStep(id)
-                }
-              : undefined
-          }
-        />
+      <CollapsibleContent>
+        <div className="pt-2">
+          <StepRail steps={steps} />
+        </div>
       </CollapsibleContent>
     </Collapsible>
   )

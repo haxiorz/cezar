@@ -941,13 +941,18 @@ export function ConversationColumn({
   onOpenReference?: (reference: ThreadReference) => void
 }) {
   const history = useRunHistory(run.id)
+  const harnessSteps = run.harness ? run.steps : undefined
+  const stepNames = useMemo(
+    () => (harnessSteps ? new Map(harnessSteps.map((step) => [step.id, step.name])) : undefined),
+    [harnessSteps],
+  )
   const thread = useMemo(
-    () => reduceThread(history.visibleEvents, { activeTurn: run.status === 'running', runner: run.runner }),
-    [history.visibleEvents, run.status, run.runner],
+    () => reduceThread(history.visibleEvents, { activeTurn: run.status === 'running', runner: run.runner, stepNames }),
+    [history.visibleEvents, run.status, run.runner, stepNames],
   )
   const currentThread = useMemo(
-    () => reduceThread(history.currentEvents, { activeTurn: run.status === 'running', runner: run.runner }),
-    [history.currentEvents, run.status, run.runner],
+    () => reduceThread(history.currentEvents, { activeTurn: run.status === 'running', runner: run.runner, stepNames }),
+    [history.currentEvents, run.status, run.runner, stepNames],
   )
   useRunRecordReconcile(run, history.visibleEvents)
 

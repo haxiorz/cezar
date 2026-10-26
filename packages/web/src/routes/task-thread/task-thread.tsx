@@ -101,13 +101,18 @@ export function TaskThreadRoute() {
   const run = useRun(id)
   const history = useRunHistory(id)
   const runStatus = run.data?.status
+  const harnessSteps = run.data?.harness ? run.data.steps : undefined
+  const stepNames = useMemo(
+    () => (harnessSteps ? new Map(harnessSteps.map((step) => [step.id, step.name])) : undefined),
+    [harnessSteps],
+  )
   const thread = useMemo(
-    () => reduceThread(history.visibleEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner }),
-    [history.visibleEvents, runStatus, run.data?.runner],
+    () => reduceThread(history.visibleEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames }),
+    [history.visibleEvents, runStatus, run.data?.runner, stepNames],
   )
   const currentThread = useMemo(
-    () => reduceThread(history.currentEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner }),
-    [history.currentEvents, runStatus, run.data?.runner],
+    () => reduceThread(history.currentEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames }),
+    [history.currentEvents, runStatus, run.data?.runner, stepNames],
   )
 
   // Read receipt (#unread-done-items): opening a finished task's thread marks it read — the same
@@ -193,22 +198,6 @@ export function TaskThreadRoute() {
       onMarkedUnread={suppressAutoReadFor}
     />
   )
-}
-
-/**
- * The transcript row of a step's divider marker (`reduceThread` pushes one
- * `step-start:<id>` note per phase boundary) — the jump target for the
- * header's step panel (user request 2026-07-29). Falls back to a
- * round-suffixed variant (`spec-review` → `spec-review-1`) because council
- * sub-phases stamp their round onto the event step id. -1 when the step never
- * reached the transcript — the caller then no-ops.
- */
-export function stepRowIndex(rows: readonly { key: string }[], stepId: string): number {
-  const exact = rows.findIndex((row) => row.key.endsWith(`:step-start:${stepId}`))
-  if (exact >= 0) return exact
-  const escaped = stepId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const suffixed = new RegExp(`:step-start:${escaped}-\\d+$`)
-  return rows.findIndex((row) => suffixed.test(row.key))
 }
 
 const NO_EVENTS: readonly RunEvent[] = []
@@ -404,30 +393,6 @@ export function ThreadView({
   useKeyboardInsetVar(scroll.restickIfStuck)
   const [timelineOpen, setTimelineOpen] = useState(false)
 
-  // The step panel's jump: virtua owns programmatic scrolls while virtualized;
-  // the flat mode scrolls the row's own element. The virtual jump is issued
-  // twice — a far target's offset is an estimate until its neighborhood has
-  // been measured, and the second call lands on the corrected position.
-  // Stable across renders so the memoized RunHeader is not re-rendered on every streamed row.
-  const rowsRef = useRef(rows)
-  rowsRef.current = rows
-  const { virtualizerRef, scrollElRef } = scroll
-  const jumpToStep = useCallback((stepId: string) => {
-    const index = stepRowIndex(rowsRef.current, stepId)
-    if (index < 0) return
-    const virtualizer = virtualizerRef.current
-    if (virtualizer) {
-      virtualizer.scrollToIndex(index, { align: 'start' })
-      window.setTimeout(() => {
-        virtualizerRef.current?.scrollToIndex(index, { align: 'start' })
-      }, 120)
-      return
-    }
-    const row = (scrollElRef.current ?? document).querySelectorAll(
-      '[data-slot="thread-row"]',
-    )[index]
-    row?.scrollIntoView({ block: 'start', behavior: 'smooth' })
-  }, [virtualizerRef, scrollElRef])
   const orderedSteps = useMemo(
     () => (harnessLedger ? orderStepsByLedger(run.steps, harnessLedger) : undefined),
     [harnessLedger, run.steps],
@@ -439,7 +404,6 @@ export function ThreadView({
         run={run}
         planTally={planTally}
         publishBlockedReason={harnessPublishBlocked}
-        onJumpToStep={jumpToStep}
         orderedSteps={orderedSteps}
         hideWorkflowProgress={Boolean(harnessLedger)}
         onMarkedUnread={markedUnread}

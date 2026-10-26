@@ -171,28 +171,46 @@ describe('WorkflowSteps — the collapsible header summary', () => {
 })
 
 /**
- * Step rows became jump targets (user request 2026-07-29): with a handler each
- * row is a button that reports its step id; without one the rows stay inert —
- * no dead buttons on surfaces that have no transcript to jump in.
+ * A harness run's step list opens as a popover (user feedback 2026-07-29), so 18 phases never grow
+ * the header. PR #925 review: it must dismiss like one and never reopen on its own, and an
+ * ordinary run keeps the inline expansion.
  */
-describe('StepRail step selection', () => {
-  const steps = [
-    { id: 'spec', name: 'Specify', kind: 'agent', status: 'done', iterations: 1 },
-    { id: 'implement', name: 'Implement', kind: 'agent', status: 'running', iterations: 1 },
-  ] as unknown as Parameters<typeof StepRail>[0]['steps']
+describe('WorkflowSteps — the harness popover', () => {
+  const steps = Array.from({ length: 18 }, (_, index) =>
+    step(`phase-${index + 1}`, index === 0 ? 'running' : 'pending', { name: `Phase ${index + 1}` }),
+  )
+  let seq = 0
+  const freshRun = () => `run-overlay-${(seq += 1)}`
 
-  it('reports the clicked step id and renders rows as buttons', () => {
-    const picked: string[] = []
-    render(<StepRail steps={steps} onSelectStep={(id) => picked.push(id)} />)
+  it('opens a floating panel that Escape dismisses', () => {
+    render(<WorkflowSteps runId={freshRun()} steps={steps} overlay />)
+    fireEvent.click(screen.getByRole('button', { name: /Workflow: Phase 1/ }))
+    const panel = document.querySelector('[data-slot="workflow-steps-panel"]')
+    expect(panel?.querySelectorAll('[data-slot="step-row"]')).toHaveLength(18)
+    expect(document.querySelector('[data-slot="workflow-steps"]')?.getAttribute('data-state')).toBe('open')
 
-    const rows = screen.getAllByRole('button')
-    expect(rows).toHaveLength(2)
-    rows[1]!.click()
-    expect(picked).toEqual(['implement'])
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' })
+    expect(document.querySelector('[data-slot="workflow-steps-panel"]')).toBeNull()
+    expect(document.querySelector('[data-slot="workflow-steps"]')?.getAttribute('data-state')).toBe('closed')
   })
 
-  it('renders inert rows without a handler', () => {
-    render(<StepRail steps={steps} />)
-    expect(screen.queryAllByRole('button')).toHaveLength(0)
+  it('opens closed again after a remount, where an inline expansion is remembered', () => {
+    const runId = freshRun()
+    const first = render(<WorkflowSteps runId={runId} steps={steps} overlay />)
+    fireEvent.click(screen.getByRole('button', { name: /Workflow: Phase 1/ }))
+    expect(document.querySelector('[data-slot="step-row"]')).not.toBeNull()
+    first.unmount()
+
+    render(<WorkflowSteps runId={runId} steps={steps} overlay />)
+    expect(document.querySelector('[data-slot="step-row"]')).toBeNull()
+  })
+
+  it('expands an ordinary run inline, with no floating panel', () => {
+    render(<WorkflowSteps runId={freshRun()} steps={steps} />)
+    fireEvent.click(screen.getByRole('button', { name: /Workflow: Phase 1/ }))
+    expect(document.querySelector('[data-slot="workflow-steps-panel"]')).toBeNull()
+    expect(
+      document.querySelector('[data-slot="workflow-steps"]')?.querySelectorAll('[data-slot="step-row"]'),
+    ).toHaveLength(18)
   })
 })

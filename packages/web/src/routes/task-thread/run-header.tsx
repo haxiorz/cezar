@@ -114,8 +114,6 @@ interface RunHeaderProps {
   planTally?: { done: number; total: number }
   tab?: RunTab
   publishBlockedReason?: string
-  /** Wired only where a transcript exists to jump in (the Session tab). */
-  onJumpToStep?: (id: string) => void
   /** Steps in EXECUTION order (harness pages derive it from the ledger) —
    *  older harness runs recorded their dynamic steps appended at the tail. */
   orderedSteps?: StepState[]
@@ -141,7 +139,6 @@ const headerPropComparators = {
   run: (before, after) => before.run === after.run,
   tab: (before, after) => before.tab === after.tab,
   publishBlockedReason: (before, after) => before.publishBlockedReason === after.publishBlockedReason,
-  onJumpToStep: (before, after) => before.onJumpToStep === after.onJumpToStep,
   orderedSteps: (before, after) => before.orderedSteps === after.orderedSteps,
   hideWorkflowProgress: (before, after) => before.hideWorkflowProgress === after.hideWorkflowProgress,
   onMarkedUnread: (before, after) => before.onMarkedUnread === after.onMarkedUnread,
@@ -163,7 +160,6 @@ function RunHeaderView({
   planTally,
   tab = 'session',
   publishBlockedReason,
-  onJumpToStep,
   orderedSteps,
   hideWorkflowProgress = false,
   onMarkedUnread,
@@ -395,7 +391,7 @@ function RunHeaderView({
 
           {!hideWorkflowProgress && run.steps.length > 0 ? (
             <div className={cn('border-t border-border pt-1 pb-0 md:pt-2 md:pb-1', collapsed && 'md:hidden')}>
-              <WorkflowSteps runId={run.id} steps={orderedSteps ?? run.steps} onJumpToStep={onJumpToStep} />
+              <WorkflowSteps runId={run.id} steps={orderedSteps ?? run.steps} overlay={Boolean(run.harness)} />
             </div>
           ) : null}
 

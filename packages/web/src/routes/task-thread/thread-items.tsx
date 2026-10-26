@@ -337,14 +337,12 @@ export function AssistantMessage({ text }: { text: string }) {
 }
 
 /** A dim (lifecycle/note) or danger (error) transcript line. A `step-start`
- *  marker renders as a phase divider instead — the visible boundary the
- *  header's step panel jumps to (2026-07-29). */
+ *  marker, which only a harness run's transcript carries, renders as a phase divider instead. */
 export function NoteLine({ note }: { note: ThreadNote }) {
   if (note.marker === 'step-start') {
     return (
       <div
         data-slot="step-divider"
-        data-step={note.text}
         className="flex items-center gap-2.5 pt-1.5 pb-0.5"
       >
         <span aria-hidden="true" className="h-px flex-1 bg-border" />
