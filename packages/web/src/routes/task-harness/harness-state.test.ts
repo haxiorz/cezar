@@ -6,7 +6,9 @@ import { holdGitSteps } from '../task-git/run-git-step'
 import {
   activeHarnessPhase,
   currentImplementationCouncil,
+  foldHarnessSnapshot,
   harnessPublishBlockedReason,
+  harnessWindowGap,
   mergeHarnessLedger,
 } from './harness-state'
 
@@ -318,6 +320,52 @@ describe('mergeHarnessLedger', () => {
         }),
       ]),
     ).toBeUndefined()
+  })
+})
+
+// PR #925 review: the thread's event window is bounded, so live harness state is folded back into
+// the cached snapshot before compaction drops it.
+describe('foldHarnessSnapshot', () => {
+  const implementDone = event(11, 'harness.phase.updated', {
+    phase: { ...ledger().phases[0], status: 'done' },
+  })
+  const validateRunning = event(12, 'harness.phase.updated', {
+    phase: { id: 'validate', name: 'Validate', kind: 'op', status: 'running', attempts: 1, artifacts: {} },
+  })
+
+  it('stamps the folded snapshot through the newest harness event, so the window never re-applies', () => {
+    const folded = foldHarnessSnapshot({ ...ledger(), snapshotSeq: 10 }, [
+      implementDone,
+      validateRunning,
+      event(13, 'item.completed', {}),
+    ])!
+
+    expect(folded.snapshotSeq).toBe(12)
+    expect(activeHarnessPhase(folded)?.id).toBe('validate')
+    // The events that built it are behind its watermark now: folding again changes nothing.
+    expect(foldHarnessSnapshot(folded, [implementDone, validateRunning])).toBeUndefined()
+    expect(mergeHarnessLedger(folded, [event(14, 'item.completed', {})])).toEqual(folded)
+  })
+
+  it('never moves snapshotSeq backwards over a fresher snapshot', () => {
+    expect(foldHarnessSnapshot({ ...ledger(), snapshotSeq: 40 }, [implementDone, validateRunning])).toBeUndefined()
+    expect(foldHarnessSnapshot({ ...ledger(), snapshotSeq: 10 }, [event(30, 'item.completed', {})])).toBeUndefined()
+    expect(foldHarnessSnapshot(undefined, [validateRunning])).toBeUndefined()
+  })
+})
+
+describe('harnessWindowGap', () => {
+  const window = [event(50, 'item.completed', {}), event(51, 'item.completed', {})]
+
+  it('flags a window that starts past what the snapshot covers while older history is unloaded', () => {
+    expect(harnessWindowGap(10, window, true)).toBe(true)
+  })
+
+  it('accepts a contiguous window, the whole history, and an empty window', () => {
+    expect(harnessWindowGap(49, window, true)).toBe(false)
+    expect(harnessWindowGap(60, window, true)).toBe(false)
+    expect(harnessWindowGap(10, window, false)).toBe(false)
+    expect(harnessWindowGap(10, [], true)).toBe(false)
   })
 })
 

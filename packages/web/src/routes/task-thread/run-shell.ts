@@ -38,7 +38,12 @@ export function runShellClass(wide = false): string {
   return wide ? RUN_SHELL_WIDE : RUN_SHELL_NARROW
 }
 
-/** The harness body grid: transcript + a sticky rail that folds away under xl.
+/** The query container the rail grid, the rail and the Models dock measure. A workspace column is
+ *  narrower than the viewport, so viewport breakpoints gave it the rail track anyway (PR #925 review). */
+export const RUN_RAIL_CONTAINER = '@container/run'
+
+/** The harness body grid: transcript + a sticky rail that folds away below a 64rem container
+ *  (80rem for the wider rail) — about `xl`/`2xl` less the default sidebar on a full-width page.
  *  Kept here so the header, the body and the composer dock cannot drift apart. */
 export const RUN_RAIL_GRID =
-  'grid grid-cols-1 items-start gap-5 xl:grid-cols-[minmax(0,1fr)_336px] 2xl:grid-cols-[minmax(0,1fr)_400px]'
+  'grid grid-cols-1 items-start gap-5 @5xl/run:grid-cols-[minmax(0,1fr)_336px] @7xl/run:grid-cols-[minmax(0,1fr)_400px]'

@@ -3,8 +3,10 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { MemoryRouter } from 'react-router'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { queryKeys } from '@/api/queries'
 import { createQueryClient } from '@/api/query-client'
-import type { ApiRun, HarnessLedgerResponse } from '@open-mercato/cezar-api-client'
+import type { RunHistoryState } from '@/api/run-history'
+import type { ApiRun, HarnessLedgerResponse, RunEvent } from '@open-mercato/cezar-api-client'
 
 import { ThreadView } from './task-thread'
 import { reduceThread } from './thread-state'
@@ -194,5 +196,166 @@ describe('harness phase-boundary composer', () => {
       document.querySelector<HTMLButtonElement>('[data-slot="review-accept"]')?.disabled,
     ).toBe(true)
     expect(screen.getByText(/harness recovery snapshot is unavailable/i)).toBeTruthy()
+  })
+})
+
+const phase = (id: string, name: string, status: string) => ({
+  id, name, kind: 'agent', status, attempts: 1, artifacts: {},
+}) as HarnessLedgerResponse['phases'][number]
+
+const at = (seq: number, type: string, payload: Record<string, unknown> = {}): RunEvent => ({
+  seq, ts: '2026-07-26T09:30:00.000Z', type, ...payload,
+})
+
+const historyWindow = (events: RunEvent[], hasOlder: boolean): RunHistoryState => ({
+  visibleEvents: events,
+  currentEvents: events,
+  isPending: false,
+  contextPending: false,
+  fallback: false,
+  hasOlder,
+  isFetchingOlder: false,
+  olderError: undefined,
+  loadOlder: async () => {},
+  jumpToLatest: async () => {},
+  retainedPages: 1,
+})
+
+const specRunning: HarnessLedgerResponse = {
+  ...ledger,
+  phases: [phase('spec', 'Spec', 'running')],
+  snapshotSeq: 10,
+}
+
+function stubHarnessFetch(snapshot: HarnessLedgerResponse | undefined): string[] {
+  const reads: string[] = []
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const path = String(input)
+      const harnessRead = (init.method ?? 'GET') === 'GET' && path.endsWith('/runs/r-boundary/harness')
+      if (harnessRead) reads.push(path)
+      return new Response(JSON.stringify(harnessRead && snapshot ? snapshot : {}), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }),
+  )
+  return reads
+}
+
+const statusLine = () => document.querySelector('[data-slot="harness-status-bar"]')?.textContent ?? ''
+
+// PR #925 review: the thread folds `harness.*` events from a BOUNDED window over a snapshot that is
+// read once, so phase state that scrolled out of the window used to revert to the snapshot's.
+describe('harness ledger over a bounded transcript window', () => {
+  it('keeps the live phase once its harness events scroll out of the window', async () => {
+    const reads = stubHarnessFetch(undefined)
+    const client = createQueryClient()
+    client.setQueryData(queryKeys.runs.harness(run.id), specRunning)
+    const view = (history: RunHistoryState) => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ThreadView run={run} thread={reduceThread([])} history={history} embedded />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    const { rerender } = render(view(historyWindow([
+      at(11, 'harness.phase.updated', { phase: phase('spec', 'Spec', 'done') }),
+      at(12, 'harness.phase.updated', { phase: phase('implement', 'Implement', 'running') }),
+      at(13, 'item.completed'),
+    ], true)))
+    await waitFor(() => expect(statusLine()).toContain('Implement'))
+
+    // Compaction swapped the tail for the newest page: both phase events are out of the window.
+    rerender(view(historyWindow([at(13, 'item.completed'), at(14, 'item.completed')], true)))
+
+    expect(statusLine()).toContain('Implement')
+    expect(statusLine()).not.toContain('Spec')
+    expect(client.getQueryData<HarnessLedgerResponse>(queryKeys.runs.harness(run.id))?.snapshotSeq).toBe(12)
+    expect(reads).toEqual([])
+  })
+
+  it('re-reads the snapshot when the window starts past what it accounts for', async () => {
+    // A remount after the history query went stale: its newest page starts long after the cached
+    // snapshot, and every harness event in between is in neither.
+    const reads = stubHarnessFetch({
+      ...ledger,
+      phases: [phase('spec', 'Spec', 'done'), phase('implement', 'Implement', 'running')],
+      snapshotSeq: 501,
+    })
+    const client = createQueryClient()
+    client.setQueryData(queryKeys.runs.harness(run.id), specRunning)
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ThreadView
+            run={run}
+            thread={reduceThread([])}
+            history={historyWindow([at(500, 'item.completed'), at(501, 'item.completed')], true)}
+            embedded
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+
+    await waitFor(() => expect(statusLine()).toContain('Implement'))
+    expect(reads).toHaveLength(1)
+  })
+})
+
+// PR #925 review: `/tasks/:id` renders the thread inside a workspace column, so the rail must follow
+// the column's width — a viewport breakpoint gave a 590px column a 336px rail track.
+describe('harness rail layout', () => {
+  const viewportVariants = (element: Element) =>
+    element.className.split(/\s+/).filter((token) => /^(sm|md|lg|xl|2xl):/.test(token))
+
+  const renderThread = (subject: ApiRun, harnessLedger?: HarnessLedgerResponse) => {
+    stubHarnessFetch(undefined)
+    render(
+      <QueryClientProvider client={createQueryClient()}>
+        <MemoryRouter>
+          <ThreadView run={subject} thread={reduceThread([])} harnessLedger={harnessLedger} embedded />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+  }
+
+  it('sizes the rail, its grid track and the Models dock by the run container', async () => {
+    renderThread(run, ledger)
+    await waitFor(() => {
+      expect(document.querySelector('[data-slot="harness-rail"]')).not.toBeNull()
+      expect(document.querySelector('[data-slot="harness-models-dock"]')).not.toBeNull()
+    })
+
+    const root = document.querySelector('[data-route="task-thread"]')!
+    const grid = document.querySelector('[data-slot="run-rail-grid"]')!
+    const rail = document.querySelector('[data-slot="harness-rail"]')!
+    const dock = document.querySelector('[data-slot="harness-models-dock"]')!.parentElement!
+    expect(root.className).toContain('@container/run')
+    expect(grid.className).toContain('@5xl/run:grid-cols-[minmax(0,1fr)_336px]')
+    expect(rail.className).toContain('@5xl/run:flex')
+    expect(dock.className).toContain('@5xl/run:hidden')
+    for (const element of [grid, rail, dock]) expect(viewportVariants(element)).toEqual([])
+    // The column scroller starts below the workspace's run header: no header offset here.
+    expect(rail.className).toContain('top-3')
+    expect(rail.className).not.toContain('top-[calc(var(--run-header-h')
+  })
+
+  it('reserves no rail track while the ledger has nothing to show', () => {
+    renderThread(run, { ...ledger, phases: [], models: [] })
+
+    expect(document.querySelector('[data-slot="run-rail-grid"]')).toBeNull()
+    expect(document.querySelector('[data-slot="harness-rail"]')).toBeNull()
+  })
+
+  it('leaves an ordinary run exactly as on main', () => {
+    const { harness: _harness, ...ordinary } = run
+    renderThread(ordinary)
+
+    expect(document.querySelector('[data-route="task-thread"]')!.className).toBe('flex min-h-full flex-col')
+    expect(document.querySelector('[data-slot="run-rail-grid"]')).toBeNull()
   })
 })

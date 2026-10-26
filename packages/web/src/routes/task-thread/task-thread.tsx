@@ -1,4 +1,5 @@
 import { queueWaitLabel } from '@/lib/queue-wait-label'
+import { useQueryClient } from '@tanstack/react-query'
 import { MessageSquareTextIcon, SearchXIcon } from 'lucide-react'
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useLocation, useParams } from 'react-router'
@@ -7,6 +8,7 @@ import { Link } from '@/lib/project-router'
 
 import { ApiError } from '@/api/client'
 import {
+  queryKeys,
   useEditQueuedMessage,
   useMarkRunSeen,
   usePatchRun,
@@ -17,7 +19,7 @@ import {
   useRuns,
 } from '@/api/queries'
 import { useRunHistory, type RunHistoryState } from '@/api/run-history'
-import type { ApiRun, HarnessLedgerResponse, RunEvent } from '@open-mercato/cezar-api-client'
+import { queryScope, type ApiRun, type HarnessLedgerResponse, type RunEvent } from '@open-mercato/cezar-api-client'
 import { CenteredState } from '@/components/centered-state'
 import { TaskLifecycleCard } from '@/components/worktree-lifecycle-operation'
 import { StatusDot } from '@/components/status-dot'
@@ -66,8 +68,15 @@ import {
   type ThreadAsk,
   type ThreadState,
 } from './thread-state'
-import { RUN_RAIL_GRID, runShellClass } from './run-shell'
-import { harnessPublishBlockedReason, mergeHarnessLedger, orderStepsByLedger } from '../task-harness/harness-state'
+import { RUN_RAIL_CONTAINER, RUN_RAIL_GRID, runShellClass } from './run-shell'
+import {
+  foldHarnessSnapshot,
+  harnessPublishBlockedReason,
+  harnessRailHasContent,
+  harnessWindowGap,
+  mergeHarnessLedger,
+  orderStepsByLedger,
+} from '../task-harness/harness-state'
 import { lazyRoute } from '@/lib/telemetry'
 
 // Ordinary runs never render these (PR #925 review, UI performance gate).
@@ -207,7 +216,7 @@ const NO_EVENTS: readonly RunEvent[] = []
 function RailLayout({ rail, children }: { rail: ReactNode; children: ReactNode }) {
   if (!rail) return <>{children}</>
   return (
-    <div className={RUN_RAIL_GRID}>
+    <div data-slot="run-rail-grid" className={RUN_RAIL_GRID}>
       <div className="flex min-w-0 flex-col gap-2.5 md:gap-3.5">{children}</div>
       {rail}
     </div>
@@ -220,8 +229,13 @@ function useThreadHarnessLedger(
   run: ApiRun,
   events: readonly RunEvent[],
   enabled: boolean,
+  hasOlder: boolean,
 ): HarnessLedgerResponse | undefined {
-  const harness = useRunHarness(run.id, enabled && Boolean(run.harness), events)
+  const active = enabled && Boolean(run.harness)
+  const queryClient = useQueryClient()
+  const scope = queryScope()
+  const harnessKey = useMemo(() => queryKeys.runs.harness(run.id), [scope, run.id])
+  const harness = useRunHarness(run.id, active, events)
   const lastHarnessSeq = events.reduce(
     (max, event) => (event.type.startsWith('harness.') ? Math.max(max, event.seq) : max),
     0,
@@ -230,6 +244,28 @@ function useThreadHarnessLedger(
   useEffect(() => {
     if (lastHarnessSeq > 0 && isError) void refetch()
   }, [lastHarnessSeq, isError, refetch])
+  // `events` is a bounded window, and the snapshot never refreshes on its own while the run
+  // stays `running`: fold the window into the cache before compaction drops it, and re-read
+  // the snapshot when the window starts past what it accounts for (PR #925 review).
+  const coverage = useRef<{ key: unknown; seq: number; refetched: string }>({ key: undefined, seq: 0, refetched: '' })
+  const snapshot = harness.data
+  useEffect(() => {
+    if (!active || !snapshot) return
+    if (coverage.current.key !== harnessKey) coverage.current = { key: harnessKey, seq: 0, refetched: '' }
+    const covered = Math.max(coverage.current.seq, snapshot.snapshotSeq ?? 0)
+    if (harnessWindowGap(covered, events, hasOlder)) {
+      const attempt = `${covered}:${events[0]!.seq}`
+      if (coverage.current.refetched !== attempt) {
+        coverage.current.refetched = attempt
+        void refetch()
+      }
+      return
+    }
+    coverage.current.seq = Math.max(covered, events.at(-1)?.seq ?? 0)
+    if (!foldHarnessSnapshot(snapshot, events)) return
+    // Folded onto the CURRENT entry: a fresher fetched snapshot makes this a no-op.
+    queryClient.setQueryData<HarnessLedgerResponse>(harnessKey, (current) => foldHarnessSnapshot(current, events))
+  }, [active, events, harnessKey, hasOlder, queryClient, refetch, snapshot])
   return useMemo(() => mergeHarnessLedger(harness.data, events), [harness.data, events])
 }
 
@@ -263,6 +299,7 @@ export function ThreadView({
     run,
     run.harness ? (history?.visibleEvents ?? NO_EVENTS) : NO_EVENTS,
     givenHarnessLedger === undefined,
+    history?.hasOlder ?? false,
   )
   const harnessLedger = givenHarnessLedger ?? ownHarnessLedger
   const markedUnread = useCallback(() => onMarkedUnread?.(run.id), [onMarkedUnread, run.id])
@@ -407,7 +444,11 @@ export function ThreadView({
   )
 
   return (
-    <div data-route="task-thread" data-run-id={run.id} className="flex min-h-full flex-col">
+    <div
+      data-route="task-thread"
+      data-run-id={run.id}
+      className={cn('flex min-h-full flex-col', harnessLedger && RUN_RAIL_CONTAINER)}
+    >
       {embedded ? null : <RunHeader
         run={run}
         planTally={planTally}
@@ -455,10 +496,11 @@ export function ThreadView({
           </Suspense>
         ) : null}
         <RailLayout
-          rail={harnessLedger ? (
+          rail={harnessLedger && harnessRailHasContent(harnessLedger) ? (
             <Suspense fallback={null}>
               <HarnessRail
                 ledger={harnessLedger}
+                embedded={embedded}
                 runId={run.id}
                 onOpenTimeline={() => setTimelineOpen((open) => !open)}
                 onOpenReviewer={setOpenReviewer}
@@ -619,7 +661,7 @@ export function ThreadView({
         <AgentsDock key={`agents:${run.id}`} runId={run.id} agents={agents} onSelect={setOpenAgentId} />
 
         {harnessLedger ? (
-          <div className="xl:hidden">
+          <div className="@5xl/run:hidden">
             <Suspense fallback={null}>
               <HarnessModelsDock ledger={harnessLedger} />
             </Suspense>

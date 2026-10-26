@@ -167,6 +167,41 @@ export function mergeHarnessLedger(
   return ledger
 }
 
+/**
+ * The snapshot with `events` folded in and `snapshotSeq` moved to the newest harness event applied,
+ * or undefined when the window holds nothing newer — so a cache write can never move it backwards.
+ * The thread's window is bounded: what is not written back is lost on compaction (PR #925 review).
+ */
+export function foldHarnessSnapshot(
+  snapshot: HarnessLedgerResponse | undefined,
+  events: readonly RunEvent[],
+): HarnessLedgerResponse | undefined {
+  if (!snapshot) return undefined
+  const from = snapshot.snapshotSeq ?? 0
+  let through = from
+  for (const event of events) {
+    if (event.seq > through && event.type.startsWith('harness.')) through = event.seq
+  }
+  if (through === from) return undefined
+  return { ...mergeHarnessLedger(snapshot, events)!, snapshotSeq: through }
+}
+
+/** True when older history is unloaded and the window starts past `coveredSeq`: harness events in
+ *  between were never seen, so only a fresh snapshot can account for them (PR #925 review). */
+export function harnessWindowGap(
+  coveredSeq: number,
+  events: readonly RunEvent[],
+  hasOlder: boolean,
+): boolean {
+  const oldest = events[0]?.seq
+  return hasOlder && oldest !== undefined && oldest > coveredSeq + 1
+}
+
+/** Whether the rail has anything to draw — the thread reserves its column only then. */
+export function harnessRailHasContent(ledger: Pick<HarnessLedgerResponse, 'phases' | 'models'>): boolean {
+  return ledger.phases.length > 0 || ledger.models.length > 0
+}
+
 export function activeHarnessPhase(ledger: HarnessLedgerResponse): HarnessPhaseRecord | undefined {
   return [...ledger.phases].reverse().find((phase) => phase.status === 'running')
 }

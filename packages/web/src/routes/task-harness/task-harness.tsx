@@ -45,10 +45,11 @@ import { elapsed, SeverityTag, toneOf } from './harness-components'
 import { HarnessRail } from './harness-rail'
 import { HarnessStatusBar, HarnessTimelineDialog } from './harness-status-bar'
 import { ReviewerModal } from './reviewer-modal'
-import { RUN_RAIL_GRID, runShellClass } from '../task-thread/run-shell'
+import { RUN_RAIL_CONTAINER, RUN_RAIL_GRID, runShellClass } from '../task-thread/run-shell'
 import {
   blockingReasonList,
   displayedCouncil,
+  harnessRailHasContent,
   mergeHarnessLedger,
   shortModelName,
   orderStepsByLedger,
@@ -116,7 +117,7 @@ function HarnessPage({
   const [openReviewer, setOpenReviewer] = useState<string | null>(null)
   return (
     <OpenReviewerContext.Provider value={setOpenReviewer}>
-    <div data-route={`task-harness-${tab}`} className="flex min-h-full flex-col">
+    <div data-route={`task-harness-${tab}`} className={cn('flex min-h-full flex-col', RUN_RAIL_CONTAINER)}>
       <RunHeader run={run} tab={tab} orderedSteps={orderStepsByLedger(run.steps, ledger)} hideWorkflowProgress />
       {/* Same shell width as the header (review 2026-07-27): these two used to
           cap at 1120px and 820px respectively, so at any viewport above 820px
@@ -133,15 +134,19 @@ function HarnessPage({
       <div
         className={cn('flex flex-1 flex-col gap-3 px-4 py-5 md:px-6', runShellClass(true))}
       >
-        <div className={RUN_RAIL_GRID}>
+        {harnessRailHasContent(ledger) ? (
+          <div data-slot="run-rail-grid" className={RUN_RAIL_GRID}>
+            <div className="flex min-w-0 flex-col gap-3">{children}</div>
+            <HarnessRail
+              ledger={ledger}
+              runId={run.id}
+              onOpenTimeline={() => setTimelineOpen((open) => !open)}
+              onOpenReviewer={setOpenReviewer}
+            />
+          </div>
+        ) : (
           <div className="flex min-w-0 flex-col gap-3">{children}</div>
-          <HarnessRail
-            ledger={ledger}
-            runId={run.id}
-            onOpenTimeline={() => setTimelineOpen((open) => !open)}
-            onOpenReviewer={setOpenReviewer}
-          />
-        </div>
+        )}
       </div>
       <HarnessTimelineDialog ledger={ledger} open={timelineOpen} onOpenChange={setTimelineOpen} />
       <ReviewerModal

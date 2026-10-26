@@ -12,7 +12,13 @@ import { toast } from '@/components/ui/toaster'
 import { cn } from '@/lib/utils'
 
 import { elapsed, phaseLabel, toneOf } from './harness-components'
-import { activeHarnessPhase, blockingReasonList, displayedCouncil, shortModelName } from './harness-state'
+import {
+  activeHarnessPhase,
+  blockingReasonList,
+  displayedCouncil,
+  harnessRailHasContent,
+  shortModelName,
+} from './harness-state'
 
 /**
  * The run rail (review 2026-07-27, findings A2 + B1).
@@ -23,27 +29,37 @@ import { activeHarnessPhase, blockingReasonList, displayedCouncil, shortModelNam
  * beside it. This is that: phase, council and models beside the transcript, on
  * every harness surface.
  *
- * It folds away under `xl` — below that the reading measure is worth more than
- * the companion column, and the Review tab still holds everything.
+ * It folds away when its `@container/run` is narrower than 64rem — below that
+ * the reading measure is worth more than the companion column, and the Review
+ * tab still holds everything.
  */
 export function HarnessRail({
   ledger,
   runId,
   onOpenTimeline,
   onOpenReviewer,
+  embedded = false,
 }: {
   ledger: HarnessLedgerResponse
   /** Enables the council decision actions; without it the rail is read-only. */
   runId?: string
   onOpenTimeline?: () => void
   onOpenReviewer?: (id: string) => void
+  /** In a workspace column, whose scroller already starts below the run header and the 2rem
+   *  column bar — the header offset would push the rail down by its height (PR #925 review). */
+  embedded?: boolean
 }) {
-  if (ledger.phases.length === 0 && ledger.models.length === 0) return null
+  if (!harnessRailHasContent(ledger)) return null
   return (
     <aside
       data-slot="harness-rail"
       aria-label="Run state"
-      className="sticky hidden flex-col gap-3 self-start overflow-y-auto xl:flex top-[calc(var(--run-header-h,0px)+0.75rem)] max-h-[calc(100dvh-var(--run-header-h,0px)-1.5rem)] [scrollbar-width:thin]"
+      className={cn(
+        'sticky hidden flex-col gap-3 self-start overflow-y-auto @5xl/run:flex [scrollbar-width:thin]',
+        embedded
+          ? 'top-3 max-h-[calc(100dvh-var(--run-header-h,0px)-3.5rem)]'
+          : 'top-[calc(var(--run-header-h,0px)+0.75rem)] max-h-[calc(100dvh-var(--run-header-h,0px)-1.5rem)]',
+      )}
     >
       <PhaseSection ledger={ledger} onOpenTimeline={onOpenTimeline} />
       <CouncilSection ledger={ledger} runId={runId} onOpenReviewer={onOpenReviewer} />

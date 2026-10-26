@@ -277,3 +277,24 @@ describe('HarnessRail models working indicator', () => {
     expect(document.querySelectorAll('[data-slot="model-working"]')).toHaveLength(0)
   })
 })
+
+// PR #925 review: the rail follows its `@container/run`, and only a full-width page's scroller holds
+// the run header the sticky offset clears.
+describe('HarnessRail placement', () => {
+  const rail = () => document.querySelector('[data-slot="harness-rail"]')!.className
+
+  it('clears the run header on a full-width page', () => {
+    render(<HarnessRail ledger={ledger()} />)
+
+    expect(rail()).toContain('@5xl/run:flex')
+    expect(rail().split(/\s+/)).not.toContain('xl:flex')
+    expect(rail()).toContain('top-[calc(var(--run-header-h,0px)+0.75rem)]')
+  })
+
+  it('sticks just below the column bar in a workspace column', () => {
+    render(<HarnessRail ledger={ledger()} embedded />)
+
+    expect(rail()).toContain('top-3')
+    expect(rail()).not.toContain('top-[calc(var(--run-header-h')
+  })
+})
