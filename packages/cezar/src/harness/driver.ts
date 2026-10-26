@@ -369,6 +369,23 @@ export async function snapshotHarnessStageSubject(cwd: string): Promise<string> 
   return hash.digest('hex');
 }
 
+/** A superseded handoff stays in the index, where `git diff HEAD` cannot see a change the
+ *  worktree since reverted, and the stage op then refuses it (PR #925 review). */
+function resetIndexToHead(cwd: string): void {
+  // Only a pinned harness worktree: never whatever repository happens to enclose `cwd`.
+  const env = pinnedGitEnv(cwd);
+  if (!env) return;
+  try {
+    execFileSync('git', ['reset', '-q'], {
+      cwd,
+      stdio: 'ignore',
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env },
+    });
+  } catch {
+    // The stage op's own index checks still refuse anything left behind.
+  }
+}
+
 function currentChangedPaths(cwd: string): string[] | null {
   try {
     const tracked = execFileSync('git', ['diff', '--name-only', '-z', 'HEAD', '--'], {
@@ -396,6 +413,9 @@ function currentChangedPaths(cwd: string): string[] | null {
     return null;
   }
 }
+
+const advisorInvocationId = (op: { kindTag: string; round: number }, member: { label: string }): string =>
+  `advisor:${op.kindTag}:${op.round}:${member.label}`;
 
 /** The independence axis a council quorum counts. Delegates to the ONE shared
  *  definition (review 2026-07-27): returning `ref.runner` here counted a host
@@ -448,19 +468,21 @@ const preImplementResultSchema = z.object({
     .default([]),
 });
 
+// Changed paths are allowlist hints: git derives the complete handoff, so a long list is clamped,
+// never a contract failure (PR #925 review).
+const clampPaths = (paths: string[]): string[] => paths.slice(0, HARNESS_RESULT_LIMITS.paths);
+
 const implementResultSchema = z.object({
   changedPaths: z
     .array(z.string().min(1).max(HARNESS_RESULT_LIMITS.path))
     .min(1)
-    .max(HARNESS_RESULT_LIMITS.paths),
+    .transform(clampPaths),
   summary: z.string().max(HARNESS_RESULT_LIMITS.summary).optional(),
   suggestedCommit: z.string().max(HARNESS_RESULT_LIMITS.shortText).optional(),
 });
 
 const fixResultSchema = implementResultSchema.extend({
-  changedPaths: z
-    .array(z.string().min(1).max(HARNESS_RESULT_LIMITS.path))
-    .max(HARNESS_RESULT_LIMITS.paths),
+  changedPaths: z.array(z.string().min(1).max(HARNESS_RESULT_LIMITS.path)).transform(clampPaths),
 });
 
 const packetManifestSchema = z.object({
@@ -573,6 +595,34 @@ function coerceReviewVerdict(result: {
   return { verdict, coercedFrom: verdict === result.verdict ? null : result.verdict };
 }
 
+const SEVERITY_RANK = { blocker: 0, major: 1, minor: 2, nit: 3 } as const;
+
+/** An advisor review as the runtime merged it, with no bounds of its own: clamped rather than
+ *  rejected, keeping the most severe findings when it must drop some (PR #925 review). */
+const advisorReviewSchema = z.object({
+  verdict: z.enum(['approve', 'request_changes']),
+  findings: z
+    .array(
+      z.object({
+        severity: z.enum(['blocker', 'major', 'minor', 'nit']),
+        title: z.string().min(1).transform((title) => title.slice(0, HARNESS_RESULT_LIMITS.shortText)),
+        location: findingLocationSchema.optional().catch(undefined),
+        evidence: z
+          .string()
+          .optional()
+          .transform((evidence) => evidence?.slice(0, HARNESS_RESULT_LIMITS.text)),
+      }),
+    )
+    .default([])
+    .transform((findings) =>
+      findings.length <= HARNESS_RESULT_LIMITS.findings
+        ? findings
+        : [...findings]
+            .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity])
+            .slice(0, HARNESS_RESULT_LIMITS.findings),
+    ),
+});
+
 /** The runtime's `review-result.json`, reduced to what the driver folds into
  *  the council: per-advisor status plus the session-shaped review payload
  *  (spec 2026-07-24-advisor-reviewers). Loose on purpose — the runtime's own
@@ -592,7 +642,8 @@ const councilResultSchema = z
           .object({
             id: z.string(),
             status: z.string(),
-            review: reviewResultSchema.optional(),
+            // Parsed per row: one advisor's unreadable review fails that advisor alone (PR #925 review).
+            review: z.unknown().optional(),
           })
           .passthrough(),
       )
@@ -1576,7 +1627,10 @@ export async function runHarnessDriver(
             entry.error.startsWith('ended without a valid result file'),
         )
         ?.error?.replace(/^ended without a valid result file(?: — )?/, '') || null;
-    for (let attempt = priorAttempts + 1; attempt <= 2; attempt += 1) {
+    // Two attempts per input; a Continue after both failed buys one more, or it re-returned the
+    // same failure without running anything (PR #925 review).
+    const attemptLimit = Math.max(2, priorAttempts + 1);
+    for (let attempt = priorAttempts + 1; attempt <= attemptLimit; attempt += 1) {
       if (host.isCancelled()) return { cancelled: true };
       const attemptPrompt =
         attempt > 1 && lastContractFailure
@@ -2733,7 +2787,7 @@ export async function runHarnessDriver(
     >();
     const pendingMembers: typeof op.members = [];
     for (const member of op.members) {
-      const id = `advisor:${op.kindTag}:${op.round}:${member.label}`;
+      const id = advisorInvocationId(op, member);
       const inputSha256 = sha256(
         JSON.stringify({
           inputHashVersion: 2,
@@ -2769,6 +2823,8 @@ export async function runHarnessDriver(
           Number.isFinite(endedAt) &&
           recoverableCouncilMtimeMs >= startedAt - 5_000 &&
           recoverableCouncilMtimeMs <= endedAt + 5_000;
+        const recoveredReview =
+          recoveredRow?.status === 'completed' ? advisorReviewSchema.safeParse(recoveredRow.review) : null;
         const contractSubject = recoverableCouncil?.reviewContract?.subjectSha256;
         const contractMatchesSubject =
           !op.artifact || contractSubject === undefined || contractSubject === subjectSha256;
@@ -2778,10 +2834,9 @@ export async function runHarnessDriver(
           isCouncilSubjectChangedError(prior.error) &&
           writtenDuringAttempt &&
           contractMatchesSubject &&
-          recoveredRow?.status === 'completed' &&
-          recoveredRow.review !== undefined
+          recoveredReview?.success
         ) {
-          writeJsonAtomic(artifactPath, recoveredRow.review);
+          writeJsonAtomic(artifactPath, recoveredReview.data);
           prior.status = 'completed';
           prior.error = undefined;
           prior.process = undefined;
@@ -2799,8 +2854,8 @@ export async function runHarnessDriver(
             family: member.family,
             status: 'completed',
             freshContext: true,
-            verdict: recoveredRow.review.verdict,
-            findings: recoveredRow.review.findings,
+            verdict: recoveredReview.data.verdict,
+            findings: recoveredReview.data.findings,
             recovered: true,
           });
           persist();
@@ -2996,26 +3051,36 @@ export async function runHarnessDriver(
       } else {
         for (const member of pendingMembers) {
           const row = parsedCouncil.data.reviewers.find((r) => r.id === member.councilId);
-          const completed = row?.status === 'completed' && row.review !== undefined;
+          const review = row?.status === 'completed' ? advisorReviewSchema.safeParse(row.review) : null;
+          const reviewError =
+            review && !review.success
+              ? `advisor ${member.label} returned a review cezar could not read: ${review.error.issues
+                  .slice(0, 3)
+                  .map((i) => `${i.path.join('.')}: ${i.message}`)
+                  .join('; ')}`
+              : null;
+          const completed = review?.success === true;
           rows.push({
             id: member.label,
             runner: 'harness',
             model: member.councilId,
             family: member.family,
-            status: completed ? 'completed' : (row?.status ?? 'failed'),
+            status: completed ? 'completed' : reviewError ? 'failed' : (row?.status ?? 'failed'),
             freshContext: true,
-            verdict: row?.review?.verdict ?? null,
-            findings: row?.review?.findings ?? [],
-            ...(!completed && !result.ok
-              ? { error: (result.error ?? result.stderr.slice(-300)).trim() || `exit ${result.exitCode}` }
-              : {}),
+            verdict: completed ? review.data.verdict : null,
+            findings: completed ? review.data.findings : [],
+            ...(reviewError
+              ? { error: reviewError }
+              : !completed && !result.ok
+                ? { error: (result.error ?? result.stderr.slice(-300)).trim() || `exit ${result.exitCode}` }
+                : {}),
           });
           const invocation = running.get(member.label)!;
           const promptPath = typeof row?.promptPath === 'string' ? row.promptPath : null;
           if (promptPath && existsSync(promptPath)) invocation.promptPath = promptPath;
           if (completed) {
             const meta = invocationMeta.get(member.label)!;
-            writeJsonAtomic(meta.artifactPath, row.review);
+            writeJsonAtomic(meta.artifactPath, review.data);
             finishInvocation(invocation, 'completed', {
               artifactPath: meta.artifactPath,
               modelId: member.label,
@@ -3023,8 +3088,9 @@ export async function runHarnessDriver(
           } else {
             finishInvocation(invocation, 'failed', {
               error:
-                (result.error ?? result.stderr.slice(-300)).trim() ||
-                `advisor returned status ${row?.status ?? 'missing'}`,
+                reviewError ??
+                ((result.error ?? result.stderr.slice(-300)).trim() ||
+                  `advisor returned status ${row?.status ?? 'missing'}`),
             });
           }
         }
@@ -3064,7 +3130,7 @@ export async function runHarnessDriver(
     return advisor.value;
   };
 
-  const runAdvisorCouncilOpWithRetry = async (
+  const runAdvisorCouncilOpGuardingSubject = async (
     op: Parameters<typeof runAdvisorCouncilOp>[0],
   ): ReturnType<typeof runAdvisorCouncilOp> => {
     const first = await runAdvisorCouncilOp(op);
@@ -3079,6 +3145,73 @@ export async function runHarnessDriver(
         'council once against the current subject before giving up',
     });
     return runAdvisorCouncilOp(op);
+  };
+
+  /** One in-round second attempt for advisors that failed in a way a retry can change, as
+   *  session reviewers get: the runtime's own retry loop is off (PR #925 review). */
+  const runAdvisorCouncilOpWithRetry = async (
+    op: Parameters<typeof runAdvisorCouncilOp>[0],
+  ): ReturnType<typeof runAdvisorCouncilOp> => {
+    const invocationOf = (member: { label: string }) =>
+      ledger.invocations.find((entry) => entry.id === advisorInvocationId(op, member));
+    const endedBefore = new Map(op.members.map((member) => [member.label, invocationOf(member)?.endedAt]));
+    const first = await runAdvisorCouncilOpGuardingSubject(op);
+    if (first === null || op.proceedAccepted || host.isCancelled()) return first;
+    if (first.error !== null && isCouncilSubjectChangedError(first.error)) return first;
+    const retry = op.members.filter((member) => {
+      const invocation = invocationOf(member);
+      return (
+        invocation?.status === 'failed' &&
+        invocation.endedAt !== endedBefore.get(member.label) &&
+        typeof invocation.error === 'string' &&
+        isRetryableReviewerFailure(invocation.error) &&
+        !isUsageLimitMessage(invocation.error) &&
+        !isCouncilSubjectChangedError(invocation.error)
+      );
+    });
+    if (retry.length === 0) return first;
+    host.emit({
+      type: 'note',
+      message: `retrying advisor reviewer(s) ${retry.map((member) => member.label).join(', ')} once`,
+    });
+    const second = await runAdvisorCouncilOpGuardingSubject({ ...op, members: retry });
+    if (second === null) return null;
+    const retried = new Set(retry.map((member) => member.label));
+    return {
+      rows: [...first.rows.filter((row) => !retried.has(String(row.id))), ...second.rows],
+      error: second.error,
+    };
+  };
+
+  /** An op error fails only the members it returned no row for: reviews it reused or recovered
+   *  stay completed (PR #925 review). */
+  const foldAdvisorRun = (
+    advisorRun: { rows: Array<Record<string, unknown>>; error: string | null },
+    members: ReadonlyArray<{ label: string; family?: string }>,
+    outcomes: CouncilOutcome[],
+    councilReviewers: Array<Record<string, unknown>>,
+    stepId: string,
+  ): void => {
+    councilReviewers.push(...advisorRun.rows);
+    for (const row of advisorRun.rows) {
+      outcomes.push({
+        label: String(row.id),
+        family: typeof row.family === 'string' ? row.family : undefined,
+        status: row.status === 'completed' ? 'completed' : 'failed',
+        reason: typeof row.error === 'string' ? row.error : undefined,
+      });
+    }
+    if (!advisorRun.error) return;
+    const covered = new Set(advisorRun.rows.map((row) => String(row.id)));
+    for (const member of members.filter((entry) => !covered.has(entry.label))) {
+      outcomes.push({ label: member.label, family: member.family, status: 'failed', reason: advisorRun.error });
+      councilReviewers.push({ id: member.label, status: 'failed', reason: advisorRun.error });
+    }
+    host.emit({
+      type: 'note',
+      stepId,
+      message: `advisor council produced no result (${advisorRun.error}) — continuing with the runner reviewers`,
+    });
   };
 
   const runHighAssurancePackets = async (
@@ -3247,7 +3380,9 @@ export async function runHarnessDriver(
             reason: releaseReason,
           }),
         );
-      const inFlightStates = ['planned', 'claimed', 'implementing', 'reviewing', 'fixing'];
+      // `blocked` is a packet whose worker or gate failed: it gets the same bounded replacement, or
+      // every Continue dead-ended on it (PR #925 review).
+      const inFlightStates = ['planned', 'claimed', 'implementing', 'reviewing', 'fixing', 'blocked'];
 
       // A crash after a release leaves the recorded packet behind it, so follow every release
       // this run already made, not only the first (PR #925 review).
@@ -3287,7 +3422,9 @@ export async function runHarnessDriver(
         // only a run that failed on its own does (PR #925 review).
         const failedRuns = ledger.invocations.filter(
           (invocation) =>
-            invocation.id.startsWith(`packet-run:${source.id}:`) && invocation.status === 'failed',
+            (invocation.id.startsWith(`packet-run:${source.id}:`) ||
+              invocation.id.startsWith(`packet-gate:${source.id}:`)) &&
+            invocation.status === 'failed',
         ).length;
         if (failedRuns >= 2) {
           return `packet ${source.id} failed twice in state ${stateName}; manual recovery is required`;
@@ -4379,34 +4516,8 @@ export async function runHarnessDriver(
             return specSubjectIssue;
           }
           if (specAdvisorWork !== null) {
-            const advisorRun = specAdvisorRun;
-            if (advisorRun === null) return null;
-            if (advisorRun.error) {
-              for (const member of specCouncilMembers) {
-                outcomes.push({
-                  label: member.label,
-                  family: member.family,
-                  status: 'failed',
-                  reason: advisorRun.error,
-                });
-                councilReviewers.push({ id: member.label, status: 'failed', reason: advisorRun.error });
-              }
-              host.emit({
-                type: 'note',
-                stepId: councilId,
-                message: `advisor council produced no result (${advisorRun.error}) — continuing with the runner reviewers`,
-              });
-            } else {
-              councilReviewers.push(...advisorRun.rows);
-              for (const row of advisorRun.rows) {
-                outcomes.push({
-                  label: String(row.id),
-                  family: typeof row.family === 'string' ? row.family : undefined,
-                  status: row.status === 'completed' ? 'completed' : 'failed',
-                  reason: typeof row.error === 'string' ? row.error : undefined,
-                });
-              }
-            }
+            if (specAdvisorRun === null) return null;
+            foldAdvisorRun(specAdvisorRun, specCouncilMembers, outcomes, councilReviewers, councilId);
           }
           const gate = resolveCouncilGate('spec', sround, outcomes, councilId, specSubjectSha256);
           if (!gate.proceed) {
@@ -5010,13 +5121,19 @@ export async function runHarnessDriver(
         continue;
       }
       if (isClosingRepair) {
-        survivingBlockers = [];
+        // Fixed but never re-reviewed: the spec keeps such blockers contested, never verified
+        // (2026-07-26-harness-production-stabilization, PR #925 review).
+        survivingBlockers = survivingBlockers.map((finding) => ({
+          ...finding,
+          title: `${finding.title} — addressed by the closing fix, not re-reviewed`,
+        }));
         host.emit({
           type: 'note',
           stepId: validateId,
           message:
             `validated the fixes for code-review cycle ${ledger.loops.maxFixRounds}/${ledger.loops.maxFixRounds}; ` +
-            `the review budget is exhausted, so staging continues without buying a fourth review`,
+            `the review budget is exhausted, so staging continues without buying a fourth review — ` +
+            `its findings stay contested until the risk is accepted`,
         });
         break;
       }
@@ -5293,33 +5410,9 @@ export async function runHarnessDriver(
           return implSubjectIssue;
         }
         if (advisorWork !== null) {
-          const advisorRun = settledAdvisorRun;
-          if (advisorRun === null) return null;
-          if (advisorRun.error) {
-            for (const member of implCouncilMembers) {
-              outcomes.push({
-                label: member.label,
-                family: member.family,
-                status: 'failed',
-                reason: advisorRun.error,
-              });
-              councilReviewers.push({ id: member.label, status: 'failed', reason: advisorRun.error });
-            }
-            host.emit({
-              type: 'note',
-              stepId: reviewId,
-              message: `advisor council produced no result (${advisorRun.error}) — continuing with the runner reviewers`,
-            });
-          } else {
-            councilReviewers.push(...advisorRun.rows);
-            for (const row of advisorRun.rows) {
-              outcomes.push({
-                label: String(row.id),
-                family: typeof row.family === 'string' ? row.family : undefined,
-                status: row.status === 'completed' ? 'completed' : 'failed',
-                reason: typeof row.error === 'string' ? row.error : undefined,
-              });
-            }
+          if (settledAdvisorRun === null) return null;
+          foldAdvisorRun(settledAdvisorRun, implCouncilMembers, outcomes, councilReviewers, reviewId);
+          if (!settledAdvisorRun.error) {
             host.emit({
               type: 'harness.council.updated',
               stepId: reviewId,
@@ -5496,6 +5589,7 @@ export async function runHarnessDriver(
       return reason;
     }
 
+    if (!(phaseDone('stage') && ledger.stage.status === 'staged')) resetIndexToHead(host.cwd);
     const discoveredPaths = discoverChangedPaths(host.cwd, [...allowlist]);
     if (discoveredPaths === null) {
       const reason =

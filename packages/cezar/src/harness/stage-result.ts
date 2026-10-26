@@ -8,12 +8,18 @@ export const harnessStageResultSchema = z
     currentHead: z.string().optional(),
     branch: z.string().optional(),
     worktree: z.string().optional(),
-    stagedPaths: z
-      .array(z.string().min(1).max(HARNESS_RESULT_LIMITS.path))
-      .max(HARNESS_RESULT_LIMITS.paths),
+    // Runtime-written from git, and `samePathSet` proves the set: a count cap only made a large
+    // handoff fatal (PR #925 review).
+    stagedPaths: z.array(z.string().min(1).max(HARNESS_RESULT_LIMITS.path)),
+    // Advisory: an oversized warning is truncated, never a failed stage (run aad28178, PR #925 review).
     warnings: z
-      .array(z.string().min(1).max(HARNESS_RESULT_LIMITS.summary))
-      .max(20)
+      .array(z.string())
+      .transform((warnings) =>
+        warnings
+          .filter((warning) => warning.length > 0)
+          .slice(0, 20)
+          .map((warning) => warning.slice(0, HARNESS_RESULT_LIMITS.summary)),
+      )
       .optional(),
   })
   .passthrough();

@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, sep } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as claudeGuard from './claude-guard.js';
+import { pinWorktreeGitDir } from '../git-pin.js';
 import {
   councilDecisionDetail,
   loadLedger,
@@ -173,7 +174,7 @@ function makeHarness(dir: string) {
   const setCouncilBehavior = (fn: typeof councilBehavior) => {
     councilBehavior = fn;
   };
-  let packetRunBehavior: (call: number) => 'awaiting_validation' | 'implementing' = () =>
+  let packetRunBehavior: (call: number) => 'awaiting_validation' | 'implementing' | 'blocked' = () =>
     'awaiting_validation';
   let packetRunCalls = 0;
   const setPacketRunBehavior = (fn: typeof packetRunBehavior) => {
@@ -836,9 +837,14 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(h.calls.map((c) => c.id)).toContain('stage');
     const notes = h.events.filter((e) => e.type === 'note').map((e) => String(e.message));
     expect(notes.some((n) => n.includes('applying its confirmed findings'))).toBe(true);
+    // PR #925 review: the closing fixes are never re-reviewed, so the spec keeps their blockers
+    // contested (2026-07-26-harness-production-stabilization), not represented as verified.
     const ledger = loadLedger(h.host.dataDir, h.host.runId);
-    expect(ledger?.outcome.status).toBe('ready');
-    expect(ledger?.stage.prBody).not.toContain('still broken');
+    expect(ledger?.outcome.status).toBe('contested');
+    expect(ledger?.outcome.blockingReasons).toEqual([
+      '[blocker] still broken — addressed by the closing fix, not re-reviewed (raised by claude)',
+    ]);
+    expect(ledger?.stage.prBody).toContain('still broken — addressed by the closing fix, not re-reviewed');
     expect(ledger?.decisions.some((d) => d.kind === 'review.closing-fixes')).toBe(true);
   });
 
@@ -1236,8 +1242,8 @@ describe('harness driver — standard fix-issue graph', () => {
     // The coercion forces all three review-and-repair cycles, including the
     // scheduled closing repair for the third review's confirmed findings.
     expect(h.calls.map((c) => c.id)).toContain('fix-final');
-    expect(ledger?.outcome.status).toBe('ready');
-    expect(ledger?.stage.prBody).not.toContain('Auth check removed');
+    expect(ledger?.outcome.status).toBe('contested');
+    expect(ledger?.stage.prBody).toContain('Auth check removed — addressed by the closing fix');
     const notes = h.events.filter((e) => e.type === 'note').map((e) => String(e.message));
     expect(notes.some((n) => n.includes('coerced to "request_changes"'))).toBe(true);
   });
@@ -1960,6 +1966,67 @@ describe('harness driver — standard fix-issue graph', () => {
     ).toEqual(['interrupted', 'interrupted', 'interrupted', 'completed']);
   });
 
+  // PR #925 review: a packet the runtime marked blocked dead-ended every Continue on a misleading
+  // "worker invocation evidence is missing".
+  it('gives a blocked packet its bounded replacement on Continue', async () => {
+    const h = makeHarness(dir);
+    h.setPacketRunBehavior((call) => (call === 1 ? 'blocked' : 'awaiting_validation'));
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    const packetInput = { ...input, profile: 'high-assurance' as const };
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toMatch(/packet PK-01 failed/i);
+
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toBeNull();
+    expect(h.ops.map((op) => op.id)).toContain('packet-release');
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.stage.status).toBe('staged');
+  });
+
+  // PR #925 review: feedback that reverted a staged change left it in the index, invisible to the
+  // git-derived handoff, and the runtime refused it on every Continue.
+  it('stages from HEAD, dropping a superseded handoff the worktree reverted', async () => {
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'test@local');
+    git('config', 'user.name', 'test');
+    writeFileSync(join(dir, 'reverted.txt'), 'base\n');
+    git('add', 'reverted.txt');
+    git('commit', '-q', '-m', 'base');
+    writeFileSync(join(dir, 'reverted.txt'), 'staged by the earlier handoff\n');
+    git('add', 'reverted.txt');
+    writeFileSync(join(dir, 'reverted.txt'), 'base\n');
+    pinWorktreeGitDir(dir, join(dir, '.git'));
+    const h = makeHarness(dir);
+
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    expect(git('diff', '--cached', '--name-only').trim()).toBe('');
+  });
+
+  // PR #925 review: the stage result's bounds made an advisory warning or a large handoff fatal.
+  it('stages a handoff with an oversized warning and more than 200 paths', async () => {
+    const h = makeHarness(dir);
+    const many = Array.from({ length: 250 }, (_, index) => `src/generated/file-${index}.ts`);
+    h.deps.discoverChangedPaths = () => many;
+    h.stageWarnings.push(`whitespace findings in the staged diff (cosmetic):\n${'x'.repeat(30_000)}`);
+
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    const ledger = loadLedger(h.host.dataDir, h.host.runId);
+    expect(ledger?.stage.status).toBe('staged');
+    expect(ledger?.stage.stagedPaths).toHaveLength(250);
+    expect(ledger?.outcome.status).toBe('ready');
+  });
+
+  // PR #925 review: an honest list of more than 200 changed paths spent the implement contract retry.
+  it('accepts an implement result that lists more than 200 changed paths', async () => {
+    const h = makeHarness(dir);
+    h.agentBehavior.set('implement', (req) => {
+      const changedPaths = Array.from({ length: 250 }, (_, index) => `src/file-${index}.ts`);
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths }), 'utf8');
+      return null;
+    });
+
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    expect(h.calls.filter((call) => call.id === 'implement')).toHaveLength(1);
+  });
+
   it('stops a packet for manual recovery after its runtime fails twice', async () => {
     const h = makeHarness(dir);
     h.setPacketRunBehavior(() => 'implementing');
@@ -2584,7 +2651,8 @@ describe('harness driver — standard fix-issue graph', () => {
   it('resumes an unstaged high-assurance council with feedback after implementation completed', async () => {
     const first = makeHarness(dir);
     first.deps.loadAgentic = async () => highAssuranceAgentic();
-    first.setCouncilBehavior(() => ({ ok: false, stderr: 'review transport failed' }));
+    // A timeout is not retried in-round, so the resume still has the advisors' second attempt.
+    first.setCouncilBehavior(() => ({ ok: false, stderr: 'review transport timed out' }));
     const packetInput = { ...input, profile: 'high-assurance' as const };
     expect(await runHarnessDriver(first.host, packetInput, first.deps)).toMatch(/council|review/i);
     const interrupted = loadLedger(first.host.dataDir, first.host.runId)!;
@@ -2870,7 +2938,9 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(loadLedger(resumed.host.dataDir, resumed.host.runId)?.stage.status).toBe('staged');
   });
 
-  it('still fails a phase whose two ended attempts both broke the result contract', async () => {
+  // The ended attempts still count (D5); PR #925 review: a Continue after both buys one more
+  // instead of re-returning the failure without a model call.
+  it('gives a phase whose two ended attempts broke the result contract one more attempt per Continue', async () => {
     const first = makeHarness(dir);
     first.agentBehavior.set('implement', (req) => {
       writeFileSync(req.resultPath, '{"not":"the contract"}', 'utf8');
@@ -2880,16 +2950,17 @@ describe('harness driver — standard fix-issue graph', () => {
       /"implement" produced no valid result after a retry/,
     );
     const resumed = makeHarness(dir);
-    let implementCalls = 0;
-    resumed.agentBehavior.set('implement', () => {
-      implementCalls += 1;
+    const implementPrompts: string[] = [];
+    resumed.agentBehavior.set('implement', (req) => {
+      implementPrompts.push(req.prompt);
       return null;
     });
 
     expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toMatch(
       /"implement" produced no valid result after a retry/,
     );
-    expect(implementCalls).toBe(0);
+    expect(implementPrompts).toHaveLength(1);
+    expect(implementPrompts[0]).toContain('RESULT-CONTRACT RETRY');
   });
 
   // PR #925 review (D3): staging promotes only a pending outcome, so a stale block meant publish 409'd forever.
@@ -3295,7 +3366,8 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
           verdict: 'approve',
           reviewers: ids.map((id) => ({
             id,
-            status: councilCalls.length === 1 ? 'failed' : 'completed',
+            // A timeout gets no in-round retry, so the first run pauses and the resume is exercised.
+            status: councilCalls.length === 1 ? 'timeout' : 'completed',
             ...(councilCalls.length === 1
               ? {}
               : { review: { verdict: 'approve', findings: [] } }),
@@ -3326,11 +3398,9 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     ).toHaveLength(3);
   });
 
-  /* ---- council decisions (2026-07-29): quorum failures the user resolves ---- */
-
-  /** Structured reviewer transports permanently down: every council op
-   *  answers with both non-session members failed. */
-  const advisorsAlwaysFail = (h: ReturnType<typeof makeHarness>) => {
+  // PR #925 review: advisors lost their in-round retry when the runtime's own loop was disabled.
+  it('retries an advisor that failed retryably once within the round', async () => {
+    const h = makeHarness(dir);
     const councilCalls: string[][] = [];
     h.setCouncilBehavior((ids) => {
       councilCalls.push(ids);
@@ -3338,7 +3408,99 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
         ok: true,
         result: {
           verdict: 'approve',
-          reviewers: ids.map((id) => ({ id, status: 'failed' })),
+          reviewers: ids.map((id, index) => ({
+            id,
+            ...(councilCalls.length === 1 && index === 0
+              ? { status: 'failed' }
+              : { status: 'completed', review: { verdict: 'approve', findings: [] } }),
+          })),
+        },
+      };
+    });
+
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toBeNull();
+    expect(councilCalls).toHaveLength(2);
+    expect(councilCalls[1]).toEqual([councilCalls[0]![0]]);
+  });
+
+  // PR #925 review: one advisor's oversized review voided every advisor in the op.
+  it('reads each advisor review on its own and clamps an oversized one', async () => {
+    const h = makeHarness(dir);
+    const findings = Array.from({ length: 60 }, (_, index) => ({
+      severity: 'minor',
+      title: `nit ${index}`,
+      evidence: 'e'.repeat(5_000),
+    }));
+    h.setCouncilBehavior((ids) => ({
+      ok: true,
+      result: {
+        verdict: 'approve',
+        reviewers: ids.map((id, index) => ({
+          id,
+          status: 'completed',
+          review: index === 0 ? { verdict: 'approve', findings } : { verdict: 'approve', findings: [] },
+        })),
+      },
+    }));
+
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toBeNull();
+    const council = loadLedger(h.host.dataDir, h.host.runId)?.councils.find((entry) => entry.kind === 'implementation');
+    const rows = (council?.reviewers ?? []) as Array<Record<string, unknown>>;
+    const advisors = rows.filter((row) => String(row.id).startsWith('codex/'));
+    expect(advisors.map((row) => row.status)).toEqual(['completed', 'completed']);
+  });
+
+  // PR #925 review: an op error marked every advisor failed, discarding reviews it had reused.
+  it('keeps a reused advisor review when the re-run op errors', async () => {
+    const h = makeHarness(dir);
+    let call = 0;
+    h.setCouncilBehavior((ids) => {
+      call += 1;
+      if (call > 1) return { ok: false, stderr: 'advisor op crashed after a timeout' };
+      return {
+        ok: true,
+        result: {
+          verdict: 'approve',
+          reviewers: ids.map((id, index) => ({
+            id,
+            ...(index === 0
+              ? { status: 'completed', review: { verdict: 'approve', findings: [] } }
+              : { status: 'timeout' }),
+          })),
+        },
+      };
+    });
+    let sessionReviews = 0;
+    h.agentBehavior.set('review', (req) => {
+      sessionReviews += 1;
+      if (sessionReviews === 1) return 'claude timed out after 30m and was stopped';
+      writeFileSync(req.resultPath, JSON.stringify({ verdict: 'approve', findings: [] }), 'utf8');
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toMatch(/quorum/);
+    const reviewersOf = () =>
+      (loadLedger(h.host.dataDir, h.host.runId)?.councils.find((entry) => entry.kind === 'implementation')?.reviewers ??
+        []) as Array<Record<string, unknown>>;
+    const firstAdvisor = reviewersOf().find((row) => String(row.id).startsWith('codex/') && row.status === 'completed')?.id;
+
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toBeNull();
+    expect(firstAdvisor).toBeDefined();
+    expect(reviewersOf().find((row) => row.id === firstAdvisor)?.status).toBe('completed');
+  });
+
+  /* ---- council decisions (2026-07-29): quorum failures the user resolves ---- */
+
+  /** Structured reviewer transports permanently down: every council op
+   *  answers with both non-session members failed. */
+  const advisorsAlwaysFail = (h: ReturnType<typeof makeHarness>, status = 'failed') => {
+    const councilCalls: string[][] = [];
+    h.setCouncilBehavior((ids) => {
+      councilCalls.push(ids);
+      return {
+        ok: true,
+        result: {
+          verdict: 'approve',
+          reviewers: ids.map((id) => ({ id, status })),
         },
       };
     });
@@ -3454,7 +3616,8 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
 
   it('a recorded proceed decision continues with the survivors, loudly', async () => {
     const h = makeHarness(dir);
-    const councilCalls = advisorsAlwaysFail(h);
+    // A timeout leaves each advisor one attempt short, so a decision that bought one would show.
+    const councilCalls = advisorsAlwaysFail(h, 'timeout');
     // Decided at the FIRST pause: pre-spending the budget with an extra resume hid that the
     // decision used to buy the failed advisors a second paid attempt (PR #925 review).
     expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toMatch(/quorum/);
@@ -4039,7 +4202,7 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(h.calls.find((c) => c.id === 'fix-final')?.skill).toBe('om-implement-spec');
     expect(h.calls.map((c) => c.id)).toContain('stage');
     const ledger = loadLedger(h.host.dataDir, h.host.runId);
-    expect(ledger?.outcome.status).toBe('ready');
+    expect(ledger?.outcome.status).toBe('contested');
     expect(ledger?.decisions).toContainEqual(
       expect.objectContaining({ kind: 'spec.closing-fixes', detail: 'round:3' }),
     );

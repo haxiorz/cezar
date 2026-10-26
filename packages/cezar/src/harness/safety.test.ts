@@ -84,18 +84,22 @@ describe('harness safety primitives', () => {
     expect(promptExcerpt('abcdefgh', 4)).toContain('abcd\n…');
   });
 
-  it('parses only bounded, explicit stage results and compares path sets', () => {
+  it('parses explicit stage results with bounded paths and compares path sets', () => {
     expect(
       harnessStageResultSchema.safeParse({
         status: 'ready',
         stagedPaths: ['src/a.ts'],
       }).success,
     ).toBe(true);
+    // PR #925 review: the set is git-derived and proven by `samePathSet`, so its size is not capped.
     expect(
       harnessStageResultSchema.safeParse({
         status: 'ready',
         stagedPaths: Array.from({ length: 201 }, (_, index) => `src/${index}.ts`),
       }).success,
+    ).toBe(true);
+    expect(
+      harnessStageResultSchema.safeParse({ status: 'ready', stagedPaths: [`src/${'x'.repeat(1_001)}.ts`] }).success,
     ).toBe(false);
     expect(samePathSet(['a', 'b'], ['b', 'a'])).toBe(true);
     expect(samePathSet(['a'], ['a', 'b'])).toBe(false);

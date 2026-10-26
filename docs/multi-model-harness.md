@@ -186,7 +186,9 @@ mechanical verdicts:
 The loop structure matters as much as the council: a red validation gate
 short-circuits review and spends from a separate repair budget (2 rounds), so a
 broken build never eats review rounds; and after the last paid review round, one
-closing fix pass runs and is validated without buying a fourth review.
+closing fix pass runs and is validated without buying a fourth review. Those fixes
+were never re-reviewed, so the run stages as `contested` with the findings listed,
+and publishing waits until you accept the risk.
 
 ## Stage-only, mechanically enforced
 
