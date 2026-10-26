@@ -53,3 +53,36 @@ describe('liveTurnStart — concurrent reviewers', () => {
     })).toBe(bEnd)
   })
 })
+
+describe('PR #925 issue3: compact council clocks and session closure', () => {
+  it('uses the earliest defined open-peer start after reloading compact context', () => {
+    const thread = reduceThread([
+      { seq: 1, ts: aStart, type: 'item.completed', stepId: 'review', sessionKey: 'a', item: { kind: 'message', id: 'm', role: 'assistant', text: 'A' } },
+      event(2, 'turn.started', 'b', bStart),
+      { seq: 3, ts: aEnd, type: 'session.error', stepId: 'review', sessionKey: 'c', message: 'C failed' },
+    ] as RunEvent[])
+    expect(thread.turns[0]?.startedAt).toBeUndefined()
+    expect(liveTurnStart(run, thread)).toBe(bStart)
+  })
+
+  it('closes a dead reviewer on session.ended without inventing a reply', () => {
+    const thread = reduceThread([
+      ...started,
+      event(3, 'turn.completed', 'b', bEnd),
+      { ...event(4, 'session.ended', 'a', aEnd), reason: 'error' },
+    ])
+    expect(liveTurnStart(run, thread)).toBe(aEnd)
+    expect(thread.turns[0]?.sessionEnded).toMatchObject({ reason: 'error', ts: aEnd })
+    expect(thread.turns[0]?.completed).toBeUndefined()
+  })
+
+  it('guard: PR #925 issue3 leaves sessionless session.ended on the ordinary latest-turn clock', () => {
+    const thread = reduceThread([
+      { seq: 1, type: 'turn.started', ts: aStart, turnId: 'ordinary' },
+      { seq: 2, type: 'session.ended', ts: aEnd, reason: 'error' },
+    ])
+    expect(liveTurnStart(run, thread)).toBe(aStart)
+    expect(thread.turns[0]?.sessionEnded).toBeUndefined()
+    expect(thread.sessionEnded).toEqual({ reason: 'error' })
+  })
+})

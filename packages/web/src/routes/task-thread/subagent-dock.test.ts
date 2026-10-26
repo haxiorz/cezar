@@ -34,7 +34,7 @@ const childTool = (id: string, parentItemId: string, title: string): UiToolItem 
   parentItemId,
 })
 
-const childText = (id: string, parentItemId: string, text: string): ThreadEntry => ({
+const childText = (id: string, parentItemId: string, text: string): Extract<ThreadEntry, { kind: 'message' }> => ({
   kind: 'message',
   id,
   role: 'assistant',
@@ -576,13 +576,16 @@ describe('subagents — scoped source identities', () => {
     const turns = scopedTurns(scopes)
     for (const [index, id] of ids.entries()) {
       expect(findSubagent(turns, id)).toEqual(collectSubagents(turns)[index])
-      expect(subagentChildren(turns, id)).toEqual([childTool('item_2', 'item_1', `Ran reviewer ${index}`)])
+      expect(subagentChildren(turns, id)).toEqual([{
+        ...childTool('item_2', 'item_1', `Ran reviewer ${index}`),
+        sourceKey: id.replace(/item_1$/, 'item_2'), parentSourceKey: id,
+      }])
     }
   })
 
   it('keeps attributed children across later turns of the same reviewer only', () => {
     const turns = scopedTurns([{ stepId: 'review', sessionKey: 'a' }, { stepId: 'review', sessionKey: 'b' }])
-    turns.push({ id: 'later-a', stepId: 'review', sessionKey: 'a', items: [childText('item_3', 'item_1', 'A follow-up')] })
+    turns.push({ id: 'later-a', stepId: 'review', sessionKey: 'a', items: [{ ...childText('item_3', 'item_1', 'A follow-up'), sourceKey: 'review:a:item_3', parentSourceKey: 'review:a:item_1' }] })
     const agents = collectSubagents(turns)
     expect(agents.map((agent) => agent.activity)).toEqual(['A follow-up', 'Ran reviewer 1'])
     expect(subagentChildren(turns, agents[0]!.id).map((item) => item.id)).toEqual(['item_2', 'item_3'])
@@ -594,5 +597,45 @@ describe('subagents — scoped source identities', () => {
     expect(collectSubagents(turns)).toEqual([{ id: 'a', title: 'review a', status: 'running', toolCalls: 1, activity: 'Ran later' }])
     expect(findSubagent(turns, 'a')).toEqual(collectSubagents(turns)[0])
     expect(subagentChildren(turns, 'a')).toEqual([childTool('c', 'a', 'Ran later')])
+  })
+})
+
+describe('PR #925 issue1: item scopes survive steering', () => {
+  const emit = (seq: number, type: string, rest: Record<string, unknown>): RunEvent =>
+    ({ seq, type, ts: '2026-07-14T12:00:00.000Z', ...rest }) as RunEvent
+
+  it.each([
+    ['check-step-first', emit(1, 'note', { stepId: 'ci', message: 'CI failed — fixing' })],
+    ['earlier-plan context', emit(1, 'plan.updated', { stepId: 'plan', entries: [{ content: 'Old plan', status: 'completed' }] })],
+  ])('joins the dock and sheet after %s then steer', (_name, context) => {
+    const turns = reduceThread([
+      context,
+      emit(2, 'turn.started', { stepId: 'fix', turnId: 'turn_1' }),
+      emit(3, 'item.started', { stepId: 'fix', item: task('agent', 'running') }),
+      emit(4, 'user-message', { text: 'Keep going' }),
+      emit(5, 'turn.started', { stepId: 'fix', turnId: 'turn_2' }),
+      emit(6, 'item.completed', { stepId: 'fix', item: childTool('child', 'agent', 'Ran after steering') }),
+    ]).turns
+    expect(collectSubagents(turns)[0]?.toolCalls).toBe(1)
+    expect(collectSubagents(turns)[0]?.id).toBe('fix:agent')
+    expect(findSubagent(turns, 'fix:agent')).toEqual(collectSubagents(turns)[0])
+    expect(subagentChildren(turns, 'fix:agent')).toMatchObject([childTool('child', 'agent', 'Ran after steering')])
+  })
+
+  it('guard: PR #925 issue1 keeps council children separated after steering', () => {
+    const turns = reduceThread([
+      emit(1, 'turn.started', { stepId: 'review', sessionKey: 'a', turnId: 'turn_1' }),
+      emit(2, 'turn.started', { stepId: 'review', sessionKey: 'b', turnId: 'turn_1' }),
+      emit(3, 'item.started', { stepId: 'review', sessionKey: 'a', item: task('agent', 'running') }),
+      emit(4, 'item.started', { stepId: 'review', sessionKey: 'b', item: task('agent', 'running') }),
+      emit(5, 'user-message', { text: 'Continue' }),
+      emit(6, 'item.completed', { stepId: 'review', sessionKey: 'a', item: childTool('child', 'agent', 'Ran A') }),
+      emit(7, 'item.completed', { stepId: 'review', sessionKey: 'b', item: childTool('child', 'agent', 'Ran B') }),
+    ]).turns
+    expect(collectSubagents(turns).map(({ id, toolCalls, activity }) => [id, toolCalls, activity])).toEqual([
+      ['review:a:agent', 1, 'Ran A'], ['review:b:agent', 1, 'Ran B'],
+    ])
+    expect(subagentChildren(turns, 'review:a:agent')).toMatchObject([childTool('child', 'agent', 'Ran A')])
+    expect(subagentChildren(turns, 'review:b:agent')).toMatchObject([childTool('child', 'agent', 'Ran B')])
   })
 })

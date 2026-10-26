@@ -110,10 +110,10 @@ describe('reduceThread — item ids across workflow steps', () => {
 
     expect(turns).toHaveLength(2)
     expect(turns[0]!.items).toEqual([
-      { kind: 'reasoning', id: 'item_1', text: 'Earlier thinking survives.' },
+      { kind: 'reasoning', id: 'item_1', text: 'Earlier thinking survives.', sourceKey: 'initial:item_1' },
     ])
     expect(turns[1]!.items).toEqual([
-      { kind: 'message', id: 'item_1', role: 'assistant', text: 'Resumed response.' },
+      { kind: 'message', id: 'item_1', role: 'assistant', text: 'Resumed response.', sourceKey: 'resume:item_1' },
     ])
   })
 
@@ -132,8 +132,8 @@ describe('reduceThread — item ids across workflow steps', () => {
     ])
 
     expect(turns).toHaveLength(2)
-    expect(turns[0]!.items).toEqual([{ kind: 'message', id: 'item_1', role: 'assistant', text: 'Reviewer A.' }])
-    expect(turns[1]!.items).toEqual([{ kind: 'message', id: 'item_1', role: 'assistant', text: 'Reviewer B.' }])
+    expect(turns[0]!.items).toEqual([{ kind: 'message', id: 'item_1', role: 'assistant', text: 'Reviewer A.', sourceKey: 'review:a:item_1' }])
+    expect(turns[1]!.items).toEqual([{ kind: 'message', id: 'item_1', role: 'assistant', text: 'Reviewer B.', sourceKey: 'review:b:item_1' }])
     expect(turns[0]!.completed).toBeDefined()
     expect(turns[1]!.completed).toBeUndefined()
   })
@@ -158,7 +158,7 @@ describe('reduceThread — item ids across workflow steps', () => {
       line(5, 'item.completed', { item: { kind: 'message', id: 'item_1', role: 'assistant', text: 'B' }, ...at('b') }),
     ])
     expect(turns[0]!.items).toContainEqual(expect.objectContaining(expected))
-    expect(turns[1]!.items).toEqual([{ kind: 'message', id: 'item_1', role: 'assistant', text: 'B' }])
+    expect(turns[1]!.items).toEqual([{ kind: 'message', id: 'item_1', role: 'assistant', text: 'B', sourceKey: 'review:b:item_1' }])
   })
 
   it('routes plan snapshots to their concurrent reviewer', () => {
@@ -665,6 +665,7 @@ describe('reduceThread — check-output (check steps, v1-only by nature)', () =>
     expect(turns[0]!.items[1]).toEqual({
       kind: 'tool',
       id: 'v1:2',
+      sourceKey: 'verify:v1:2',
       name: 'check',
       toolKind: 'execute',
       title: 'Ran npm test',

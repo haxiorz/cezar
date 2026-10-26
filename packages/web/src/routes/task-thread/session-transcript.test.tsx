@@ -628,3 +628,62 @@ describe('SessionTranscript', () => {
     expect(document.querySelector('[data-slot="codex-empty"]')?.textContent).toBe('No attributed output')
   })
 })
+
+describe('PR #925 issue2: phase completion rows', () => {
+  it('puts the previous phase finish before the next divider without changing keys', () => {
+    const thread = reduceThread(asRunEvents([
+      { type: 'turn.started', stepId: 'spec', turnId: 'spec-turn' },
+      { type: 'item.completed', stepId: 'spec', item: { kind: 'message', id: 'answer', role: 'assistant', text: 'Specified' } },
+      { type: 'turn.completed', stepId: 'spec', turnId: 'spec-turn', ts: '2026-07-31T00:04:00.000Z' },
+      { type: 'step-start', stepId: 'review' },
+      { type: 'turn.started', stepId: 'review', turnId: 'review-turn' },
+      { type: 'item.completed', stepId: 'review', item: { kind: 'message', id: 'review', role: 'assistant', text: 'Reviewing' } },
+    ]), { stepNames: new Map([['spec', 'Specify'], ['review', 'Review']]) })
+    const rows = buildTranscriptRows(mainTranscriptSections(run({ task: '' }), thread), 'r1')
+    expect(rows.map((row) => row.key)).toEqual([
+      'turn-seq-1:answer', 'turn-seq-1:turn-time', 'turn-seq-1:step-start:4', 'turn-seq-5:review',
+    ])
+    expect(rows[1]?.content).toMatchObject({ kind: 'turn-time', completedAt: '2026-07-31T00:04:00.000Z' })
+  })
+
+  it('guard: PR #925 issue2 keeps an ordinary turn finish after all entries', () => {
+    const sections: TranscriptSection[] = [{
+      id: 'ordinary', completedAt: '2026-07-31T00:04:00.000Z',
+      entries: [
+        { kind: 'message', id: 'answer', role: 'assistant', text: 'Done' },
+        { kind: 'note', id: 'note', tone: 'dim', text: 'Session finished' },
+      ],
+    }]
+    expect(buildTranscriptRows(sections, 'r1').map((row) => row.key)).toEqual([
+      'ordinary:answer', 'ordinary:note', 'ordinary:turn-time',
+    ])
+  })
+
+  it('guard: PR #925 issue2 keeps the first phase heading above its own finish', () => {
+    const thread = reduceThread(asRunEvents([
+      { type: 'step-start', stepId: 'spec' },
+      { type: 'turn.started', stepId: 'spec', turnId: 'spec-turn' },
+      { type: 'item.completed', stepId: 'spec', item: { kind: 'message', id: 'answer', role: 'assistant', text: 'Specified' } },
+      { type: 'turn.completed', stepId: 'spec', turnId: 'spec-turn' },
+    ]), { stepNames: new Map([['spec', 'Specify']]), atHistoryStart: true })
+    const rows = buildTranscriptRows(mainTranscriptSections(run({ task: '' }), thread), 'r1')
+    expect(rows.map((row) => row.content.kind === 'block' ? row.content.block.id : row.content.kind)).toEqual([
+      'step-start:1', 'answer', 'turn-time',
+    ])
+  })
+
+  it('keeps a complete history finish between its first heading and the next phase divider', () => {
+    const thread = reduceThread(asRunEvents([
+      { type: 'step-start', stepId: 'spec' },
+      { type: 'turn.started', stepId: 'spec', turnId: 'spec-turn' },
+      { type: 'item.completed', stepId: 'spec', item: { kind: 'message', id: 'answer', role: 'assistant', text: 'Specified' } },
+      { type: 'turn.completed', stepId: 'spec', turnId: 'spec-turn' },
+      { type: 'step-start', stepId: 'review' },
+      { type: 'turn.started', stepId: 'review', turnId: 'review-turn' },
+    ]), { stepNames: new Map([['spec', 'Specify'], ['review', 'Review']]), atHistoryStart: true })
+    const rows = buildTranscriptRows(mainTranscriptSections(run({ task: '' }), thread), 'r1')
+    expect(rows.map((row) => row.content.kind === 'block' ? row.content.block.id : row.content.kind)).toEqual([
+      'step-start:1', 'answer', 'turn-time', 'step-start:5',
+    ])
+  })
+})

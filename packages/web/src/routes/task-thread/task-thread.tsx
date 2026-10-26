@@ -116,12 +116,12 @@ export function TaskThreadRoute() {
     [harnessSteps],
   )
   const thread = useMemo(
-    () => reduceThread(history.visibleEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames, askAsProse: stepNames !== undefined }),
-    [history.visibleEvents, runStatus, run.data?.runner, stepNames],
+    () => reduceThread(history.visibleEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames, askAsProse: stepNames !== undefined, atHistoryStart: !history.hasOlder }),
+    [history.visibleEvents, runStatus, run.data?.runner, stepNames, history.hasOlder],
   )
   const currentThread = useMemo(
-    () => reduceThread(history.currentEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames, askAsProse: stepNames !== undefined }),
-    [history.currentEvents, runStatus, run.data?.runner, stepNames],
+    () => reduceThread(history.currentEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames, askAsProse: stepNames !== undefined, atHistoryStart: !history.hasOlder }),
+    [history.currentEvents, runStatus, run.data?.runner, stepNames, history.hasOlder],
   )
 
   // Read receipt (#unread-done-items): opening a finished task's thread marks it read — the same
@@ -894,15 +894,20 @@ function HistoryBoundary({
 export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefined {
   const last = thread.turns.at(-1)
   if (last === undefined) return run.startedAt
-  // PR #925 review: the last-started reviewer may finish before its peers.
-  if (last.sessionKey !== undefined) {
+  // Driver notes can trail the reviewers; their clocks still belong to the council (PR #925 review).
+  if (last.sessionKey !== undefined || (last.stepId !== undefined && last.turnId === undefined && last.userMessage === undefined && last.startedAt === undefined)) {
     const peers = thread.turns.filter((turn) => turn.sessionKey !== undefined && turn.stepId === last.stepId)
-    const open = peers.find((turn) => turn.completed === undefined)
-    if (open !== undefined) return open.startedAt ?? run.startedAt
-    return peers.reduce<string | undefined>((latest, turn) => {
-      const endedAt = turn.completed?.ts
-      return endedAt !== undefined && (latest === undefined || Date.parse(endedAt) > Date.parse(latest)) ? endedAt : latest
-    }, undefined) ?? run.startedAt
+    if (peers.length > 0) {
+      const open = peers.filter((turn) => turn.completed === undefined && turn.sessionEnded === undefined)
+      if (open.length > 0) return open.reduce<string | undefined>((earliest, turn) => {
+        const startedAt = turn.startedAt
+        return startedAt !== undefined && (earliest === undefined || Date.parse(startedAt) < Date.parse(earliest)) ? startedAt : earliest
+      }, undefined) ?? run.startedAt
+      return peers.reduce<string | undefined>((latest, turn) => {
+        const endedAt = turn.sessionEnded?.ts ?? turn.completed?.ts
+        return endedAt !== undefined && (latest === undefined || Date.parse(endedAt) > Date.parse(latest)) ? endedAt : latest
+      }, undefined) ?? run.startedAt
+    }
   }
   if (last.completed === undefined) return last.startedAt ?? run.startedAt
   return last.completed.ts ?? run.startedAt

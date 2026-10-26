@@ -44,6 +44,8 @@ export interface ThreadNote {
   tone: 'dim' | 'danger'
   /** A synthetic harness phase boundary (2026-07-29), rendered as a step divider. */
   marker?: 'step-start'
+  /** The first heading has no preceding phase to finish (PR #925 review). */
+  initialStep?: boolean
 }
 
 /** An image the run persisted (v1 `image` line: served from `/api/runs/:id/images/…`). */
@@ -88,8 +90,14 @@ export interface ThreadAgentUpdateRequired {
   provider: ThreadProviderAuthRequired['provider']
 }
 
+type ScopedItem = UiItem & {
+  /** The item's own event scope, independent of its turn (PR #925 review). */
+  sourceKey?: string
+  parentSourceKey?: string
+}
+
 export type ThreadEntry =
-  | UiItem
+  | ScopedItem
   | ThreadNote
   | ThreadImage
   | ThreadAsk
@@ -102,7 +110,7 @@ export interface ThreadTurn {
   id: string
   /** The protocol-v2 turnId, once known. */
   turnId?: string
-  /** Source scope for cross-turn agent joins (PR #925 review). */
+  /** The phase and concurrent reviewer owning this turn (PR #925 review). */
   stepId?: string
   sessionKey?: string
   /** The v1 `user-message` that opened this turn. The FIRST turn usually has none — the initial
@@ -118,6 +126,8 @@ export interface ThreadTurn {
   /** Latest `plan.updated` snapshot seen during this turn (full-replacement semantics). */
   planEntries?: PlanEntry[]
   completed?: { stopReason: StopReason; costUsd?: number; ts?: string }
+  /** Session closure can arrive without a turn completion (PR #925 review). */
+  sessionEnded?: { reason: StopReason; message?: string; ts?: string }
 }
 
 export interface ThreadState {
@@ -139,6 +149,8 @@ export interface ThreadReduceOptions {
   /** A harness run's step names by id: its phases share turns, so each phase boundary gets a
    *  divider labelled with the phase. Absent for every other run, whose transcript has none. */
   stepNames?: ReadonlyMap<string, string>
+  /** Only a complete history window can label its first phase (PR #925 review). */
+  atHistoryStart?: boolean
   /** A harness run: its phase sessions never render an ask card, so a cardless `CEZ:ASK` reads as
    *  its questions (user reports 2026-07-27/28). Every other run keeps the raw fallback (#757). */
   askAsProse?: boolean
@@ -227,6 +239,7 @@ interface DraftTurn {
   entries: DraftEntry[]
   planEntries?: PlanEntry[]
   completed?: { stopReason: StopReason; costUsd?: number; ts?: string }
+  sessionEnded?: ThreadTurn['sessionEnded']
   /** True once any v2 `item.*` event landed in this turn — the dedup latch. */
   v2Items: boolean
   /** The concurrent council session this turn belongs to, when it has one. */
@@ -459,8 +472,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
     return turn
   }
   const currentTurn = (): DraftTurn => turns.at(-1) ?? newTurn()
-  /** Each concurrent council session's open turn, so interleaved reviewers never write into each
-   *  other's turn (PR #925 review). An event without a `sessionKey` keeps the single-turn rule. */
+  /** Each concurrent council session's turn (PR #925 review). */
   const sessionTurns = new Map<string, DraftTurn>()
   const sessionOf = (event: RunEvent): string | undefined =>
     typeof event.sessionKey === 'string' ? event.sessionKey : undefined
@@ -472,7 +484,19 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
   }
   const turnFor = (event: RunEvent): DraftTurn => {
     const key = sessionOf(event)
-    const turn = key === undefined ? currentTurn() : sessionTurns.get(key) ?? openSessionTurn(key, event)
+    const stepId = str(event.stepId)
+    let turn: DraftTurn
+    if (key !== undefined) turn = sessionTurns.get(key) ?? openSessionTurn(key, event)
+    else {
+      const current = turns.at(-1)
+      // Driver commentary must not split a reviewer's stream (PR #925 review).
+      const peersOpen = stepId !== undefined && [...sessionTurns.values()].some((peer) =>
+        peer.stepId === stepId && peer.completed === undefined && peer.sessionEnded === undefined,
+      )
+      turn = peersOpen && (current?.sessionKey !== undefined || current?.stepId !== stepId)
+        ? newTurn(event.seq, stepId)
+        : currentTurn()
+    }
     turn.stepId ??= str(event.stepId)
     return turn
   }
@@ -494,9 +518,20 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
     return runItemKey(event.stepId, itemId, event.sessionKey)
   }
 
-  const upsertV2 = (turn: DraftTurn, raw: UiItem, key: string) => {
+  const scopedItem = (event: RunEvent, raw: UiItem): ScopedItem => {
+    const key = itemKey(event, raw.id)
+    return {
+      ...raw,
+      ...(key !== raw.id ? {
+        sourceKey: key,
+        ...(raw.parentItemId !== undefined ? { parentSourceKey: itemKey(event, raw.parentItemId) } : {}),
+      } : {}),
+    }
+  }
+
+  const upsertV2 = (turn: DraftTurn, raw: UiItem, key: string, event: RunEvent) => {
     // Clone: deltas append in place, and the event object off the wire must stay untouched.
-    const item = { ...raw }
+    const item = scopedItem(event, raw)
     if (!turn.v2Items) {
       // The dedup latch flips: this turn is v2-covered, so every v1-synthesized TOOL in it is
       // a duplicate of something v2 already describes (or is about to). Tools can be dropped
@@ -525,16 +560,19 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
     itemsById.set(key, { turn, entry: draft })
   }
 
-  // PR #925 review: the window's first stamped step is context, not a transition.
+  // A partial window's first step is context, not a transition (PR #925 review).
   const stepNames = options.stepNames
   let currentStepId: string | undefined
   for (const event of events) {
     const eventStepId = stepNames ? str(event.stepId) : undefined
     if (stepNames && eventStepId !== undefined && eventStepId !== currentStepId) {
-      if (currentStepId !== undefined) {
+      if (currentStepId !== undefined || options.atHistoryStart === true) {
         currentTurn().entries.push({
           origin: 'meta',
-          entry: { kind: 'note', id: `step-start:${event.seq}`, text: stepDividerLabel(stepNames, eventStepId), tone: 'dim', marker: 'step-start' },
+          entry: {
+            kind: 'note', id: `step-start:${event.seq}`, text: stepDividerLabel(stepNames, eventStepId), tone: 'dim', marker: 'step-start',
+            ...(currentStepId === undefined ? { initialStep: true } : {}),
+          },
         })
       }
       currentStepId = eventStepId
@@ -566,7 +604,11 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         const turnId = str(event.turnId)
         const session = sessionOf(event)
         if (session !== undefined) {
-          const opened = openSessionTurn(session, event)
+          const current = sessionTurns.get(session)
+          const opened = current && current.turnId === undefined && !current.v2Items && current.sessionEnded === undefined
+            ? current
+            : openSessionTurn(session, event)
+          opened.stepId ??= str(event.stepId)
           opened.turnId = turnId
           const sessionStartedAt = stamp(event.ts)
           if (sessionStartedAt !== undefined) opened.startedAt = sessionStartedAt
@@ -576,7 +618,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         // A v1 `user-message` line precedes the v2 turn.started for the same turn (observed
         // wire order) — attach rather than opening a duplicate. A turn that already has a v2
         // identity or v2 items is someone else's; open fresh.
-        const attached = current && current.turnId === undefined && !current.v2Items ? current : newTurn(event.seq, str(event.stepId))
+        const attached = current && current.sessionKey === undefined && current.turnId === undefined && !current.v2Items ? current : newTurn(event.seq, str(event.stepId))
         attached.stepId ??= str(event.stepId)
         attached.turnId = turnId
         // First stamp wins: when the v1 line opened this turn a moment ago, when the user sent
@@ -626,7 +668,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         const item = event.item as unknown as UiItem
         const key = itemKey(event, item.id)
         const located = itemsById.get(key)
-        upsertV2(located?.turn ?? turnFor(event), item, key)
+        upsertV2(located?.turn ?? turnFor(event), item, key, event)
         break
       }
       case 'item.delta': {
@@ -653,7 +695,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         if (text === '') break
         turn.entries.push({
           origin: 'v1',
-          entry: { kind: 'message', id: `v1:${event.seq}`, role: 'assistant', text },
+          entry: scopedItem(event, { kind: 'message', id: `v1:${event.seq}`, role: 'assistant', text }),
         })
         break
       }
@@ -680,7 +722,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
           status: 'running',
           input: event.input,
         }
-        const draft: DraftEntry = { origin: 'v1', entry: item }
+        const draft: DraftEntry = { origin: 'v1', entry: scopedItem(event, item) }
         turn.entries.push(draft)
         itemsById.set(item.id, { turn, entry: draft })
         break
@@ -764,7 +806,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
           output: str(event.text) ?? '',
           exitCode,
         }
-        turnFor(event).entries.push({ origin: 'meta', entry: item })
+        turnFor(event).entries.push({ origin: 'meta', entry: scopedItem(event, item) })
         break
       }
       case 'provider-auth-required': {
@@ -809,6 +851,12 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         sessionEnded = {
           reason: (str(event.reason) ?? 'end_turn') as StopReason,
           ...(str(event.message) !== undefined ? { message: str(event.message) } : {}),
+        }
+        const key = sessionOf(event)
+        const turn = key === undefined ? undefined : sessionTurns.get(key)
+        if (turn) {
+          const ts = stamp(event.ts)
+          turn.sessionEnded = { ...sessionEnded, ...(ts !== undefined ? { ts } : {}) }
         }
         break
       }
@@ -904,6 +952,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         ...(draft.startedAt !== undefined ? { startedAt: draft.startedAt } : {}),
         ...(draft.planEntries !== undefined ? { planEntries: draft.planEntries } : {}),
         ...(draft.completed !== undefined ? { completed: draft.completed } : {}),
+        ...(draft.sessionEnded !== undefined ? { sessionEnded: draft.sessionEnded } : {}),
         items: draft.entries.map(({ entry }) =>
           entry.kind === 'message' && entry.role === 'assistant'
             ? { ...entry, text: stripDoneMarker(entry.text, hasAskCard || provisionalAsk, options.askAsProse) }

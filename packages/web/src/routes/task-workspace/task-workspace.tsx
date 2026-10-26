@@ -947,12 +947,12 @@ export function ConversationColumn({
     [harnessSteps],
   )
   const thread = useMemo(
-    () => reduceThread(history.visibleEvents, { activeTurn: run.status === 'running', runner: run.runner, stepNames, askAsProse: stepNames !== undefined }),
-    [history.visibleEvents, run.status, run.runner, stepNames],
+    () => reduceThread(history.visibleEvents, { activeTurn: run.status === 'running', runner: run.runner, stepNames, askAsProse: stepNames !== undefined, atHistoryStart: !history.hasOlder }),
+    [history.visibleEvents, run.status, run.runner, stepNames, history.hasOlder],
   )
   const currentThread = useMemo(
-    () => reduceThread(history.currentEvents, { activeTurn: run.status === 'running', runner: run.runner, stepNames, askAsProse: stepNames !== undefined }),
-    [history.currentEvents, run.status, run.runner, stepNames],
+    () => reduceThread(history.currentEvents, { activeTurn: run.status === 'running', runner: run.runner, stepNames, askAsProse: stepNames !== undefined, atHistoryStart: !history.hasOlder }),
+    [history.currentEvents, run.status, run.runner, stepNames, history.hasOlder],
   )
   useRunRecordReconcile(run, history.visibleEvents)
 
