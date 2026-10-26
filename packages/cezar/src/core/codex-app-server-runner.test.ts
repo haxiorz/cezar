@@ -148,6 +148,8 @@ describe('a teardown cezar initiated (codex app-server)', () => {
       expect(codexStageOnlyArgs(cwd, { CODEX_HOME: home }, '/out')).toEqual([
         '-c', 'sandbox_workspace_write.writable_roots=["/out"]',
         '-c', 'sandbox_workspace_write.network_access=false',
+        '-c', 'sandbox_workspace_write.exclude_slash_tmp=true',
+        '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true',
         '-c', 'mcp_servers.github.enabled=false',
         '-c', 'mcp_servers.Figma Desktop.enabled=false',
         '-c', 'mcp_servers.docs-2.enabled=false',
@@ -155,6 +157,22 @@ describe('a teardown cezar initiated (codex app-server)', () => {
       // `-c` cannot address a dotted name: refuse rather than leave that server live.
       writeFileSync(join(home, 'config.toml'), '[mcp_servers."odd.name"]\ncommand = "x"\n');
       expect(() => codexStageOnlyArgs(cwd, { CODEX_HOME: home }, '/out')).toThrow(/cannot disable MCP server "odd.name"/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  // PR #925 review: on Linux a stage-only phase could write /tmp, where cezar's own scratch files
+  // live, and plant a link for the unsandboxed server to follow.
+  it('keeps the shared temp dirs out of a stage-only phase, but not the run\'s own TMPDIR', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cez-codex-home-'));
+    const cwd = mkdtempSync(join(tmpdir(), 'cez-codex-cwd-'));
+    try {
+      const args = codexStageOnlyArgs(cwd, { CODEX_HOME: home, TMPDIR: '/data/tmp/run-1' }, '/out');
+      expect(args).toContain('sandbox_workspace_write.exclude_slash_tmp=true');
+      expect(args).toContain('sandbox_workspace_write.exclude_tmpdir_env_var=true');
+      expect(args).toContain('sandbox_workspace_write.writable_roots=["/out","/data/tmp/run-1"]');
     } finally {
       rmSync(home, { recursive: true, force: true });
       rmSync(cwd, { recursive: true, force: true });

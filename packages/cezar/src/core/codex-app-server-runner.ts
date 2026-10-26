@@ -859,11 +859,19 @@ export function codexStageOnlyArgs(cwd: string, env: Record<string, string> | un
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
+  // `/tmp` and the host TMPDIR are shared with cezar itself, which writes scratch files there: a phase
+  // could plant a link for it to follow (PR #925 review). The run's own TMPDIR, which only cezar's
+  // env overlay sets (agent-tmpdir.ts), stays writable.
+  const writableRoots = [outputDir, ...(env?.TMPDIR ? [env.TMPDIR] : [])];
   const args = [
     '-c',
-    `sandbox_workspace_write.writable_roots=${JSON.stringify([outputDir])}`,
+    `sandbox_workspace_write.writable_roots=${JSON.stringify(writableRoots)}`,
     '-c',
     'sandbox_workspace_write.network_access=false',
+    '-c',
+    'sandbox_workspace_write.exclude_slash_tmp=true',
+    '-c',
+    'sandbox_workspace_write.exclude_tmpdir_env_var=true',
   ];
   for (const name of names) {
     // `-c` splits its path on "." and its value on "="; spaces are fine (an argv element, no shell).
