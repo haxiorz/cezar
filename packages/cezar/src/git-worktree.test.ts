@@ -432,8 +432,9 @@ describe('worktreeShortstat (real git)', () => {
           .split('\n')
           .filter((line) => line.includes('\tdiff --shortstat '));
         expect(seen.length).toBeGreaterThan(0);
+        // Each scratch index sits in its own private directory (PR #925 review).
         expect(
-          seen.every((line) => line.startsWith(`${tmpdir()}/cez-wt-scratch-${process.pid}-`)),
+          seen.every((line) => line.startsWith(`${tmpdir()}/cez-scratch-`) && line.split('\t')[0]!.endsWith('/index')),
         ).toBe(true);
       },
     );

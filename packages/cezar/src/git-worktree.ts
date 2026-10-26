@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process';
-import { existsSync, realpathSync, type Dirent } from 'node:fs';
-import { copyFile, readdir, readFile, rm, stat, utimes } from 'node:fs/promises';
+import { constants, existsSync, realpathSync, type Dirent } from 'node:fs';
+import { copyFile, lstat, mkdtemp, readdir, readFile, rm, stat, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { resolveTaskDiffBase } from './git-diff-base.ts';
 import { pinnedGitEnv } from './git-pin.ts';
 import { isSafeGitRef } from './git-refs.ts';
@@ -89,7 +89,16 @@ async function fetchBase(repoRoot: string, remote: string, base: string): Promis
   });
 }
 
-let scratchSeq = 0;
+/** A scratch index path in its own private directory: a predictable name in the shared temp dir
+ *  let a sandboxed phase plant a symlink there for the seeding copy to write through (PR #925
+ *  review). Dispose with `disposeScratchIndexPath`. */
+export async function scratchIndexPath(): Promise<string> {
+  return join(await mkdtemp(join(tmpdir(), 'cez-scratch-')), 'index');
+}
+
+export async function disposeScratchIndexPath(path: string): Promise<void> {
+  await rm(dirname(path), { recursive: true, force: true }).catch(() => {});
+}
 
 /**
  * Seed a scratch index at `target` from a COPY of `dir`'s real index. The copy keeps the stat
@@ -98,17 +107,21 @@ let scratchSeq = 0;
  * Changes read). `read-tree HEAD` remains the fallback when there is no index to copy.
  */
 export async function seedScratchIndex(dir: string, target: string): Promise<boolean> {
+  // The seed creates `target`, never writes over one: a copy and git's own index lock both follow
+  // a link already at that path (PR #925 review).
+  if (await lstat(target).then(() => true, () => false)) return false;
   const where = await git(dir, ['rev-parse', '--git-path', 'index']);
   if (where.ok && where.stdout.trim()) {
     const source = resolve(dir, where.stdout.trim());
     try {
       const { atime, mtime } = await stat(source);
-      await copyFile(source, target);
+      await copyFile(source, target, constants.COPYFILE_EXCL);
       // Racy-git judges entries against the index file's own mtime; keep the real one.
       await utimes(target, atime, mtime);
       return true;
     } catch {
-      // No index yet (a fresh repo): seed from HEAD below.
+      // No index yet (a fresh repo): seed from HEAD below, unless the copy lost a race for `target`.
+      if (await lstat(target).then(() => true, () => false)) return false;
     }
   }
   const seeded = await git(dir, ['read-tree', 'HEAD'], { env: { ...process.env, GIT_INDEX_FILE: target } });
@@ -137,8 +150,8 @@ interface ScratchIndex {
 }
 
 async function scratchIndex(worktreePath: string): Promise<ScratchIndex | null> {
-  scratchSeq += 1;
-  const path = join(tmpdir(), `cez-wt-scratch-${process.pid}-${scratchSeq}`);
+  const path = await scratchIndexPath().catch(() => null);
+  if (!path) return null;
   const env = { ...process.env, GIT_INDEX_FILE: path };
   let ready = false;
   try {
@@ -151,12 +164,12 @@ async function scratchIndex(worktreePath: string): Promise<ScratchIndex | null> 
     // Seeding can create the file before failing. A failed setup has no
     // caller-owned handle, so dispose it here; successful handles are removed
     // after the last diff that uses them.
-    if (!ready) await rm(path, { force: true }).catch(() => {});
+    if (!ready) await disposeScratchIndexPath(path);
   }
 }
 
 async function disposeScratchIndex(scratch: ScratchIndex | null): Promise<void> {
-  if (scratch) await rm(scratch.path, { force: true }).catch(() => {});
+  if (scratch) await disposeScratchIndexPath(scratch.path);
 }
 
 export function branchFor(runId: string): string {

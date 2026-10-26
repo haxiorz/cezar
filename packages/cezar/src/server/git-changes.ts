@@ -1,13 +1,18 @@
 import { execFile } from 'node:child_process';
-import { rmSync } from 'node:fs';
 import { lstat, open, readFile, readdir, realpath, stat } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { CEZAR_DATA_EXCLUDE } from '../data-gitignore.ts';
 import { resolveTaskDiffBase, type RepointedHead } from '../git-diff-base.ts';
 import { isSafeGitRef } from '../git-refs.ts';
 import { resolveTaskRemotes, splitRemoteRef } from '../git-remotes.ts';
-import { branchesCheckedOutElsewhere, gitHasIdentity, seedScratchIndex, unresolvedConflicts } from '../git-worktree.ts';
+import {
+  branchesCheckedOutElsewhere,
+  disposeScratchIndexPath,
+  gitHasIdentity,
+  scratchIndexPath,
+  seedScratchIndex,
+  unresolvedConflicts,
+} from '../git-worktree.ts';
 import { pinnedGitEnv } from '../git-pin.ts';
 
 /**
@@ -301,7 +306,8 @@ export async function collectChanges(
   let scratchIndex: string | undefined;
   try {
     if (opts.intentToAdd !== true) {
-      scratchIndex = join(tmpdir(), `cez-scratch-index-${process.pid}-${scratchSeq++}`);
+      scratchIndex = await scratchIndexPath().catch(() => undefined);
+      if (!scratchIndex) return { ok: false, error: 'could not create a scratch index in the temp directory' };
       env = { GIT_INDEX_FILE: scratchIndex };
       await seedScratchIndex(dir, scratchIndex); // tracked files + stat cache; harmless if no HEAD
       await git(dir, ['add', '-N', '.'], env);
@@ -350,13 +356,9 @@ export async function collectChanges(
       },
     };
   } finally {
-    if (scratchIndex) rmSync(scratchIndex, { force: true });
+    if (scratchIndex) await disposeScratchIndexPath(scratchIndex);
   }
 }
-
-/** Monotonic suffix for scratch index files, so concurrent /api/repo/changes calls never share
- *  one (each is cleaned up in the finally above). */
-let scratchSeq = 0;
 
 /** The three raw `git diff` listings (name-status, numstat, patch) → the `{files, stat}`
  *  payload. Shared by the working-tree diff above and the commit diff below. Each file's
