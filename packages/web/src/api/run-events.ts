@@ -43,8 +43,11 @@ function rememberSeq(seqs: Set<number>, seq: number): void {
 
 export type RunEventCompaction = readonly number[]
 
-export function runItemKey(stepId: unknown, itemId: string): string {
-  return typeof stepId === 'string' ? `${stepId}:${itemId}` : itemId
+/** Concurrent council sessions share a step and restart their ids, so their `sessionKey` is part
+ *  of an item's identity (PR #925 review). */
+export function runItemKey(stepId: unknown, itemId: string, sessionKey?: unknown): string {
+  const scoped = typeof sessionKey === 'string' ? `${sessionKey}:${itemId}` : itemId
+  return typeof stepId === 'string' ? `${stepId}:${scoped}` : scoped
 }
 
 export function liveItemKey(event: RunEvent): string | undefined {
@@ -54,7 +57,7 @@ export function liveItemKey(event: RunEvent): string | undefined {
       ? (event.item as { id?: unknown }).id
       : undefined
   return typeof itemId === 'string' && itemId !== ''
-    ? runItemKey(event.stepId, itemId)
+    ? runItemKey(event.stepId, itemId, event.sessionKey)
     : undefined
 }
 

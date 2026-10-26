@@ -39,6 +39,13 @@ export class HistoryCursorError extends Error {
   }
 }
 
+/** One item's identity: concurrent council sessions share a step and restart their ids, so their
+ *  `sessionKey` keeps them apart (PR #925 review). */
+function itemIdentity(event: { stepId?: unknown; sessionKey?: unknown }, id: string): string {
+  const session = typeof event.sessionKey === 'string' ? `${event.sessionKey}:` : '';
+  return `${typeof event.stepId === 'string' ? event.stepId : ''}:${session}${id}`;
+}
+
 function encodeCursor(value: z.infer<typeof pageCursorSchema> | z.infer<typeof liveCursorSchema>): string {
   return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
 }
@@ -201,7 +208,7 @@ export function canonicalSessionItems(events: readonly RunEvent[]): CanonicalIte
         const id = (raw as { id?: unknown }).id;
         if (typeof id === 'string' && id !== '') {
           turnHasV2 = true;
-          upsert(`v2:${event.stepId ?? ''}:${id}`, event);
+          upsert(`v2:${itemIdentity(event, id)}`, event);
           const item = raw as { kind?: unknown; text?: unknown };
           if (item.kind === 'message' && typeof item.text === 'string') v2Texts.push(item.text);
         }
@@ -603,7 +610,7 @@ function foldContextEvent(fold: ContextFold, event: RunHistoryEvent): void {
   const parentId = typeof item.parentItemId === 'string' ? item.parentItemId : undefined;
   const isRoot = item.toolKind === 'task' && parentId === undefined;
   if (!isRoot && parentId === undefined) return;
-  const key = `${event.stepId ?? ''}:${item.id}`;
+  const key = itemIdentity(event, item.id);
   const collection = isRoot ? fold.roots : fold.children;
   const existing = collection.get(key);
   const next: ContextItem = existing

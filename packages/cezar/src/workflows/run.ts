@@ -7249,6 +7249,13 @@ export class RunManager {
   ): Promise<string | null> {
     const resumeStep = graphHooks?.usageLimitResume;
     const concurrentPhase = opts.concurrent === true;
+    // Concurrent council sessions share one step and each mints `item_1`, `turn_1`…: every event of
+    // one carries its own key, so the transcript can tell them apart (PR #925 review).
+    const sessionKey = concurrentPhase ? randomUUID().slice(0, 8) : undefined;
+    if (sessionKey) {
+      const stepEmit = emit;
+      emit = (event) => stepEmit({ ...event, sessionKey });
+    }
     let liveSession: AgentSession | undefined;
     let systemPrompt: string | undefined;
     // An attachment-only task (telemetry 18c930de) — the note stands in for the missing text, so a
@@ -7372,7 +7379,7 @@ export class RunManager {
     };
     let turnText = '';
     let sessionError: string | undefined;
-    const sink = this.makeUiSink(runId, step.id);
+    const sink = this.makeUiSink(runId, step.id, sessionKey);
     const resumeGuard = new ResumeFallback(
       graphHooks?.resumeSessionId !== undefined,
       (event) => emit({ ...event, stepId: step.id }),
@@ -7952,10 +7959,11 @@ export class RunManager {
    * guardrails). One sink per session: cumulative usage dedup and the
    * item-shape cache are session-scoped, like the mapper state feeding them.
    */
-  private makeUiSink(runId: string, stepId: string): UiEventSink {
+  private makeUiSink(runId: string, stepId: string, sessionKey?: string): UiEventSink {
+    const stamp = sessionKey ? { stepId, sessionKey } : { stepId };
     return new UiEventSink({
-      persist: (event) => this.store.appendEvent(runId, { ...event, stepId }),
-      emitLive: (event) => this.store.emitEphemeral(runId, { ...event, stepId }),
+      persist: (event) => this.store.appendEvent(runId, { ...event, ...stamp }),
+      emitLive: (event) => this.store.emitEphemeral(runId, { ...event, ...stamp }),
     });
   }
 

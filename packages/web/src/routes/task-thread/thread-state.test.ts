@@ -117,6 +117,27 @@ describe('reduceThread — item ids across workflow steps', () => {
     ])
   })
 
+  // PR #925 review: concurrent council reviewers share a step and each mints `item_1`/`turn_1`,
+  // so one reviewer's text overwrote the other's and turns closed out of order.
+  it('keeps interleaved council sessions in their own turns', () => {
+    const at = (sessionKey: string) => ({ stepId: 'review', sessionKey })
+    const { turns } = reduceThread([
+      line(1, 'turn.started', { turnId: 'turn_1', ...at('a') }),
+      line(2, 'turn.started', { turnId: 'turn_1', ...at('b') }),
+      line(3, 'item.started', { item: { kind: 'message', id: 'item_1', role: 'assistant', text: '' }, ...at('a') }),
+      line(4, 'item.started', { item: { kind: 'message', id: 'item_1', role: 'assistant', text: '' }, ...at('b') }),
+      line(5, 'item.delta', { itemId: 'item_1', field: 'text', delta: 'Reviewer A.', ...at('a') }),
+      line(6, 'item.delta', { itemId: 'item_1', field: 'text', delta: 'Reviewer B.', ...at('b') }),
+      line(7, 'turn.completed', { turnId: 'turn_1', stopReason: 'end_turn', ...at('a') }),
+    ])
+
+    expect(turns).toHaveLength(2)
+    expect(turns[0]!.items).toEqual([{ kind: 'message', id: 'item_1', role: 'assistant', text: 'Reviewer A.' }])
+    expect(turns[1]!.items).toEqual([{ kind: 'message', id: 'item_1', role: 'assistant', text: 'Reviewer B.' }])
+    expect(turns[0]!.completed).toBeDefined()
+    expect(turns[1]!.completed).toBeUndefined()
+  })
+
   it('retains bare-id lifecycle updates for legacy events without stepId', () => {
     const { turns } = reduceThread([
       line(1, 'turn.started', { turnId: 'turn_1' }),

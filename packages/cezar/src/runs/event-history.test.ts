@@ -47,6 +47,20 @@ describe('canonicalSessionItems', () => {
     ]);
   });
 
+  // PR #925 review: concurrent council sessions share a step and restart their item ids.
+  it('keeps the same item id from two council sessions apart', () => {
+    const item = (seq: number, sessionKey: string) => ({
+      seq,
+      ts: 'x',
+      type: 'item.completed',
+      stepId: 'review',
+      sessionKey,
+      item: { kind: 'message', id: 'item_1', role: 'assistant', text: `from ${sessionKey}` },
+    });
+    const events = [item(1, 'a'), item(2, 'b')] as RunEvent[];
+    expect(canonicalSessionItems(events).map(({ key }) => key)).toEqual(['v2:review:a:item_1', 'v2:review:b:item_1']);
+  });
+
   it('suppresses exact and fragmented v1 text twins using the reducer evidence', () => {
     const events = [
       { seq: 1, ts: 'x', type: 'turn.started', turnId: 't1' },

@@ -225,6 +225,8 @@ interface DraftTurn {
   completed?: { stopReason: StopReason; costUsd?: number; ts?: string }
   /** True once any v2 `item.*` event landed in this turn — the dedup latch. */
   v2Items: boolean
+  /** The concurrent council session this turn belongs to, when it has one. */
+  sessionKey?: string
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -452,6 +454,22 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
     return turn
   }
   const currentTurn = (): DraftTurn => turns.at(-1) ?? newTurn()
+  /** Each concurrent council session's open turn, so interleaved reviewers never write into each
+   *  other's turn (PR #925 review). An event without a `sessionKey` keeps the single-turn rule. */
+  const sessionTurns = new Map<string, DraftTurn>()
+  const sessionOf = (event: RunEvent): string | undefined =>
+    typeof event.sessionKey === 'string' ? event.sessionKey : undefined
+  const openSessionTurn = (key: string, sourceSeq?: number): DraftTurn => {
+    const turn = newTurn(sourceSeq)
+    turn.sessionKey = key
+    sessionTurns.set(key, turn)
+    return turn
+  }
+  const turnFor = (event: RunEvent): DraftTurn => {
+    const key = sessionOf(event)
+    if (key === undefined) return currentTurn()
+    return sessionTurns.get(key) ?? openSessionTurn(key, event.seq)
+  }
 
   /** The backend of the latest session, which an outdated-CLI error is about. */
   let sessionBackend: ThreadProviderAuthRequired['provider'] | undefined = providerId(options.runner)
@@ -468,7 +486,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
   }
 
   const itemKey = (event: RunEvent, itemId: string) => {
-    return runItemKey(event.stepId, itemId)
+    return runItemKey(event.stepId, itemId, event.sessionKey)
   }
 
   const upsertV2 = (turn: DraftTurn, raw: UiItem, key: string) => {
@@ -544,6 +562,14 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
       }
       case 'turn.started': {
         const turnId = str(event.turnId)
+        const session = sessionOf(event)
+        if (session !== undefined) {
+          const opened = openSessionTurn(session, event.seq)
+          opened.turnId = turnId
+          const sessionStartedAt = stamp(event.ts)
+          if (sessionStartedAt !== undefined) opened.startedAt = sessionStartedAt
+          break
+        }
         const current = turns.at(-1)
         // A v1 `user-message` line precedes the v2 turn.started for the same turn (observed
         // wire order) — attach rather than opening a duplicate. A turn that already has a v2
@@ -560,11 +586,12 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         const turnId = str(event.turnId)
         // Newest match first (lib is ES2022, so no findLast): per-session turn ids repeat
         // across steps, and a completion always belongs to the most recent turn wearing it.
+        const session = sessionOf(event)
         let matched: DraftTurn | undefined
         for (let i = turns.length - 1; i >= 0 && !matched; i -= 1) {
-          if (turns[i]!.turnId === turnId) matched = turns[i]
+          if (turns[i]!.turnId === turnId && turns[i]!.sessionKey === session) matched = turns[i]
         }
-        const turn = matched ?? turns.at(-1)
+        const turn = matched ?? (session === undefined ? turns.at(-1) : sessionTurns.get(session))
         if (turn) {
           const ts = stamp(event.ts)
           turn.completed = {
@@ -596,7 +623,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         const item = event.item as unknown as UiItem
         const key = itemKey(event, item.id)
         const located = itemsById.get(key)
-        upsertV2(located?.turn ?? currentTurn(), item, key)
+        upsertV2(located?.turn ?? turnFor(event), item, key)
         break
       }
       case 'item.delta': {
@@ -618,7 +645,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         // No `v2Items` guard, unlike `tool-call` below: whether this line has a v2 twin is
         // decided by TEXT at the end of the fold, not by the latch. Suppressing it here would
         // lose any prose v2 never described (claude's `msg.result` fallback).
-        const turn = currentTurn()
+        const turn = turnFor(event)
         const text = str(event.text) ?? ''
         if (text === '') break
         turn.entries.push({
@@ -628,7 +655,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         break
       }
       case 'tool-call': {
-        const turn = currentTurn()
+        const turn = turnFor(event)
         if (turn.v2Items) break
         const name = str(event.tool) ?? 'Tool'
         // Codex collaboration bookkeeping has no user-facing meaning. Protocol
