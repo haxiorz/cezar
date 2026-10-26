@@ -110,7 +110,7 @@ describe('watchProviderRuntimeAuthFailures', () => {
     return onInvalidated;
   };
 
-  it('invalidates the step backend for an auth error in a mixed-provider run', () => {
+  it('guard: invalidates the step backend for an auth error in a mixed-provider run', () => {
     const onInvalidated = watch();
     const run = store.createRun({
       title: 'mixed',
@@ -141,6 +141,32 @@ describe('watchProviderRuntimeAuthFailures', () => {
         stepId: 'implement',
       }),
     ]));
+  });
+
+  it.each(['error', 'session.error'])('latches the %s session account even when a sibling last wrote the council step', (type) => {
+    const onInvalidated = watch();
+    const run = store.createRun({ title: 'council', workflow: 'harness-fix-issue', task: 'work', runner: 'codex',
+      steps: [{ id: 'review', name: 'Review', kind: 'agent' }] });
+    store.updateStep(run.id, 'review', { backend: 'codex', profileId: 'wrong-account' });
+    store.appendEvent(run.id, { type, stepId: 'review', sessionKey: 'claude-reviewer', backend: 'claude', profileId: 'work',
+      message: 'OAuth session expired and could not be refreshed' });
+    expect(providerAuth.peekProfileStatus('claude', 'work')).toMatchObject({ status: 'disconnected' });
+    expect(providerAuth.peekProfileStatus('codex', 'wrong-account')?.status).not.toBe('disconnected');
+    expect(onInvalidated).not.toHaveBeenCalled();
+    expect(store.readEvents(run.id).filter((event) => event.type === 'provider-auth-required'))
+      .toEqual([expect.objectContaining({ provider: 'claude', profileId: 'work' })]);
+  });
+
+  it('uses the reviewer default login instead of a named sibling account', () => {
+    const onInvalidated = watch();
+    const run = store.createRun({ title: 'council', workflow: 'harness-fix-issue', task: 'work', runner: 'codex',
+      steps: [{ id: 'review', name: 'Review', kind: 'agent' }] });
+    store.updateStep(run.id, 'review', { backend: 'codex', profileId: 'wrong-account' });
+    store.appendEvent(run.id, { type: 'error', stepId: 'review', sessionKey: 'claude-reviewer', backend: 'claude', profileId: 'default',
+      message: 'OAuth session expired and could not be refreshed' });
+    expect(onInvalidated).toHaveBeenCalledWith(expect.objectContaining({ provider: 'claude', status: 'disconnected' }));
+    expect(store.readEvents(run.id).find((event) => event.type === 'provider-auth-required'))
+      .not.toHaveProperty('profileId');
   });
 
   it('falls back to the run backend when the event has no matching step', () => {

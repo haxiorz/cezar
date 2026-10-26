@@ -111,8 +111,31 @@ describe('a harness run that ends without its driver', () => {
       hydrateQueuedInput: (id: string, input: Parameters<RunManager['startRun']>[1]) => Parameters<RunManager['startRun']>[1];
     };
     expect(internal.hydrateQueuedInput(run.id, internal.pendingJobs.get(run.id)!.input).harness?.issueId).toBe('999');
-    expect(manager.editTask(run.id, 'Fix something')).toBe(false);
+    expect(manager.editTask(run.id, 'Fix something')).toBe(true);
     expect(store.getRun(run.id)?.harness?.issueId).toBe('999');
+  });
+
+  it('retains an explicit issue binding through edits without a text reference', () => {
+    const run = manager.startRun(workflow, { task: 'Fix the crash', harness: { issueId: '642' } });
+    expect(manager.editTask(run.id, 'Fix the startup crash')).toBe(true);
+    expect(store.getRun(run.id)?.harness?.issueId).toBe('642');
+    expect(manager.editTask(run.id, 'Fix issue #999')).toBe(true);
+    expect(store.getRun(run.id)?.harness?.issueId).toBe('999');
+  });
+
+  it('reports a missing issue binding without editing the queued task', () => {
+    const run = manager.startRun(workflow, { task: 'Fix issue #642' });
+    store.updateRun(run.id, { harness: { workflow: workflow.name, profile: 'standard' } });
+    expect(manager.editTask(run.id, 'Fix the crash')).toBe('missing-issue');
+    expect(store.getRun(run.id)?.task).toBe('Fix issue #642');
+  });
+
+  it('guard: ordinary queued task edits still update the prompt and inferred issue', () => {
+    const run = manager.startRun({ name: 'ordinary', source: 'file', steps: [{ id: 'work', prompt: '{{task}}' }] }, { task: 'old' });
+    expect(manager.editTask(run.id, 'Fix issue #123')).toBe(true);
+    expect(store.getRun(run.id)).toMatchObject({ task: 'Fix issue #123', issueNumber: 123 });
+    expect(manager.editTask(run.id, 'new brief')).toBe(true);
+    expect(store.getRun(run.id)?.task).toBe('new brief');
   });
 
   it('keeps the claim of a run parked on its staged handoff', async () => {

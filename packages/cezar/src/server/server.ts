@@ -5674,7 +5674,11 @@ export function createApp(deps: ServerDeps) {
             400,
           );
         }
-        if (!manager.editTask(id, parsed.data.task)) {
+        const edited = manager.editTask(id, parsed.data.task);
+        if (edited === 'missing-issue') {
+          return c.json({ error: 'harness fix workflow requires a concrete issue id' }, 400);
+        }
+        if (!edited) {
           return c.json({ error: 'run already started' }, 409);
         }
       }

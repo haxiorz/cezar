@@ -551,6 +551,8 @@ interface ActiveRun {
   currentStepId?: string;
   /** Only a cezar session can attribute a limit to an account (PR #925 review). */
   usageLimitedAccount?: string;
+  usageLimitedMessage?: string;
+  usageLimitedSessions?: Set<AgentSession>;
   /** Graph node parks with no agent session (spec 2026-09-30-workflow-node-editor, 1c):
    *  `deliverMessage` hands a user's reply to `graphAnswer`, `finish()` calls `graphFinish`,
    *  and a settling dispatch child resolves its entry in `graphChildWaits`. */
@@ -843,9 +845,10 @@ function harnessAccountKey(run: Pick<RunRecord, 'runner' | 'agentProfile'> | und
   return `${backend}:${(backend === run?.runner ? run?.agentProfile : undefined) ?? 'default'}`;
 }
 
-function admissionAccountKeys(run: Parameters<typeof runAccountKey>[0], fallbackRunner: RunnerId): string[] {
+function admissionAccountKeys(run: Parameters<typeof accountHeldFor>[0], fallbackRunner: RunnerId): string[] {
   const roles = run.harness?.roles;
-  if (!roles) return [runAccountKey(run, fallbackRunner)];
+  // A resume must test its own window before gating new role work (PR #925 review).
+  if (!roles || resumeInFlight(run)) return [runAccountKey(run, fallbackRunner)];
   const keys = run.autoResumeAccount ? [run.autoResumeAccount] : [];
   for (const role of [roles.orchestrator, roles.implementer, ...roles.reviewers]) {
     if (role.runner !== 'harness') keys.push(harnessAccountKey(run, role.runner));
@@ -2524,16 +2527,24 @@ export class RunManager {
    *  other task queued behind it (spec 2026-08-03-auto-resume-after-usage-limit). `settleSuccess`
    *  does the same for a run that finishes outright. Every turn-end path calls this: a harness phase
    *  that skipped it held its account for the rest of the run (PR #925 review). */
-  private noteWindowProven(runId: string, account?: string): void {
+  private noteWindowProven(runId: string, account?: string, session?: AgentSession): void {
     const run = this.store.getRun(runId);
     if (run?.autoResumeAttempts === undefined && !(run?.harness && run.autoResumeAccount)) return;
     // Another account's turn proves nothing about the limited one's window (PR #925 review).
     if (run.autoResumeAccount && account && account !== run.autoResumeAccount) return;
+    let pendingAccount: string | undefined;
     if (run.harness) {
       const state = this.active.get(runId);
-      if (state && state.usageLimitedAccount === account) state.usageLimitedAccount = undefined;
+      if (state && state.usageLimitedAccount === account) {
+        // An already-running sibling cannot prove a newly closed window (PR #925 review).
+        if (session && state.usageLimitedSessions?.has(session)) return;
+        state.usageLimitedAccount = undefined;
+        state.usageLimitedMessage = undefined;
+        state.usageLimitedSessions = undefined;
+      }
+      pendingAccount = state?.usageLimitedAccount;
     }
-    this.store.updateRun(runId, { autoResumeAttempts: undefined, autoResumeAccount: undefined });
+    this.store.updateRun(runId, { autoResumeAttempts: undefined, autoResumeAccount: pendingAccount });
   }
 
   /** Fence a continuation failure to the async owner that started it. */
@@ -2614,7 +2625,7 @@ export class RunManager {
     // manager, and a pump reads the hold off the records. Publishing the schedule afterwards
     // left a window — measured as exactly one extra task — where the queue saw a free slot and
     // an account that looked healthy, and started work that was already doomed.
-    this.scheduleAutoResumeIfLimited(runId, state?.usageLimitedAccount);
+    this.scheduleAutoResumeIfLimited(runId, state?.usageLimitedAccount, state?.usageLimitedMessage);
     // A settled CHILD owes its parent a report (spec 2026-09-10-dispatch §Engine — the settle
     // ladder). Here for the same reason the two hooks above are: every terminal transition funnels
     // through this one method, and a parent parked on `monitoring` has no other way to learn that
@@ -3245,14 +3256,14 @@ export class RunManager {
    * which is exactly the pre-feature behavior — except the safety cap, which says so on the
    * transcript, because a run that stops resuming itself needs to explain why.
    */
-  private scheduleAutoResumeIfLimited(runId: string, limitedAccount?: string): void {
+  private scheduleAutoResumeIfLimited(runId: string, limitedAccount?: string, limitedMessage?: string): void {
     if (this.autoResumeTimers.has(runId)) return; // already promised
     const run = this.store.getRun(runId);
     if (!run || run.status !== 'failed') return;
     // Archiving IS resigning from a task. Reviving one because a window happened to reopen would
     // be the feature working against the clearest signal the user can give it.
     if (run.archived) return;
-    const limit = parseUsageLimit(run.error);
+    const limit = parseUsageLimit(run.harness ? limitedMessage ?? run.error : run.error);
     if (!limit) return;
     if (!this.semaphore.autoResumeOnUsageLimit()) return;
     // Harness resumes its ledger; ordinary runs need a session (PR #925 review).
@@ -4222,14 +4233,16 @@ export class RunManager {
    * heuristic title and the PR/issue chips, but never re-runs the LLM namer —
    * it already fired at creation and a second model call per edit is unjustified.
    */
-  editTask(runId: string, task: string): boolean {
+  editTask(runId: string, task: string): boolean | 'missing-issue' {
     if (!this.promptEditable(runId)) return false;
     const run = this.store.getRun(runId);
     if (!run) return false;
     const workflow = this.pendingJobs.get(runId)?.workflow;
     const skillHint = workflow?.steps.find((s) => stepKind(s) === 'agent' && s.skill)?.skill?.trim();
     const refs = refineTaskRefs(extractTaskRefs(task), skillHint);
-    if (run.harness?.workflow === HARNESS_FIX_ISSUE && refs.issueNumber === undefined) return false;
+    // The API may bind an issue independently of the brief (PR #925 review).
+    const issueId = refs.issueNumber === undefined ? run.harness?.issueId : String(refs.issueNumber);
+    if (run.harness?.workflow === HARNESS_FIX_ISSUE && !issueId) return 'missing-issue';
     // Hand-edited titles always win (#389): `user` beats the heuristic, and a
     // `marker` title the agent declared beats it too.
     const keepTitle = run.titleOrigin === 'user' || run.titleOrigin === 'marker';
@@ -4239,7 +4252,7 @@ export class RunManager {
       ...(refs.prNumber !== undefined ? { prNumber: refs.prNumber } : {}),
       ...(refs.issueNumber !== undefined ? { issueNumber: refs.issueNumber } : {}),
       ...(run.harness?.workflow === HARNESS_FIX_ISSUE
-        ? { harness: { ...run.harness, issueId: String(refs.issueNumber) } } : {}),
+        ? { harness: { ...run.harness, issueId } } : {}),
     });
     return true;
   }
@@ -7268,9 +7281,12 @@ export class RunManager {
     // Concurrent council sessions share one step and each mints `item_1`, `turn_1`…: every event of
     // one carries its own key, so the transcript can tell them apart (PR #925 review).
     const sessionKey = concurrentPhase ? randomUUID().slice(0, 8) : undefined;
+    const sessionAttribution = sessionKey
+      ? { sessionKey, backend: step.runner ?? taskBackend, profileId: DEFAULT_AGENT_ACCOUNT_ID }
+      : undefined;
     if (sessionKey) {
       const stepEmit = emit;
-      emit = (event) => stepEmit({ ...event, sessionKey });
+      emit = (event) => stepEmit({ ...event, ...sessionAttribution });
     }
     let liveSession: AgentSession | undefined;
     let systemPrompt: string | undefined;
@@ -7367,6 +7383,16 @@ export class RunManager {
     this.store.updateStep(runId, step.id, { sessionId, backend });
 
     const phaseResultPath = !interactive ? opts.resultPath : undefined;
+    const captureUsageLimit = (message: string): void => {
+      const run = this.store.getRun(runId);
+      if (!phaseResultPath || !run?.harness || !isUsageLimitMessage(message)
+        || state.cancelled || this.active.get(runId) !== state || state.usageLimitedAccount) return;
+      // Keep the first account and its deadline paired; an in-flight proof still owns its hold (PR #925 review).
+      state.usageLimitedAccount = harnessAccountKey(run, backend);
+      state.usageLimitedMessage = message;
+      state.usageLimitedSessions = new Set(state.liveSessions);
+      this.store.updateRun(runId, { autoResumeAccount: run.autoResumeAccount ?? state.usageLimitedAccount });
+    };
     let phaseNudges = 0;
     let phaseTurnSeq = 0;
     let phaseInfrastructureFailure: string | null = null;
@@ -7395,7 +7421,7 @@ export class RunManager {
     };
     let turnText = '';
     let sessionError: string | undefined;
-    const sink = this.makeUiSink(runId, step.id, sessionKey);
+    const sink = this.makeUiSink(runId, step.id, sessionAttribution);
     const resumeGuard = new ResumeFallback(
       graphHooks?.resumeSessionId !== undefined,
       (event) => emit({ ...event, stepId: step.id }),
@@ -7460,6 +7486,7 @@ export class RunManager {
         if (text) emit({ type: 'text', text, stepId: step.id });
         return;
       }
+      if (event.type === 'error') captureUsageLimit(event.message);
       emit({ ...event, stepId: step.id });
       if (event.type === 'error') {
         sessionError ??= event.message;
@@ -7482,7 +7509,7 @@ export class RunManager {
         turnText = this.store.redactRunText(runId, turnText);
         void this.recordTurnEnd(runId, turnText, state); // titleSummary + diffStat (#389)
         if (phaseResultPath) {
-          this.noteWindowProven(runId, harnessAccountKey(this.store.getRun(runId), backend));
+          this.noteWindowProven(runId, harnessAccountKey(this.store.getRun(runId), backend), liveSession);
           // Harness phase session (turn-driven): close on a delivered result,
           // nudge a session that ended its turn early — e.g. to await a
           // background subagent, its home-harness habit — and keep the CLI
@@ -7789,6 +7816,7 @@ export class RunManager {
       throw err;
     }
     this.store.updateStep(runId, step.id, { profileId: stepProfile.profileId });
+    if (sessionAttribution) sessionAttribution.profileId = stepProfile.profileId ?? DEFAULT_AGENT_ACCOUNT_ID;
 
     const runner = createRunner(stepBackend);
     const stepMcp = await this.privateMcpForLaunch(stepBackend, onEvent, opts.env?.CEZ_HARNESS_STAGE_ONLY === '1');
@@ -7946,10 +7974,7 @@ export class RunManager {
       return phaseInfrastructureFailure;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (phaseResultPath && this.store.getRun(runId)?.harness && isUsageLimitMessage(message) && !state.cancelled && this.active.get(runId) === state) {
-        state.usageLimitedAccount = harnessAccountKey(this.store.getRun(runId), backend);
-        this.store.updateRun(runId, { autoResumeAccount: state.usageLimitedAccount });
-      }
+      captureUsageLimit(message);
       sink.sessionEnded('error', message); // alongside v1's fatal `error`
       return message;
     } finally {
@@ -7978,11 +8003,10 @@ export class RunManager {
    * guardrails). One sink per session: cumulative usage dedup and the
    * item-shape cache are session-scoped, like the mapper state feeding them.
    */
-  private makeUiSink(runId: string, stepId: string, sessionKey?: string): UiEventSink {
-    const stamp = sessionKey ? { stepId, sessionKey } : { stepId };
+  private makeUiSink(runId: string, stepId: string, sessionAttribution?: { sessionKey: string; backend: RunnerId; profileId: string }): UiEventSink {
     return new UiEventSink({
-      persist: (event) => this.store.appendEvent(runId, { ...event, ...stamp }),
-      emitLive: (event) => this.store.emitEphemeral(runId, { ...event, ...stamp }),
+      persist: (event) => this.store.appendEvent(runId, { ...event, stepId, ...sessionAttribution }),
+      emitLive: (event) => this.store.emitEphemeral(runId, { ...event, stepId, ...sessionAttribution }),
     });
   }
 

@@ -3,23 +3,24 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AgentEvent, AgentRunResult, AgentRunSpec, RunnerId } from '../core/agent-runner.ts';
+import type { AgentEvent, AgentRunResult, AgentRunSpec, RunnerId, SessionOptions } from '../core/agent-runner.ts';
+import type { UiEvent } from '../core/ui-events.ts';
 import { RunStore } from '../runs/store.ts';
 import * as profiles from '../workspace/agent-profiles.ts';
-import { RunManager } from './run.ts';
+import { AUTO_RESUME_GRACE_MS, RunManager } from './run.ts';
 import type { WorkflowDef } from './types.ts';
 
-const sessions = vi.hoisted(() => [] as { backend: RunnerId; prompt: string; emit: (event: AgentEvent) => void }[]);
+const sessions = vi.hoisted(() => [] as { backend: RunnerId; prompt: string; emit: (event: AgentEvent) => void; ui: (event: UiEvent) => void }[]);
 vi.mock('../core/runner-factory.ts', () => ({
   createRunner: (backend: RunnerId) => ({
-    startSession: (spec: AgentRunSpec, onEvent: (event: AgentEvent) => void) => {
+    startSession: (spec: AgentRunSpec, onEvent: (event: AgentEvent) => void, opts: SessionOptions) => {
       if (spec.userPrompt === 'throw') throw new Error('launch failed');
       let finish: () => void = () => {};
       let open = true;
       const result = new Promise<AgentRunResult>((resolve) => {
         finish = () => { open = false; resolve({ text: '', toolCalls: [], tokensUsed: 0 }); };
       });
-      sessions.push({ backend, prompt: spec.userPrompt, emit: onEvent });
+      sessions.push({ backend, prompt: spec.userPrompt, emit: onEvent, ui: opts.onUiEvent! });
       return { result, get open() { return open; }, sendMessage: () => true, end: finish, interrupt: finish };
     },
   }),
@@ -33,11 +34,11 @@ describe('council session ownership (PR #925 review)', () => {
   let store: RunStore;
   let manager: RunManager;
   let runId: string;
-  type State = { currentStepId?: string; usageLimitedAccount?: string };
+  type State = { currentStepId?: string; usageLimitedAccount?: string; usageLimitedMessage?: string };
   let internals: {
     active: Map<string, State>;
     runAgentStep: (...args: unknown[]) => Promise<string | null>;
-    scheduleAutoResumeIfLimited: (id: string, account?: string) => void;
+    scheduleAutoResumeIfLimited: (id: string, account?: string, message?: string) => void;
   };
   let state: State;
 
@@ -70,15 +71,63 @@ describe('council session ownership (PR #925 review)', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  function phase(backend: RunnerId, prompt: string = backend) {
+  function phase(backend: RunnerId, prompt: string = backend, concurrent = true) {
     const resultPath = join(root, `${backend}.json`);
     writeFileSync(resultPath, '{}');
     return internals.runAgentStep(runId, state, { id: 'council', prompt, runner: backend },
       { task: 'x', worktree: false }, [], null, false,
       (event: { type: string; [key: string]: unknown }) => store.appendEvent(runId, event),
       undefined, 'claude', undefined, undefined, [], undefined,
-      { concurrent: true, resultPath, timeoutMs: 20_000 });
+      { concurrent, resultPath, timeoutMs: 20_000 });
   }
+
+  it.each(['error', 'session.error'])('attributes the reviewer %s stream to its own backend and resolved account', async (type) => {
+    const claude = phase('claude');
+    await expect.poll(() => sessions.length).toBe(2);
+    const codex = phase('codex');
+    await expect.poll(() => sessions.length).toBe(3);
+    const message = 'OAuth session expired and could not be refreshed';
+    sessions[1]!.emit({ type: 'error', message });
+    await claude;
+    sessions[2]!.emit({ type: 'turn-end' });
+    await codex;
+    expect(store.readEvents(runId).find((event) => event.type === type && event.message === message))
+      .toMatchObject({ backend: 'claude', profileId: 'resolved-work', sessionKey: expect.any(String) });
+  });
+
+  it('attributes persisted and live UI events before the reviewer settles', async () => {
+    const live = vi.spyOn(store, 'emitEphemeral');
+    const reviewer = phase('claude');
+    await expect.poll(() => sessions.length).toBe(2);
+    const message = 'OAuth session expired and could not be refreshed';
+    sessions[1]!.ui({ type: 'session.error', message, fatal: false });
+    sessions[1]!.ui({ type: 'item.updated', item: { id: 'item_1', kind: 'message', role: 'assistant', text: 'a' } });
+    sessions[1]!.ui({ type: 'item.updated', item: { id: 'item_1', kind: 'message', role: 'assistant', text: 'ab' } });
+    const attribution = { backend: 'claude', profileId: 'resolved-work', sessionKey: expect.any(String) };
+    expect(store.readEvents(runId).find((event) => event.type === 'session.error' && event.message === message))
+      .toMatchObject(attribution);
+    expect(live).toHaveBeenCalledWith(runId, expect.objectContaining(attribution));
+    sessions[1]!.emit({ type: 'turn-end' });
+    await reviewer;
+  });
+
+  it.each([false, true])('guard: sequential phase events still rely on their step attribution (harness=%s)', async (harness) => {
+    if (!harness) store.updateRun(runId, { harness: undefined });
+    const sequential = phase('codex', 'sequential', false);
+    await expect.poll(() => sessions.length).toBe(2);
+    const message = 'OAuth session expired and could not be refreshed';
+    sessions[1]!.emit({ type: 'error', message });
+    await sequential;
+    for (const type of ['error', 'session.error']) {
+      const event = store.readEvents(runId).find((event) => event.type === type && event.message === message)!;
+      expect(event).toBeDefined();
+      expect(event).not.toHaveProperty('sessionKey');
+      expect(event).not.toHaveProperty('backend');
+      expect(event).not.toHaveProperty('profileId');
+    }
+    expect(store.getRun(runId)?.steps.find((step) => step.id === 'council'))
+      .toMatchObject({ backend: 'codex', profileId: 'resolved-work' });
+  });
 
   it('holds the first reviewer account when a different backend spawned last', async () => {
     const codex = phase('codex');
@@ -99,7 +148,70 @@ describe('council session ownership (PR #925 review)', () => {
     expect(manager.accountHolds().deadline).toEqual(new Set(['codex:default']));
   });
 
-  it('does not retire a limit when another reviewer completes a turn', async () => {
+  it.each(['codex', 'claude'] as const)('pairs the first %s limit with its own reset when both reviewers fail', async (first) => {
+    const codex = phase('codex');
+    await expect.poll(() => sessions.length).toBe(2);
+    const claude = phase('claude');
+    await expect.poll(() => sessions.length).toBe(3);
+    const reset = Math.floor((Date.now() + 3_600_000) / 1000) * 1000;
+    const messages = { codex: `Codex usage limit reached. Try again at ${new Date(reset + 3_600_000).toISOString()}`,
+      claude: `Claude AI usage limit reached|${reset / 1000}` };
+    const second = first === 'codex' ? 'claude' : 'codex';
+    const fail = async (backend: RunnerId) => {
+      sessions[backend === 'codex' ? 1 : 2]!.emit({ type: 'error', message: messages[backend as keyof typeof messages] });
+      await (backend === 'codex' ? codex : claude);
+    };
+    await fail(first);
+    await fail(second);
+    expect.soft(state.usageLimitedAccount).toBe(`${first}:default`);
+    expect.soft(state.usageLimitedMessage).toBe(messages[first]);
+    store.updateRun(runId, { status: 'failed', error: `${messages.codex}\n${messages.claude}` });
+    internals.scheduleAutoResumeIfLimited(runId, state.usageLimitedAccount, state.usageLimitedMessage);
+    expect.soft(store.getRun(runId)?.autoResumeAccount).toBe(`${first}:default`);
+    expect.soft(store.getRun(runId)?.autoResumeAt)
+      .toBe(new Date(reset + (first === 'codex' ? 3_600_000 : 0) + AUTO_RESUME_GRACE_MS).toISOString());
+  });
+
+  it('keeps an in-flight account until its proof when another reviewer hits a limit', async () => {
+    store.updateRun(runId, { autoResumeAccount: 'claude:default', autoResumeAttempts: 2 });
+    const claude = phase('claude');
+    await expect.poll(() => sessions.length).toBe(2);
+    const codex = phase('codex');
+    await expect.poll(() => sessions.length).toBe(3);
+    sessions[2]!.emit({ type: 'error', message: LIMIT });
+    await codex;
+    expect(store.getRun(runId)?.autoResumeAccount).toBe('claude:default');
+    expect(manager.accountHolds().inFlight).toEqual(new Set(['claude:default']));
+    sessions[1]!.emit({ type: 'turn-end' });
+    await claude;
+    expect(store.getRun(runId)?.autoResumeAttempts).toBeUndefined();
+    expect(state.usageLimitedAccount).toBe('codex:default');
+    expect(store.getRun(runId)?.autoResumeAccount).toBe('codex:default');
+  });
+
+  it('ignores a same-account sibling already running at capture until a fresh session proves the window', async () => {
+    const limited = phase('claude', 'opus');
+    await expect.poll(() => sessions.length).toBe(2);
+    const sibling = phase('claude', 'sonnet');
+    await expect.poll(() => sessions.length).toBe(3);
+    store.updateRun(runId, { autoResumeAttempts: 1 });
+    sessions[1]!.emit({ type: 'error', message: 'Claude usage limit reached. Try again in 3 hours.' });
+    await limited;
+    sessions[2]!.emit({ type: 'turn-end' });
+    await sibling;
+    expect(state.usageLimitedAccount).toBe('claude:default');
+    expect(store.getRun(runId)?.autoResumeAttempts).toBe(1);
+    expect(store.getRun(runId)?.autoResumeAccount).toBe('claude:default');
+    const fresh = phase('claude', 'fresh');
+    await expect.poll(() => sessions.length).toBe(4);
+    sessions[3]!.emit({ type: 'turn-end' });
+    await fresh;
+    expect(store.getRun(runId)?.autoResumeAttempts).toBeUndefined();
+    expect(store.getRun(runId)?.autoResumeAccount).toBeUndefined();
+    expect(state.usageLimitedMessage).toBeUndefined();
+  });
+
+  it('guard: does not retire a limit when another reviewer completes a turn', async () => {
     const claude = phase('claude');
     await expect.poll(() => sessions.length).toBe(2);
     const codex = phase('codex');
@@ -115,7 +227,7 @@ describe('council session ownership (PR #925 review)', () => {
     expect(store.getRun(runId)?.autoResumeAttempts).toBeUndefined();
   });
 
-  it('schedules an advisor-only limit without attributing an account', () => {
+  it('guard: schedules an advisor-only limit without attributing an account', () => {
     store.updateStep(runId, 'council', { status: 'failed', backend: 'claude', profileId: 'resolved-work', error: LIMIT });
     store.updateRun(runId, { status: 'failed', error: `advisor failed: ${LIMIT}` });
     internals.scheduleAutoResumeIfLimited(runId);
@@ -130,7 +242,7 @@ describe('council session ownership (PR #925 review)', () => {
     { runner: 'codex' as const, override: undefined, key: 'codex:default' },
     { runner: 'codex' as const, override: 'personal', key: 'codex:personal' },
     { runner: 'claude' as const, override: 'personal', key: 'codex:default' },
-  ])('normalizes a phase limit and its proof to the ordinary scheme ($runner/$override)', async ({ runner, override, key }) => {
+  ])('guard: normalizes a phase limit and its proof to the ordinary scheme ($runner/$override)', async ({ runner, override, key }) => {
     store.updateRun(runId, { runner, agentProfile: override });
     const limited = phase('codex');
     await expect.poll(() => sessions.length).toBe(2);

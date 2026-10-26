@@ -6,7 +6,7 @@ import { harnessWorkflowDefs, HARNESS_FIX_ISSUE } from '../harness/workflows.ts'
 import { RunStore } from '../runs/store.ts';
 import * as accounts from '../workspace/agent-accounts.ts';
 import { WorkspaceSemaphore } from '../workspace/semaphore.ts';
-import { RunManager, runAccountKey, type StartRunInput } from './run.ts';
+import { AUTO_RESUME_GRACE_MS, RunManager, runAccountKey, type StartRunInput } from './run.ts';
 import type { WorkflowDef } from './types.ts';
 
 const TASK: WorkflowDef = { name: 'one-step', source: 'file', steps: [{ id: 'work', prompt: '{{task}}' }] };
@@ -21,7 +21,8 @@ describe('ordinary and harness account identity (PR #925 review)', () => {
   let internal: {
     queue: string[];
     requeueWhileHeld: (id: string, workflow: WorkflowDef, input: StartRunInput, backend: string) => boolean;
-    scheduleAutoResumeIfLimited: (id: string) => void;
+    scheduleAutoResumeIfLimited: (id: string, account?: string, message?: string) => void;
+    applyQueueReasons: (runner: string) => void;
   };
 
   beforeEach(() => {
@@ -72,6 +73,15 @@ describe('ordinary and harness account identity (PR #925 review)', () => {
     expect(accountReads).not.toHaveBeenCalled();
   });
 
+  it('guard: ordinary scheduling parses the run error even if given a harness limiting message', () => {
+    const limited = limit(false);
+    const reset = Math.floor((Date.now() + 3_600_000) / 1000) * 1000;
+    store.updateRun(limited.id, { autoResumeAt: undefined, error: `Claude AI usage limit reached|${reset / 1000}` });
+    internal.scheduleAutoResumeIfLimited(limited.id, 'codex:other', LIMIT);
+    expect(store.getRun(limited.id)?.autoResumeAt).toBe(new Date(reset + AUTO_RESUME_GRACE_MS).toISOString());
+    expect(store.getRun(limited.id)?.autoResumeAccount).toBeUndefined();
+  });
+
   it.each([undefined, 'work'])('guard: a normalized harness hold blocks ordinary admission for override %s', async (agentProfile) => {
     limit(true, agentProfile);
     const queued = manager.startRun(TASK, { task: 'new', runner: 'codex', agentProfile });
@@ -90,6 +100,39 @@ describe('ordinary and harness account identity (PR #925 review)', () => {
     } } });
     expect(internal.requeueWhileHeld(queued.id, HARNESS, { task: 'Fix #1' }, 'codex')).toBe(false);
     expect(accountReads).not.toHaveBeenCalled();
+  });
+
+  it('admits an in-flight harness resume despite a different role account deadline', async () => {
+    limit(false);
+    const queued = manager.startRun(TASK, { task: 'Fix #1', runner: 'claude' });
+    store.updateRun(queued.id, { autoResumeAttempts: 1, autoResumeAccount: 'claude:default', harness: {
+      workflow: HARNESS.name, profile: 'multi', issueId: '1', roles: {
+        orchestrator: { runner: 'claude', model: 'claude' }, implementer: { runner: 'claude', model: 'claude' },
+        reviewers: [{ runner: 'codex', model: 'codex' }],
+      },
+    } });
+    expect(manager.accountHolds().inFlight).toEqual(new Set(['claude:default']));
+    internal.applyQueueReasons('claude');
+    expect(store.getRun(queued.id)?.queueWaitReason).toBeUndefined();
+    expect(internal.requeueWhileHeld(queued.id, HARNESS, { task: 'Fix #1' }, 'claude')).toBe(false);
+    // Keep the queue parked while checking Start now's admission decision.
+    vi.spyOn(manager as unknown as { pump: () => Promise<void> }, 'pump').mockResolvedValue();
+    expect(await manager.startNow(queued.id)).toBe('started');
+    const fresh = manager.startRun(TASK, { task: 'fresh', runner: 'claude' });
+    expect(await manager.startNow(fresh.id)).toBe('held');
+  });
+
+  it('guard: a fresh harness run still waits for an explicit reviewer account deadline', async () => {
+    limit(false);
+    const queued = manager.startRun(TASK, { task: 'Fix #1', runner: 'claude' });
+    store.updateRun(queued.id, { harness: { workflow: HARNESS.name, profile: 'multi', issueId: '1', roles: {
+      orchestrator: { runner: 'claude', model: 'claude' }, implementer: { runner: 'claude', model: 'claude' },
+      reviewers: [{ runner: 'codex', model: 'codex' }],
+    } } });
+    expect(await manager.startNow(queued.id)).toBe('held');
+    internal.applyQueueReasons('claude');
+    expect(store.getRun(queued.id)?.queueWaitReason?.kind).toBe('usage-reset');
+    expect(internal.requeueWhileHeld(queued.id, HARNESS, { task: 'Fix #1' }, 'claude')).toBe(true);
   });
 
   it.each([
