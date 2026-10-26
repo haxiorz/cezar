@@ -11,7 +11,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { z } from 'zod';
 import {
   councilDecisionDetail,
@@ -73,6 +73,8 @@ import {
   HARNESS_RESULT_LIMITS,
   promptBudgetError,
   promptExcerpt,
+  boundedFindings,
+  advisorCouncilTimeoutMs,
 } from './prompt-budget.js';
 import { harnessStageResultSchema, samePathSet } from './stage-result.js';
 import { loadTrustedHarnessSkill } from './skill-binding.js';
@@ -369,20 +371,74 @@ export async function snapshotHarnessStageSubject(cwd: string): Promise<string> 
   return hash.digest('hex');
 }
 
-/** A superseded handoff stays in the index, where `git diff HEAD` cannot see a change the
- *  worktree since reverted, and the stage op then refuses it (PR #925 review). */
-function resetIndexToHead(cwd: string): void {
+/** Clear superseded staging without changing the captured HEAD reflog (PR #925 review). */
+export function resetIndexToHead(cwd: string): void {
   // Only a pinned harness worktree: never whatever repository happens to enclose `cwd`.
   const env = pinnedGitEnv(cwd);
   if (!env) return;
   try {
-    execFileSync('git', ['reset', '-q'], {
+    execFileSync('git', ['read-tree', 'HEAD'], {
       cwd,
       stdio: 'ignore',
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env },
     });
   } catch {
     // The stage op's own index checks still refuse anything left behind.
+  }
+}
+
+// A private index preserves binary/untracked edits without touching the captured refs (PR #925 review).
+function harnessDiff(cwd: string, paths: readonly string[], indexPath: string): Buffer {
+  const env = { ...process.env, ...pinnedGitEnv(cwd), GIT_INDEX_FILE: indexPath, GIT_TERMINAL_PROMPT: '0' };
+  const git = (args: string[]) => execFileSync('git', args, { cwd, env, maxBuffer: 256 * 1024 * 1024 });
+  try {
+    git(['read-tree', 'HEAD']);
+    const scopes = paths.filter((path) => {
+      try { lstatSync(join(cwd, path)); return true; } catch {
+        return git(['ls-files', '-z', '--', `:(literal)${path}`]).length > 0;
+      }
+    }).map((path) => `:(literal)${path}`);
+    if (scopes.length || paths.length === 0) git(['add', '-A', ...(scopes.length ? ['--', ...scopes] : [])]);
+    return git(['diff', '--cached', '--no-ext-diff', '--binary', 'HEAD', '--', ...scopes]);
+  } finally {
+    rmSync(indexPath, { force: true });
+    rmSync(`${indexPath}.lock`, { force: true });
+  }
+}
+
+function preserveAndRestorePacket(cwd: string, paths: readonly string[], artifactPath: string): void {
+  const pinned = pinnedGitEnv(cwd);
+  if (!pinned) {
+    if (!paths.some((path) => existsSync(join(cwd, path)))) return;
+    throw new Error('packet worktree has no pinned Git directory');
+  }
+  const env = { ...process.env, ...pinned, GIT_TERMINAL_PROMPT: '0' };
+  const git = (args: string[]) => execFileSync('git', args, { cwd, env, maxBuffer: 256 * 1024 * 1024 });
+  const scopes = paths.map((path) => `:(literal)${path}`);
+  const names = (args: string[]) => git(args).toString('utf8').split('\0').filter(Boolean);
+  const headPaths = names(['ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', ...scopes]);
+  const currentPaths = names(['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', ...scopes]);
+  const affected = [...new Set([...headPaths, ...currentPaths])];
+  for (const path of affected) {
+    for (let parent = dirname(resolve(cwd, path)); parent !== resolve(cwd); parent = dirname(parent)) {
+      if (!parent.startsWith(resolve(cwd) + sep)) throw new Error(`packet path escapes the worktree: ${path}`);
+      if (existsSync(parent) && lstatSync(parent).isSymbolicLink()) throw new Error(`packet path has a symlink parent: ${path}`);
+    }
+  }
+  // Preserve before restoring; an existing artifact belongs to a crash interrupted recovery.
+  if (!existsSync(artifactPath)) {
+    writeFileSync(artifactPath, harnessDiff(cwd, paths, `${artifactPath}.index`), { flag: 'wx' });
+  }
+  const head = new Set(headPaths);
+  for (const path of affected.filter((path) => !head.has(path))) {
+    rmSync(join(cwd, path), { force: true });
+    git(['update-index', '--force-remove', '--', path]);
+  }
+  if (headPaths.length) {
+    git(['restore', '--source=HEAD', '--staged', '--worktree', '--', ...headPaths.map((path) => `:(literal)${path}`)]);
+  }
+  if (harnessDiff(cwd, paths, `${artifactPath}.index`).length) {
+    throw new Error('packet allowed paths still contain uncommitted changes after restoration');
   }
 }
 
@@ -435,7 +491,7 @@ const diagnoseResultSchema = z.object({
   summary: z.string().max(HARNESS_RESULT_LIMITS.summary),
   files: z
     .array(z.string().min(1).max(HARNESS_RESULT_LIMITS.path))
-    .max(HARNESS_RESULT_LIMITS.paths),
+    .transform((paths) => paths.slice(0, HARNESS_RESULT_LIMITS.paths)),
   regressionTest: z.string().max(HARNESS_RESULT_LIMITS.text).optional(),
 });
 
@@ -444,11 +500,11 @@ const specResultSchema = z.object({
   specPath: z.string().min(1).max(HARNESS_RESULT_LIMITS.path),
   files: z
     .array(z.string().min(1).max(HARNESS_RESULT_LIMITS.path))
-    .max(HARNESS_RESULT_LIMITS.paths)
+    .transform((paths) => paths.slice(0, HARNESS_RESULT_LIMITS.paths))
     .optional(),
   openQuestions: z
     .array(z.string().min(1).max(HARNESS_RESULT_LIMITS.text))
-    .max(HARNESS_RESULT_LIMITS.questions)
+    .transform((questions) => questions.slice(0, HARNESS_RESULT_LIMITS.questions))
     .optional(),
 });
 
@@ -536,7 +592,7 @@ type PacketManifest = z.infer<typeof packetManifestSchema>;
  */
 const findingLocationSchema = z
   .union([
-    z.string().max(HARNESS_RESULT_LIMITS.path),
+    z.string().transform((location) => location.slice(0, HARNESS_RESULT_LIMITS.path)),
     z
       .object({
         path: z.string().max(HARNESS_RESULT_LIMITS.path),
@@ -548,7 +604,7 @@ const findingLocationSchema = z
   .transform((loc) => {
     if (typeof loc === 'string') return loc;
     const base = loc.line == null ? loc.path : `${loc.path}:${loc.line}`;
-    return loc.symbol ? `${base} (${loc.symbol})` : base;
+    return (loc.symbol ? `${base} (${loc.symbol})` : base).slice(0, HARNESS_RESULT_LIMITS.path);
   });
 
 const reviewResultSchema = z.object({
@@ -557,13 +613,15 @@ const reviewResultSchema = z.object({
     .array(
       z.object({
         severity: z.enum(['blocker', 'major', 'minor', 'nit']),
-        title: z.string().min(1).max(HARNESS_RESULT_LIMITS.shortText),
-        location: findingLocationSchema.optional(),
-        evidence: z.string().max(HARNESS_RESULT_LIMITS.text).optional(),
+        title: z.string().min(1).transform((title) => title.slice(0, HARNESS_RESULT_LIMITS.shortText)),
+        location: findingLocationSchema.optional().catch(undefined),
+        evidence: z.string().transform((evidence) => evidence.slice(0, HARNESS_RESULT_LIMITS.text)).optional(),
       }),
     )
-    .max(HARNESS_RESULT_LIMITS.findings)
-    .default([]),
+    .default([])
+    .transform((findings) => [...findings]
+      .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity])
+      .slice(0, HARNESS_RESULT_LIMITS.findings)),
 });
 
 type ReviewResult = z.infer<typeof reviewResultSchema>;
@@ -599,29 +657,7 @@ const SEVERITY_RANK = { blocker: 0, major: 1, minor: 2, nit: 3 } as const;
 
 /** An advisor review as the runtime merged it, with no bounds of its own: clamped rather than
  *  rejected, keeping the most severe findings when it must drop some (PR #925 review). */
-const advisorReviewSchema = z.object({
-  verdict: z.enum(['approve', 'request_changes']),
-  findings: z
-    .array(
-      z.object({
-        severity: z.enum(['blocker', 'major', 'minor', 'nit']),
-        title: z.string().min(1).transform((title) => title.slice(0, HARNESS_RESULT_LIMITS.shortText)),
-        location: findingLocationSchema.optional().catch(undefined),
-        evidence: z
-          .string()
-          .optional()
-          .transform((evidence) => evidence?.slice(0, HARNESS_RESULT_LIMITS.text)),
-      }),
-    )
-    .default([])
-    .transform((findings) =>
-      findings.length <= HARNESS_RESULT_LIMITS.findings
-        ? findings
-        : [...findings]
-            .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity])
-            .slice(0, HARNESS_RESULT_LIMITS.findings),
-    ),
-});
+const advisorReviewSchema = reviewResultSchema;
 
 /** The runtime's `review-result.json`, reduced to what the driver folds into
  *  the council: per-advisor status plus the session-shaped review payload
@@ -2915,7 +2951,7 @@ export async function runHarnessDriver(
         agentHarness?: {
           version?: unknown;
           delivery?: Record<string, unknown>;
-          models?: Record<string, { timeoutMs?: unknown } | undefined>;
+          models?: Record<string, { timeoutMs?: unknown; maxInputBytes?: unknown } | undefined>;
           profiles?: Record<string, unknown>;
         };
       };
@@ -2939,6 +2975,7 @@ export async function runHarnessDriver(
         'cez-role-council': {
           workers: [],
           reviewers: ids,
+          maxParallel: ids.length,
           reviewPolicy: { mode: 'all-required', requiredReviewers: ids },
           // Cezar owns retries (two per reviewer, never after a timeout). The runtime's own 3× with
           // escalating timeouts outlasted this op, which then killed it and lost the reviews that
@@ -2951,8 +2988,22 @@ export async function runHarnessDriver(
       writeFileSync(councilConfigPath, `${JSON.stringify(configJson, null, 2)}\n`, 'utf8');
       const criteriaPath = join(artifactDir, `council-criteria-${op.kindTag}-r${op.round}.md`);
       writeFileSync(criteriaPath, op.criteriaText, 'utf8');
-      const timeoutMs =
-        Math.max(600_000, ...ids.map((id) => Number(harnessObj.models?.[id]?.timeoutMs) || 0)) + 120_000;
+      const rubricFiles = [
+        join(trustedSkillsRoot, phaseSkills.codeReview, 'SKILL.md'),
+        join(trustedSkillsRoot, phaseSkills.codeReview, 'references', 'review-checklist.md'),
+        join(trustedSkillsRoot, phaseSkills.codeReview, 'references', 'output-format.md'),
+        join(dirname(sealed.script), '..', 'references', 'review-result.schema.json'),
+      ];
+      // Includes the runtime's wrapper and SOURCE labels, with room for multipart instructions.
+      const fixedBytes = Buffer.byteLength(op.criteriaText) + 8_192 + rubricFiles.reduce(
+        (bytes, path) => bytes + (existsSync(path) ? Buffer.byteLength(readHarnessArtifactText(path)) : 0), 0,
+      );
+      const subjectBytes = op.artifact
+        ? Buffer.byteLength(readHarnessArtifactText(op.artifact, HARNESS_JSON_ARTIFACT_MAX_BYTES * 4))
+        : pinnedGitEnv(host.cwd)
+          ? harnessDiff(host.cwd, [], join(artifactDir, `council-subject-${randomUUID()}.index`)).length
+          : 0;
+      const timeoutMs = advisorCouncilTimeoutMs(ids.map((id) => harnessObj.models?.[id] ?? {}), subjectBytes, fixedBytes);
       for (const member of pendingMembers) {
         const meta = invocationMeta.get(member.label)!;
         running.set(
@@ -3060,6 +3111,10 @@ export async function runHarnessDriver(
                   .join('; ')}`
               : null;
           const completed = review?.success === true;
+          const failureReason = completed ? undefined :
+            reviewError ?? (typeof row?.error === 'string' ? row.error : null) ??
+            ((result.error ?? result.stderr.slice(-300)).trim() ||
+              `advisor returned status ${row?.status ?? 'missing'}`);
           rows.push({
             id: member.label,
             runner: 'harness',
@@ -3069,11 +3124,7 @@ export async function runHarnessDriver(
             freshContext: true,
             verdict: completed ? review.data.verdict : null,
             findings: completed ? review.data.findings : [],
-            ...(reviewError
-              ? { error: reviewError }
-              : !completed && !result.ok
-                ? { error: (result.error ?? result.stderr.slice(-300)).trim() || `exit ${result.exitCode}` }
-                : {}),
+            ...(failureReason !== undefined ? { error: failureReason } : {}),
           });
           const invocation = running.get(member.label)!;
           const promptPath = typeof row?.promptPath === 'string' ? row.promptPath : null;
@@ -3087,10 +3138,7 @@ export async function runHarnessDriver(
             });
           } else {
             finishInvocation(invocation, 'failed', {
-              error:
-                reviewError ??
-                ((result.error ?? result.stderr.slice(-300)).trim() ||
-                  `advisor returned status ${row?.status ?? 'missing'}`),
+              error: failureReason,
             });
           }
         }
@@ -3162,6 +3210,7 @@ export async function runHarnessDriver(
       const invocation = invocationOf(member);
       return (
         invocation?.status === 'failed' &&
+        !first.rows.some((row) => row.id === member.label && ['timed_out', 'skipped'].includes(String(row.status))) &&
         invocation.endedAt !== endedBefore.get(member.label) &&
         typeof invocation.error === 'string' &&
         isRetryableReviewerFailure(invocation.error) &&
@@ -3214,11 +3263,80 @@ export async function runHarnessDriver(
     });
   };
 
+  const findingsPrompt = (name: string, findings: readonly ReviewResult['findings'][number][]): string => {
+    const path = join(artifactDir, `findings-${name}.json`);
+    writeJsonAtomic(path, findings);
+    return boundedFindings(findings, path);
+  };
+
   const runHighAssurancePackets = async (
     agentic: AgenticConfig,
     contextSummary: string,
     allowlist: Set<string>,
   ): Promise<string | null | 'cancelled'> => {
+    let orderedPackets: z.infer<typeof packetPlanResultSchema>['packets'] = [];
+    const acceptPacketPlan = (packetPlan: z.infer<typeof packetPlanResultSchema>): string | null => {
+      const ids = new Set(packetPlan.packets.map((packet) => packet.id));
+      if (ids.size !== packetPlan.packets.length) {
+        return 'packet plan contains duplicate packet ids';
+      }
+      const allPaths = new Set<string>();
+      for (const packet of packetPlan.packets) {
+        if (new Set(packet.dependencies).size !== packet.dependencies.length) {
+          return `packet ${packet.id} contains duplicate dependencies`;
+        }
+        for (const dependency of packet.dependencies) {
+          if (!ids.has(dependency)) return `packet ${packet.id} references unknown dependency ${dependency}`;
+        }
+        for (const rawPath of packet.allowedPaths) {
+          if (rawPath.startsWith('/') || rawPath.includes('\\') || /[\x00-\x1f\x7f]/.test(rawPath) || rawPath.split('/').some((part) => ['..', '.', '.git', ''].includes(part))) {
+            return `packet ${packet.id} contains unsafe allowed path ${rawPath}`;
+          }
+          const path = rawPath.replace(/\/+$/, '');
+          const overlap = [...allPaths].find(
+            (other) =>
+              other === path ||
+              other.startsWith(`${path}/`) ||
+              path.startsWith(`${other}/`),
+          );
+          if (overlap) return `packet plans overlap on paths ${overlap} and ${path}`;
+          allPaths.add(path);
+        }
+      }
+      const packetById = new Map(packetPlan.packets.map((packet) => [packet.id, packet]));
+      const inputOrder = new Map(packetPlan.packets.map((packet, index) => [packet.id, index]));
+      const indegree = new Map(
+        packetPlan.packets.map((packet) => [packet.id, packet.dependencies.length]),
+      );
+      const dependents = new Map<string, string[]>();
+      for (const packet of packetPlan.packets) {
+        for (const dependency of packet.dependencies) {
+          dependents.set(dependency, [...(dependents.get(dependency) ?? []), packet.id]);
+        }
+      }
+      const ready = packetPlan.packets
+        .filter((packet) => packet.dependencies.length === 0)
+        .map((packet) => packet.id);
+      orderedPackets = [];
+      while (ready.length > 0) {
+        ready.sort((a, b) => (inputOrder.get(a) ?? 0) - (inputOrder.get(b) ?? 0));
+        const id = ready.shift()!;
+        orderedPackets.push(packetById.get(id)!);
+        for (const dependent of dependents.get(id) ?? []) {
+          const remaining = (indegree.get(dependent) ?? 0) - 1;
+          indegree.set(dependent, remaining);
+          if (remaining === 0) ready.push(dependent);
+        }
+      }
+      if (orderedPackets.length !== packetPlan.packets.length) {
+        const cyclic = packetPlan.packets
+          .filter((packet) => (indegree.get(packet.id) ?? 0) > 0)
+          .map((packet) => packet.id);
+        return `packet dependency graph contains a cycle involving ${cyclic.join(', ')}`;
+      }
+
+      return null;
+    };
     const planned = await agentPhase(
       'packet-plan',
       'Plan packets',
@@ -3238,68 +3356,10 @@ export async function runHarnessDriver(
       packetPlanResultSchema,
       'spec',
       roles?.orchestrator,
+      acceptPacketPlan,
     );
     if ('cancelled' in (planned as object)) return 'cancelled';
     if ('error' in (planned as object)) return (planned as { error: string }).error;
-    const packetPlan = planned as z.infer<typeof packetPlanResultSchema>;
-    const ids = new Set(packetPlan.packets.map((packet) => packet.id));
-    if (ids.size !== packetPlan.packets.length) {
-      return 'packet plan contains duplicate packet ids';
-    }
-    const allPaths = new Set<string>();
-    for (const packet of packetPlan.packets) {
-      if (new Set(packet.dependencies).size !== packet.dependencies.length) {
-        return `packet ${packet.id} contains duplicate dependencies`;
-      }
-      for (const dependency of packet.dependencies) {
-        if (!ids.has(dependency)) return `packet ${packet.id} references unknown dependency ${dependency}`;
-      }
-      for (const rawPath of packet.allowedPaths) {
-        if (rawPath.startsWith('/') || rawPath.split('/').includes('..')) {
-          return `packet ${packet.id} contains unsafe allowed path ${rawPath}`;
-        }
-        const path = rawPath.replace(/\/+$/, '');
-        const overlap = [...allPaths].find(
-          (other) =>
-            other === path ||
-            other.startsWith(`${path}/`) ||
-            path.startsWith(`${other}/`),
-        );
-        if (overlap) return `packet plans overlap on paths ${overlap} and ${path}`;
-        allPaths.add(path);
-      }
-    }
-    const packetById = new Map(packetPlan.packets.map((packet) => [packet.id, packet]));
-    const inputOrder = new Map(packetPlan.packets.map((packet, index) => [packet.id, index]));
-    const indegree = new Map(
-      packetPlan.packets.map((packet) => [packet.id, packet.dependencies.length]),
-    );
-    const dependents = new Map<string, string[]>();
-    for (const packet of packetPlan.packets) {
-      for (const dependency of packet.dependencies) {
-        dependents.set(dependency, [...(dependents.get(dependency) ?? []), packet.id]);
-      }
-    }
-    const ready = packetPlan.packets
-      .filter((packet) => packet.dependencies.length === 0)
-      .map((packet) => packet.id);
-    const orderedPackets: typeof packetPlan.packets = [];
-    while (ready.length > 0) {
-      ready.sort((a, b) => (inputOrder.get(a) ?? 0) - (inputOrder.get(b) ?? 0));
-      const id = ready.shift()!;
-      orderedPackets.push(packetById.get(id)!);
-      for (const dependent of dependents.get(id) ?? []) {
-        const remaining = (indegree.get(dependent) ?? 0) - 1;
-        indegree.set(dependent, remaining);
-        if (remaining === 0) ready.push(dependent);
-      }
-    }
-    if (orderedPackets.length !== packetPlan.packets.length) {
-      const cyclic = packetPlan.packets
-        .filter((packet) => (indegree.get(packet.id) ?? 0) > 0)
-        .map((packet) => packet.id);
-      return `packet dependency graph contains a cycle involving ${cyclic.join(', ')}`;
-    }
 
     const packetRunDir = join(artifactDir, 'packet-runtime');
     mkdirSync(packetRunDir, { recursive: true });
@@ -3384,6 +3444,17 @@ export async function runHarnessDriver(
       // every Continue dead-ended on it (PR #925 review).
       const inFlightStates = ['planned', 'claimed', 'implementing', 'reviewing', 'fixing', 'blocked'];
 
+      const restoreAttempt = (id: string): string | null => {
+        const artifactPath = join(artifactDir, `packet-failed-diff-${id}.patch`);
+        try {
+          preserveAndRestorePacket(host.cwd, source.allowedPaths, artifactPath);
+          host.emit({ type: 'note', message: `packet ${id} failed-attempt diff preserved at ${artifactPath}; its allowed paths restored to HEAD` });
+          return null;
+        } catch (error) {
+          return `packet ${id} replacement refused: could not preserve and restore its allowed paths (${error instanceof Error ? error.message : String(error)}); diff artifact: ${artifactPath}`;
+        }
+      };
+
       // A crash after a release leaves the recorded packet behind it, so follow every release
       // this run already made, not only the first (PR #925 review).
       for (;;) {
@@ -3410,6 +3481,10 @@ export async function runHarnessDriver(
           finishInvocation(interruptedRelease, 'completed', {
             artifactPath: releaseArtifactPath,
           });
+        }
+        if (!readPacket(`${source.id}-resume-${attempt + 1}`)) {
+          const restoreError = restoreAttempt(effectiveId);
+          if (restoreError) return restoreError;
         }
         attempt += 1;
         effectiveId = `${source.id}-resume-${attempt}`;
@@ -3465,6 +3540,8 @@ export async function runHarnessDriver(
         finishInvocation(releaseInvocation, 'completed', {
           artifactPath: releaseArtifactPath,
         });
+        const restoreError = restoreAttempt(effectiveId);
+        if (restoreError) return restoreError;
         attempt += 1;
         effectiveId = `${source.id}-resume-${attempt}`;
         state = null;
@@ -3641,8 +3718,9 @@ export async function runHarnessDriver(
           }
           if (!result.ok || !packetState) {
             const reason =
+              (typeof packetState?.error === 'string' ? packetState.error : '').trim() ||
               (result.error ?? result.stderr ?? '').trim() ||
-              `packet runtime wrote no ledger for ${effectiveId}`;
+              (packetState ? `packet runtime exited ${result.exitCode} in state ${String(packetState.state)}` : `packet runtime wrote no ledger for ${effectiveId}`);
             finishInvocation(invocation, 'failed', {
               ...(packetState ? { artifactPath: packetResultPath(effectiveId) } : {}),
               error: reason,
@@ -4208,10 +4286,7 @@ export async function runHarnessDriver(
               `The spec council requested changes on the specification at ${specPath}. Address every finding, update the spec file in place, and keep it implementation-accurate.`,
               ``,
               `Findings:`,
-              ...specFindings.map(
-                (f) =>
-                  `- [${f.severity}] ${f.title}${f.location ? ` @ ${f.location}` : ''} (raised by ${f.by})${f.evidence ? ` — ${f.evidence}` : ''}`,
-              ),
+              findingsPrompt(`spec-${sround}`, specFindings),
               ``,
               `When you are done write a JSON result file at the path in $CEZ_HARNESS_RESULT_FILE of the shape:`,
               `{"summary": "<one-paragraph summary of the revision>", "specPath": "<repo-relative spec path>", "files": ["<spec file>"]}`,
@@ -4763,6 +4838,20 @@ export async function runHarnessDriver(
       ? Number(recordedClosingRound) + 1
       : undefined;
 
+    // Closing fixes have no fresh council; recover its paid findings on every entry (PR #925 review).
+    if (closingRepairStartRound !== undefined && (recordedRounds?.round ?? 1) >= closingRepairStartRound) {
+      const closingCouncil = ledger.councils.find(
+        (council) => council.kind === 'implementation' && council.round === closingRepairStartRound! - 1,
+      );
+      const closingReview = reviewResultSchema.safeParse(closingCouncil);
+      const closingFindings = closingReview.success
+        ? closingCouncil!.findings as AttributedFinding[]
+        : reviewFindings;
+      survivingBlockers = closingFindings.filter(
+        (finding) => finding.severity === 'blocker' || finding.severity === 'major',
+      );
+    }
+
     /**
      * The gate's verdict over a round's checks, measured against the baseline:
      * returns the blocking description (what a repair round must fix, with the
@@ -4898,10 +4987,7 @@ export async function runHarnessDriver(
             `A fresh code review of your project's uncommitted diff confirmed blocking findings. Fix them in the current worktree.`,
             ``,
             `Confirmed findings:`,
-            ...reviewFindings.map(
-              (f) =>
-                `- [${f.severity}] ${f.title}${f.location ? ` (${f.location})` : ''}${f.evidence ? ` — ${f.evidence}` : ''}${f.by ? ` — raised by ${f.by}` : ''}`,
-            ),
+            findingsPrompt(`fix-${round}`, reviewFindings),
             ``,
             `When a finding cites a "full output:" log path, read that log for the complete failure detail before re-running long suites.`,
             `Hard boundaries: edit only this worktree; create NO commit; perform NO push or PR; do not weaken or delete tests.`,
@@ -5746,6 +5832,13 @@ export async function runHarnessDriver(
     // the prepared PR body, so the human gate sees them wherever it reads.
     let stageWarnings: string[] = [];
     let stagedPaths: string[] = [];
+    const rejectStageResult = (reason: string): void => {
+      const invocation = ledger.invocations.find((entry) => entry.id === stageInvocationId);
+      if (invocation) finishInvocation(invocation, 'failed', { error: reason });
+      finishPhase(ledger, 'stage', 'failed', reason);
+      host.setStepStatus('stage', 'failed', reason);
+      emitPhase('stage');
+    };
     try {
       const parsedStage = harnessStageResultSchema.safeParse(
         JSON.parse(readHarnessArtifactText(stageResultPath)),
@@ -5755,6 +5848,7 @@ export async function runHarnessDriver(
           .slice(0, 3)
           .map((issue) => `${issue.path.join('.')}: ${issue.message}`)
           .join('; ')}`;
+        rejectStageResult(reason);
         ledger.stage = { ...ledger.stage, status: 'failed', error: reason };
         setOutcome({ status: 'blocked', blockingReasons: [reason] });
         return reason;
@@ -5764,6 +5858,7 @@ export async function runHarnessDriver(
       if (!samePathSet(stagedPaths, [...allowlist])) {
         const reason =
           'stage result is incomplete: staged paths do not exactly match the complete git-derived handoff';
+        rejectStageResult(reason);
         ledger.stage = { ...ledger.stage, status: 'failed', error: reason };
         setOutcome({ status: 'blocked', blockingReasons: [reason] });
         return reason;
@@ -5772,6 +5867,7 @@ export async function runHarnessDriver(
       const reason = `could not read stage result: ${
         error instanceof Error ? error.message : String(error)
       }`;
+      rejectStageResult(reason);
       ledger.stage = { ...ledger.stage, status: 'failed', error: reason };
       setOutcome({ status: 'blocked', blockingReasons: [reason] });
       return reason;

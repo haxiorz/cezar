@@ -17,6 +17,8 @@ import {
   HARNESS_PROMPT_BUDGET_BYTES,
   promptBudgetError,
   promptExcerpt,
+  boundedFindings,
+  advisorCouncilTimeoutMs,
 } from './prompt-budget.js';
 import { harnessStageResultSchema, samePathSet } from './stage-result.js';
 import { harnessPhaseSkills } from './skill-routing.js';
@@ -35,6 +37,24 @@ function tempDir(prefix: string): string {
 }
 
 describe('harness safety primitives', () => {
+  it('[925-7] renders severity first and excerpts evidence within a byte budget', () => {
+    const rendered = boundedFindings([
+      { severity: 'nit', title: 'cosmetic', evidence: '界'.repeat(4_000) },
+      { severity: 'blocker', title: 'critical', evidence: '界'.repeat(4_000) },
+    ], '/artifacts/full.json', 2_500);
+    expect(rendered.indexOf('critical')).toBeGreaterThan(0);
+    expect(rendered.indexOf('cosmetic')).toBe(-1);
+    expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(2_500);
+    expect(rendered).toContain('/artifacts/full.json');
+    expect(rendered).toContain('Additional findings/evidence');
+  });
+
+  it('[925-6] budgets part waves using each advisor input and timeout bounds', () => {
+    expect(advisorCouncilTimeoutMs([{ timeoutMs: 600_000 }], 1_000, 10_000)).toBe(720_000);
+    expect(advisorCouncilTimeoutMs([{ timeoutMs: 1_800_000, maxInputBytes: 80_000 }], 800_000, 10_000))
+      .toBeGreaterThanOrEqual(8 * 1_800_000 + 120_000);
+  });
+
   it('rejects advisor family tampering and returns the trusted family', () => {
     const models = { deepseek: { family: 'deepseek' } };
     expect(

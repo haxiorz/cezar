@@ -108,6 +108,10 @@ describe('councilQuorum', () => {
 });
 
 describe('isRetryableReviewerFailure', () => {
+  it('[925-3] does not retry the runtime timed_out spelling', () => {
+    expect(isRetryableReviewerFailure('advisor returned status timed_out')).toBe(false);
+  });
+
   it('does not retry a timeout — the budget is already spent', () => {
     expect(isRetryableReviewerFailure('opencode timed out after 60m and was killed')).toBe(false);
     expect(isRetryableReviewerFailure('POST /session/x/message timed out after 3600000ms')).toBe(false);

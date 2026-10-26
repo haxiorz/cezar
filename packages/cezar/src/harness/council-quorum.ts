@@ -90,7 +90,7 @@ export const REVIEWER_MUTATION_FAILURE = 'reviewer mutated the worktree or index
  * connection, a malformed result) can genuinely differ on a retry.
  */
 export function isRetryableReviewerFailure(failure: string): boolean {
-  return !/timed?\s?out|timeout/i.test(failure);
+  return !/timed?[\s_]?out|timeout/i.test(failure);
 }
 
 /** How many council reviewers may run at once. The om runtime this was ported

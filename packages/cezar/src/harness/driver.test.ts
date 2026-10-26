@@ -31,6 +31,7 @@ import {
   harnessAgentOutputDir,
   harnessArtifactDir,
   runHarnessDriver,
+  resetIndexToHead,
   snapshotHarnessReviewSubject,
   snapshotHarnessStageSubject,
   type HarnessDriverDeps,
@@ -435,6 +436,369 @@ describe('harness driver — standard fix-issue graph', () => {
         },
       },
     },
+  });
+
+  it('[925-1] resets the index without reflog drift in the real vendored runtime', () => {
+    const cwd = join(dir, 'real-repo');
+    mkdirSync(cwd);
+    const git = (...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'test@local');
+    git('config', 'user.name', 'test');
+    writeFileSync(join(cwd, 'file.txt'), 'base\n');
+    git('add', 'file.txt');
+    git('commit', '-qm', 'base');
+    pinWorktreeGitDir(cwd, join(cwd, '.git'));
+    const script = new URL('../../vendor/skills/cez-harness/scripts/harness.mjs', import.meta.url).pathname;
+    const start = join(dir, 'real-start.json');
+    const paths = join(dir, 'real-paths.txt');
+    const output = join(dir, 'real-stage.json');
+    const runtime = (op: string, ...args: string[]) => execFileSync(process.execPath, [script, op, '--worktree', cwd, ...args], { encoding: 'utf8' });
+    runtime('capture', '--output', start);
+    writeFileSync(join(cwd, 'file.txt'), 'changed\n');
+    git('add', 'file.txt');
+    resetIndexToHead(cwd);
+    expect(git('diff', '--cached', '--name-only')).toBe('');
+    let verified: unknown;
+    try { verified = JSON.parse(runtime('verify', '--start-state', start)); } catch (error) {
+      verified = JSON.parse(String((error as { stdout: unknown }).stdout));
+    }
+    expect(verified).toMatchObject({ status: 'clean', drift: [] });
+    writeFileSync(paths, 'file.txt\n');
+    runtime('stage', '--start-state', start, '--paths-file', paths, '--output', output);
+    expect(JSON.parse(readFileSync(output, 'utf8'))).toMatchObject({ status: 'ready', stagedPaths: ['file.txt'] });
+  });
+
+  const closingHarness = () => {
+    const h = makeHarness(dir);
+    h.agentBehavior.set('review', (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ verdict: 'request_changes', findings: [{ severity: 'blocker', title: 'closing blocker', evidence: 'confirmed evidence' }] }));
+      return null;
+    });
+    for (const id of ['fix-2', 'fix-3']) h.agentBehavior.set(id, (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/runs/store.ts'] }));
+      return null;
+    });
+    return h;
+  };
+
+  it('[925-2] keeps closing blockers contested after Stop during fix-final', async () => {
+    const h = closingHarness();
+    let stopped = false;
+    h.host.isCancelled = () => stopped;
+    h.agentBehavior.set('fix-final', () => { stopped = true; return null; });
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    stopped = false;
+    h.agentBehavior.delete('fix-final');
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    const ledger = loadLedger(h.host.dataDir, h.host.runId)!;
+    expect(ledger.outcome.status).toBe('contested');
+    expect(ledger.outcome.blockingReasons.join('\n')).toContain('closing blocker');
+    expect(ledger.stage.prBody).toContain('closing blocker');
+    expect(h.calls.filter((call) => call.id.startsWith('review'))).toHaveLength(3);
+  });
+
+  it('[925-2] keeps closing blockers contested after stage refusal then Continue', async () => {
+    const h = closingHarness();
+    const create = h.deps.createRuntime!;
+    let refuse = true;
+    h.deps.createRuntime = (opts) => {
+      const runtime = create(opts);
+      return { ...runtime, run: async (op, args, options) => op === 'stage' && refuse
+        ? { ok: false, exitCode: 2, stdout: '', stderr: 'temporary stage refusal', durationMs: 0 }
+        : runtime.run(op, args, options) };
+    };
+    expect(await runHarnessDriver(h.host, input, h.deps)).toContain('temporary stage refusal');
+    refuse = false;
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    const ledger = loadLedger(h.host.dataDir, h.host.runId)!;
+    expect(ledger.outcome.status).toBe('contested');
+    expect(ledger.stage.prBody).toContain('closing blocker');
+  });
+
+  it('[925-3] does not retry timed_out or skipped advisors and preserves their own reasons', async () => {
+    const h = makeHarness(dir);
+    const advisorInput = { ...input, roles: {
+      orchestrator: { runner: 'claude' as const, model: 'opus' },
+      implementer: { runner: 'claude' as const, model: 'opus' },
+      reviewers: [
+        { runner: 'codex' as const, model: 'gpt-5.6-sol' },
+        { runner: 'opencode' as const, model: 'deepseek/deepseek-v4-pro' },
+        { runner: 'codex' as const, model: 'gpt-5.5-mini' },
+      ],
+    } };
+    let calls = 0;
+    h.setCouncilBehavior((ids) => {
+      calls += 1;
+      return { ok: false, stderr: 'Council policy FAILED: no valid reviews', result: {
+        reviewers: ids.map((id, index) => ({ id, status: ['timed_out', 'skipped', 'failed'][index], error: ['review timed out', 'missing provider credential', 'provider usage limit reached'][index] })),
+      } };
+    });
+    expect(await runHarnessDriver(h.host, advisorInput, h.deps)).toMatch(/quorum/);
+    expect.soft(calls).toBe(1);
+    const failed = loadLedger(h.host.dataDir, h.host.runId)!.invocations.filter((invocation) => invocation.role === 'reviewer');
+    expect(failed.map((invocation) => invocation.error)).toEqual(['review timed out', 'missing provider credential', 'provider usage limit reached']);
+  });
+
+  it('[925-4] preserves failed packet edits and cleans only its allowed paths before replacement', async () => {
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'test@local');
+    git('config', 'user.name', 'test');
+    mkdirSync(join(dir, 'src/runs'), { recursive: true });
+    writeFileSync(join(dir, 'src/runs/store.ts'), 'base\n');
+    writeFileSync(join(dir, 'unrelated.txt'), 'unrelated base\n');
+    git('add', 'src/runs/store.ts', 'unrelated.txt');
+    git('commit', '-qm', 'base');
+    pinWorktreeGitDir(dir, join(dir, '.git'));
+    writeFileSync(join(dir, 'unrelated.txt'), 'keep this edit\n');
+    const h = makeHarness(dir);
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    const create = h.deps.createRuntime!;
+    let attempts = 0;
+    h.deps.createRuntime = (opts) => {
+      const runtime = create(opts);
+      return { ...runtime, run: async (op, args, options) => {
+        if (op !== 'packet-run') return runtime.run(op, args, options);
+        attempts += 1;
+        if (attempts > 1 && (git('diff', 'HEAD', '--', 'src/runs/store.ts').trim() || existsSync(join(dir, 'test/unit/store.test.ts')))) {
+          return { ok: false, exitCode: 2, stdout: '', stderr: 'Packet allowed paths already contain uncommitted changes', durationMs: 0 };
+        }
+        const result = await runtime.run(op, args, options);
+        if (attempts === 1) {
+          writeFileSync(join(dir, 'src/runs/store.ts'), 'failed attempt edit\n');
+          mkdirSync(join(dir, 'test/unit'), { recursive: true });
+          writeFileSync(join(dir, 'test/unit/store.test.ts'), 'new failed test\n');
+          const packetPath = join(args[args.indexOf('--run-dir') + 1]!, 'packets/PK-01/packet-result.json');
+          const packet = JSON.parse(readFileSync(packetPath, 'utf8'));
+          writeFileSync(packetPath, JSON.stringify({ ...packet, state: 'blocked', error: 'gate failed with precise reason' }));
+          return { ok: false, exitCode: 2, stdout: '', stderr: '', durationMs: 0 };
+        }
+        return result;
+      } };
+    };
+    const packetInput = { ...input, profile: 'high-assurance' as const };
+    const first = await runHarnessDriver(h.host, packetInput, h.deps);
+    expect(first).toMatch(/packet PK-01 failed/);
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toBeNull();
+    const patch = join(harnessArtifactDir(h.host.dataDir, h.host.runId), 'packet-failed-diff-PK-01.patch');
+    expect(first).toContain('gate failed with precise reason');
+    expect(readFileSync(patch, 'utf8')).toContain('failed attempt edit');
+    expect(readFileSync(patch, 'utf8')).toContain('new failed test');
+    expect(readFileSync(join(dir, 'unrelated.txt'), 'utf8')).toBe('keep this edit\n');
+    expect(h.events.some((event) => String(event.message).includes(patch))).toBe(true);
+  });
+
+  it('[925-4] reports packet ledger errors when exit 2 has empty stderr', async () => {
+    const h = makeHarness(dir);
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    const create = h.deps.createRuntime!;
+    h.deps.createRuntime = (opts) => {
+      const runtime = create(opts);
+      return { ...runtime, run: async (op, args, options) => {
+        const result = await runtime.run(op, args, options);
+        if (op !== 'packet-run') return result;
+        const path = join(args[args.indexOf('--run-dir') + 1]!, 'packets/PK-01/packet-result.json');
+        const packet = JSON.parse(readFileSync(path, 'utf8'));
+        writeFileSync(path, JSON.stringify({ ...packet, state: 'blocked', error: 'precise packet gate failure' }));
+        return { ok: false, exitCode: 2, stderr: '', stdout: '', durationMs: 0 };
+      } };
+    };
+    expect(await runHarnessDriver(h.host, { ...input, profile: 'high-assurance' }, h.deps)).toContain('precise packet gate failure');
+  });
+
+  it('[925-5] retries a semantically overlapping packet plan and proceeds with the corrected plan', async () => {
+    const h = makeHarness(dir);
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    let attempts = 0;
+    h.agentBehavior.set('packet-plan', (req) => {
+      attempts += 1;
+      const packet = (id: string, path: string) => ({ version: 1, id, title: id, objective: 'work', risk: 'low', allowedPaths: [path], invariants: ['safe'], acceptanceCriteria: ['passes'], dependencies: [] });
+      writeFileSync(req.resultPath, JSON.stringify({ summary: 'packets', packets: [packet('PK-01', 'src/a.ts'), packet('PK-02', attempts === 1 ? 'src/a.ts' : 'src/b.ts')] }));
+      if (attempts === 2) expect(req.prompt).toContain('packet plans overlap');
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, { ...input, profile: 'high-assurance' }, h.deps)).toBeNull();
+    expect(attempts).toBe(2);
+    expect(h.ops.filter((op) => op.id === 'packet-run')).toHaveLength(2);
+  });
+
+  it('[925-6] starts five advisors together and budgets multipart council waves', async () => {
+    const h = makeHarness(dir);
+    const featureInput = { ...input, workflow: HARNESS_IMPLEMENT_FEATURE, roles: {
+      orchestrator: { runner: 'claude' as const, model: 'opus' },
+      implementer: { runner: 'claude' as const, model: 'opus' },
+      reviewers: [...['gpt-5.6-sol', 'gpt-5.5-mini', 'gpt-5.5', 'gpt-5.4'].map((model) => ({ runner: 'codex' as const, model })), { runner: 'opencode' as const, model: 'deepseek/deepseek-v4-pro' }],
+    } };
+    h.agentBehavior.set('spec', (req) => {
+      mkdirSync(join(dir, '.ai/specs'), { recursive: true });
+      writeFileSync(join(dir, '.ai/specs/large.md'), 's'.repeat(2_500_000));
+      writeFileSync(req.resultPath, JSON.stringify({ summary: 'large spec', specPath: '.ai/specs/large.md' }));
+      return null;
+    });
+    const create = h.deps.createRuntime!;
+    const deadlines: number[] = [];
+    let memberTimeout = 600_000;
+    h.deps.createRuntime = (opts) => {
+      const runtime = create(opts);
+      return { ...runtime, run: async (op, args, options) => {
+        if (op === 'review') {
+          const config = JSON.parse(readFileSync(args[args.indexOf('--config') + 1]!, 'utf8'));
+          expect.soft(config.agentHarness.profiles['cez-role-council'].maxParallel).toBe(5);
+          if (args.includes('--artifact')) {
+            deadlines.push(options?.timeoutMs ?? 0);
+            memberTimeout = Math.max(...Object.values(config.agentHarness.models as Record<string, { timeoutMs: number }>).map((model) => model.timeoutMs));
+          }
+        }
+        return runtime.run(op, args, options);
+      } };
+    };
+    expect(await runHarnessDriver(h.host, featureInput, h.deps)).toBeNull();
+    expect.soft(deadlines[0]).toBeGreaterThanOrEqual(3 * memberTimeout + 120_000);
+  });
+
+  it('[925-7] bounds fix findings and preserves complete overflow in an artifact', async () => {
+    const h = makeHarness(dir);
+    const large = Array.from({ length: 50 }, (_, index) => ({ severity: 'major', title: `finding ${index}`, evidence: '界'.repeat(4_000) }));
+    let reviews = 0;
+    h.agentBehavior.set('review', (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ verdict: reviews++ === 0 ? 'request_changes' : 'approve', findings: reviews === 1 ? large : [] }));
+      return null;
+    });
+    let prompt = '';
+    h.agentBehavior.set('fix-2', (req) => {
+      prompt = req.prompt;
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/runs/store.ts'] }));
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    expect(Buffer.byteLength(prompt)).toBeLessThan(180_000);
+    const artifact = join(harnessArtifactDir(h.host.dataDir, h.host.runId), 'findings-fix-2.json');
+    expect(prompt).toContain(artifact);
+    expect(JSON.parse(readFileSync(artifact, 'utf8'))).toHaveLength(50);
+    expect(readFileSync(artifact, 'utf8')).toContain('界'.repeat(4_000));
+  });
+
+  it('[925-7] bounds spec revision findings and cites their complete artifact', async () => {
+    const h = makeHarness(dir);
+    const featureInput = { ...input, workflow: HARNESS_IMPLEMENT_FEATURE, roles: {
+      orchestrator: { runner: 'claude' as const, model: 'opus' },
+      implementer: { runner: 'claude' as const, model: 'opus' },
+      reviewers: [{ runner: 'claude' as const, model: 'opus' }, { runner: 'codex' as const, model: 'gpt-5.6-sol' }],
+    } };
+    const specPath = '.ai/specs/feature.md';
+    const writeSpec = (req: HarnessAgentPhaseRequest) => {
+      mkdirSync(join(dir, '.ai/specs'), { recursive: true });
+      writeFileSync(join(dir, specPath), '# feature');
+      writeFileSync(req.resultPath, JSON.stringify({ summary: 'feature', specPath }));
+      return null;
+    };
+    h.agentBehavior.set('spec', writeSpec);
+    let reviews = 0;
+    h.agentBehavior.set('spec-review', (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ verdict: reviews++ === 0 ? 'request_changes' : 'approve', findings: reviews === 1 ? Array.from({ length: 50 }, (_, index) => ({ severity: 'major', title: `spec finding ${index}`, evidence: '界'.repeat(4_000) })) : [] }));
+      return null;
+    });
+    let revision = '';
+    h.agentBehavior.set('spec-2', (req) => { revision = req.prompt; return writeSpec(req); });
+    expect(await runHarnessDriver(h.host, featureInput, h.deps)).toBeNull();
+    const path = join(harnessArtifactDir(h.host.dataDir, h.host.runId), 'findings-spec-1.json');
+    expect(revision).toContain(path);
+    expect(Buffer.byteLength(revision)).toBeLessThan(180_000);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toHaveLength(50);
+  });
+
+  it('[925-4] refuses replacement honestly when the allowed paths cannot be restored', async () => {
+    const h = makeHarness(dir);
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    h.setPacketRunBehavior(() => 'blocked');
+    const packetInput = { ...input, profile: 'high-assurance' as const };
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toMatch(/packet PK-01 failed/);
+    mkdirSync(join(dir, 'src/runs'), { recursive: true });
+    writeFileSync(join(dir, 'src/runs/store.ts'), 'preserve this edit');
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toMatch(/replacement refused.*no pinned Git directory/);
+    expect(h.ops.filter((op) => op.id === 'packet-run')).toHaveLength(1);
+    expect(readFileSync(join(dir, 'src/runs/store.ts'), 'utf8')).toBe('preserve this edit');
+  });
+
+  it('[925-8] clamps session review cosmetic bounds and retains the most severe findings', async () => {
+    const h = makeHarness(dir);
+    let reviews = 0;
+    h.agentBehavior.set('review', (req) => {
+      reviews += 1;
+      writeFileSync(req.resultPath, JSON.stringify({ verdict: 'approve', findings: reviews === 1 ? [
+        ...Array.from({ length: 60 }, () => ({ severity: 'nit', title: 't'.repeat(700), evidence: 'e'.repeat(5_000) })),
+        { severity: 'blocker', title: 'critical at tail', evidence: 'e'.repeat(5_000) },
+      ] : [] }));
+      return null;
+    });
+    h.agentBehavior.set('fix-2', (req) => {
+      expect(req.prompt).toContain('critical at tail');
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/runs/store.ts'] }));
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    expect(reviews).toBe(2);
+    expect(h.calls.filter((call) => call.id === 'fix-2')).toHaveLength(1);
+  });
+
+  it('[925-8] clamps diagnosis lists instead of spending a contract retry', async () => {
+    const h = makeHarness(dir);
+    h.agentBehavior.set('diagnose', (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ summary: 'diagnosis', files: Array.from({ length: 250 }, (_, index) => `src/${index}.ts`) }));
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    expect(h.calls.filter((call) => call.id === 'diagnose')).toHaveLength(1);
+  });
+
+  it('[925-8] clamps spec file and question lists instead of spending a contract retry', async () => {
+    const feature = makeHarness(dir);
+    feature.host.runId = 'feature';
+    feature.agentBehavior.set('spec', (req) => {
+      mkdirSync(join(dir, '.ai/specs'), { recursive: true });
+      writeFileSync(join(dir, '.ai/specs/spec.md'), '# spec');
+      writeFileSync(req.resultPath, JSON.stringify({ summary: 'spec', specPath: '.ai/specs/spec.md', files: Array.from({ length: 250 }, (_, index) => `src/${index}.ts`), openQuestions: Array.from({ length: 60 }, (_, index) => `question ${index}`) }));
+      return null;
+    });
+    expect(await runHarnessDriver(feature.host, { ...input, workflow: HARNESS_IMPLEMENT_FEATURE }, feature.deps)).toBeNull();
+    expect(feature.calls.filter((call) => call.id === 'spec')).toHaveLength(1);
+  });
+
+  it('[925-8] reuses an advisor location normalized from a long path and symbol', async () => {
+    const h = makeHarness(dir);
+    const reviewInput = { ...input, roles: {
+      orchestrator: { runner: 'claude' as const, model: 'opus' },
+      implementer: { runner: 'claude' as const, model: 'opus' },
+      reviewers: [{ runner: 'claude' as const, model: 'opus' }, { runner: 'codex' as const, model: 'gpt-5.6-sol' }],
+    } };
+    let calls = 0;
+    h.setCouncilBehavior((ids) => {
+      calls += 1;
+      return { ok: true, result: { reviewers: ids.map((id) => ({ id, status: 'completed', review: { verdict: 'approve', findings: [{ severity: 'minor', title: 'long location', location: { path: 'p'.repeat(990), symbol: 's'.repeat(490), line: 123 } }] } })) } };
+    });
+    expect(await runHarnessDriver(h.host, reviewInput, h.deps)).toBeNull();
+    expect(await runHarnessDriver(h.host, reviewInput, h.deps)).toBeNull();
+    expect(calls).toBe(1);
+  });
+
+  it('[925-9] retries a rejected incomplete stage result on Continue', async () => {
+    const h = makeHarness(dir);
+    const create = h.deps.createRuntime!;
+    let stages = 0;
+    h.deps.createRuntime = (opts) => {
+      const runtime = create(opts);
+      return { ...runtime, run: async (op, args, options) => {
+        const result = await runtime.run(op, args, options);
+        if (op === 'stage' && ++stages === 1) writeFileSync(args[args.indexOf('--output') + 1]!, JSON.stringify({ status: 'ready', stagedPaths: ['incomplete.ts'] }));
+        return result;
+      } };
+    };
+    expect(await runHarnessDriver(h.host, input, h.deps)).toContain('stage result is incomplete');
+    const rejectedStatus = loadLedger(h.host.dataDir, h.host.runId)!.invocations.find((invocation) => invocation.id === 'runtime:stage')?.status;
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    expect(stages).toBe(2);
+    expect(rejectedStatus).toBe('failed');
   });
 
   /**

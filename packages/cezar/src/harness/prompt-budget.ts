@@ -21,6 +21,42 @@ export const HARNESS_RESULT_LIMITS = {
   questions: 50,
 } as const;
 
+/** Bound greedy line splitting and two simultaneous parts per advisor (harness.mjs, PR #925 review). */
+export function advisorCouncilTimeoutMs(
+  models: readonly { timeoutMs?: unknown; maxInputBytes?: unknown }[],
+  subjectBytes: number,
+  fixedBytes: number,
+): number {
+  return Math.max(600_000, ...models.map((model) => {
+    const subjectBudget = Math.max(1_024, (Number(model.maxInputBytes) || 180_000) - fixedBytes - 16_384);
+    const parts = subjectBytes <= subjectBudget ? 1 : 2 * Math.ceil(subjectBytes / (subjectBudget - 4)) + 1;
+    return Math.ceil(parts / 2) * (Number(model.timeoutMs) || 600_000);
+  })) + 120_000;
+}
+
+export interface PromptFinding {
+  severity: 'blocker' | 'major' | 'minor' | 'nit';
+  title: string;
+  location?: string;
+  evidence?: string;
+  by?: string;
+}
+
+/** Paid findings remain in the artifact; only the model-facing aggregate is bounded (PR #925 review). */
+export function boundedFindings(findings: readonly PromptFinding[], artifactPath: string, budgetBytes = 40_000): string {
+  const ranks = { blocker: 0, major: 1, minor: 2, nit: 3 };
+  const lines = [`Full findings (${findings.length}), including any omitted evidence: ${artifactPath}`];
+  for (const finding of [...findings].sort((a, b) => ranks[a.severity] - ranks[b.severity])) {
+    const line = `- [${finding.severity}] ${finding.title.slice(0, 500)}${finding.location ? ` @ ${finding.location.slice(0, 1_000)}` : ''}${finding.by ? ` (raised by ${finding.by})` : ''}${finding.evidence ? ` — ${finding.evidence.slice(0, 600)}` : ''}`;
+    if (promptBytes([...lines, line, 'Additional findings/evidence are in the full findings artifact.'].join('\n')) > budgetBytes) {
+      lines.push('Additional findings/evidence are in the full findings artifact.');
+      break;
+    }
+    lines.push(line);
+  }
+  return lines.join('\n');
+}
+
 export function promptBytes(prompt: string): number {
   return Buffer.byteLength(prompt, 'utf8');
 }
