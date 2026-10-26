@@ -79,6 +79,7 @@ import { acquireIssueClaim, releaseIssueClaim } from './issue-claim.js';
 import { readHarnessFsEntry } from './fs-read.js';
 import { pinnedGitEnv, pinWorktreeGitDir, resolveTrustedGitDir, verifyWorktreeGitPointer } from '../git-pin.js';
 import { harnessPhaseSkills } from './skill-routing.js';
+import { isUsageLimitMessage } from '../core/usage-limit.js';
 import { createClaudeStageOnlySettings } from './claude-guard.js';
 import type {
   HarnessInvocation,
@@ -2435,6 +2436,19 @@ export async function runHarnessDriver(
     return 'the review subject changed during the council, so this round is void; the changed worktree was preserved for manual recovery, and Continue re-validates and re-reviews it';
   };
 
+  /** A usage-limited reviewer spends no attempt and is not retried into the closed window: both
+   *  attempts burned at once, so the auto-resume at the reset ran no reviewer (PR #925 review). A
+   *  timeout or crash still counts, which is what a recorded proceed decision skips. */
+  const reviewerFailedBefore = (invocationId: string, inputSha256: string): boolean => {
+    if (attemptsForInput(invocationId, inputSha256) > 0) return true;
+    const prior = ledger.invocations.find((invocation) => invocation.id === invocationId);
+    return (
+      prior?.inputSha256 === inputSha256 &&
+      prior.status === 'interrupted' &&
+      isUsageLimitMessage(prior.error ?? '')
+    );
+  };
+
   /** One packet-less advisor council op (spec 2026-07-24-advisor-reviewers):
    *  a runtime `review` over a profile synthesized to exactly the given
    *  bindings. `artifact` overrides the subject (spec councils review the
@@ -4156,7 +4170,9 @@ export async function runHarnessDriver(
             const priorAttempts = attemptsForInput(invocationId, inputSha256);
             // "Proceed with the survivors" ignores a reviewer that already failed: paying for it
             // again before the decision applies is what the user declined (PR #925 review).
-            const proceeding = priorAttempts > 0 && councilProceedAccepted('spec', sround, specSubjectSha256);
+            const proceeding =
+              reviewerFailedBefore(invocationId, inputSha256) &&
+              councilProceedAccepted('spec', sround, specSubjectSha256);
             let lastFailure: string | null = proceeding ? priorReviewerFailure(invocationId) : null;
             let lastContractFailure: string | null = null;
             for (
@@ -4213,8 +4229,9 @@ export async function runHarnessDriver(
               }
               if (failure) {
                 lastFailure = failure;
-                finishInvocation(invocation, 'failed', { error: failure });
-                if (!isRetryableReviewerFailure(failure)) break;
+                const limited = isUsageLimitMessage(failure);
+                finishInvocation(invocation, limited ? 'interrupted' : 'failed', { error: failure });
+                if (limited || !isRetryableReviewerFailure(failure)) break;
                 // The spec changed under this reviewer: the round is void, so a retry buys nothing.
                 if (failure.startsWith(REVIEWER_MUTATION_FAILURE) && hashFile(join(host.cwd, specPath)) !== specSubjectSha256) break;
                 continue;
@@ -5056,7 +5073,9 @@ export async function runHarnessDriver(
           const priorAttempts = attemptsForInput(invocationId, inputSha256);
           // "Proceed with the survivors" ignores a reviewer that already failed: paying for it
           // again before the decision applies is what the user declined (PR #925 review).
-          const proceeding = priorAttempts > 0 && councilProceedAccepted('implementation', round, implementationSubjectSha256);
+          const proceeding =
+            reviewerFailedBefore(invocationId, inputSha256) &&
+            councilProceedAccepted('implementation', round, implementationSubjectSha256);
           let lastFailure: string | null = proceeding ? priorReviewerFailure(invocationId) : null;
           let lastContractFailure: string | null = null;
           for (
@@ -5112,8 +5131,9 @@ export async function runHarnessDriver(
             }
             if (failure) {
               lastFailure = failure;
-              finishInvocation(invocation, 'failed', { error: failure });
-              if (!isRetryableReviewerFailure(failure)) break;
+              const limited = isUsageLimitMessage(failure);
+              finishInvocation(invocation, limited ? 'interrupted' : 'failed', { error: failure });
+              if (limited || !isRetryableReviewerFailure(failure)) break;
               // The subject changed under this reviewer and stayed changed: the round is void, so a
               // retry would only pay to review an edit no gate validated (PR #925 review).
               if (

@@ -2881,6 +2881,33 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(h.ops.some((o) => o.id === 'review')).toBe(true);
   });
 
+  // PR #925 review: a usage limit spent both reviewer attempts at once (attempt 2 fired into the same
+  // closed window), so the auto-resume at reset ran no reviewer and the run stayed parked.
+  it('leaves a usage-limited reviewer unspent, so the resume at reset runs it again', async () => {
+    const h = makeHarness(dir);
+    for (const phase of ['qualify', 'diagnose', 'implement']) {
+      h.agentBehavior.set(phase, (req) => {
+        writeFileSync(req.resultPath, JSON.stringify(phaseDefaults[phase]), 'utf8');
+        return null;
+      });
+    }
+    let limited = true;
+    let reviewerAttempts = 0;
+    h.agentBehavior.set('review', (req) => {
+      reviewerAttempts += 1;
+      if (limited) return `Claude AI usage limit reached|${Math.floor(Date.now() / 1000) + 3600}`;
+      writeFileSync(req.resultPath, JSON.stringify({ verdict: 'approve', findings: [] }), 'utf8');
+      return null;
+    });
+
+    expect(await runHarnessDriver(h.host, { ...input, roles }, h.deps)).toMatch(/quorum/);
+    expect(reviewerAttempts).toBe(1);
+
+    limited = false;
+    expect(await runHarnessDriver(h.host, { ...input, roles }, h.deps)).toBeNull();
+    expect(reviewerAttempts).toBe(2);
+  });
+
   // PR #925 review: the mutating attempt was retried, attempt 2 approved its own edit, and the
   // edit staged as `ready` on a review the rest of the council never saw.
   it('voids a council round a reviewer edited instead of retrying it into a staged result', async () => {
@@ -3271,6 +3298,37 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     h.agentBehavior.set('review', () => {
       sessionReviews += 1;
       return 'claude timed out after 30m and was stopped';
+    });
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toMatch(/quorum/);
+    expect(sessionReviews).toBe(1);
+
+    const decided = loadLedger(h.host.dataDir, h.host.runId)!;
+    decided.decisions.push({
+      at: new Date().toISOString(),
+      kind: 'council.proceed',
+      by: 'user',
+      detail: recordedDecisionDetail(decided),
+    });
+    saveLedger(h.host.dataDir, h.host.runId, decided);
+
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toBeNull();
+    expect(sessionReviews).toBe(1);
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.outcome.status).toBe('ready');
+  });
+
+  it('a recorded proceed decision skips a usage-limited reviewer, though its attempt was not spent', async () => {
+    const h = makeHarness(dir);
+    h.setCouncilBehavior((ids) => ({
+      ok: true,
+      result: {
+        verdict: 'approve',
+        reviewers: ids.map((id) => ({ id, status: 'completed', review: { verdict: 'approve', findings: [] } })),
+      },
+    }));
+    let sessionReviews = 0;
+    h.agentBehavior.set('review', () => {
+      sessionReviews += 1;
+      return `Claude AI usage limit reached|${Math.floor(Date.now() / 1000) + 3600}`;
     });
     expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toMatch(/quorum/);
     expect(sessionReviews).toBe(1);
