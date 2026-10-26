@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Hono } from 'hono';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { harnessLedgerResponseSchema, harnessProbeInputSchema, harnessStartInputSchema } from '@open-mercato/cezar-contract';
 import { createLedger, readLedger, saveLedger } from '../harness/ledger.js';
 import { acquireIssueClaim } from '../harness/issue-claim.js';
@@ -13,6 +13,7 @@ import type { RunManager, StartRunInput } from '../workflows/run.js';
 import type { WorkflowDef } from '../workflows/types.js';
 import { connectedProviderAuth } from './provider-auth.testkit.js';
 import { createApp } from './server.js';
+import { agentAccountsPath } from '../paths.ts';
 import { apiRequest } from './loopback-request.testkit.js';
 import { defaultWorkspaceConfig } from '../workspace/config.ts';
 
@@ -292,6 +293,39 @@ describe('harness API', () => {
       expect(body.profile).toBe('standard');
       expect(body.ready).toBe(true);
       expect(body.models.map((m) => m.id)).toContain('claude');
+    });
+
+    // PR #925 review: readiness judged the default login, so a project on a signed-out "work"
+    // account read ready and probed a login its phases would never use.
+    it('judges the account the project selected', async () => {
+      mkdirSync(join(repoRoot, 'claude-work'));
+      writeFileSync(agentAccountsPath(), JSON.stringify({
+        version: 1,
+        accounts: [{ id: 'work', provider: 'claude', configDir: join(repoRoot, 'claude-work') }],
+        selections: { [repoRoot]: { claude: 'work' } },
+      }));
+      const auth = connectedProviderAuth();
+      vi.spyOn(auth, 'profileStatus').mockResolvedValue({ provider: 'claude', status: 'disconnected', profileId: 'work' });
+      const probed = vi.fn();
+      const gated = createApp({
+        repoRoot,
+        store,
+        version: '0.0.0-test',
+        providerAuth: auth,
+        manager: { startRun: () => { throw new Error('must not start'); }, isActive: () => false } as unknown as RunManager,
+        harnessProber: { probe: probed, probeAll: probed, clearCache: () => undefined },
+      });
+      try {
+        const res = await apiRequest(gated, '/api/v1/harness/probe', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ profile: 'standard' }),
+        });
+        expect(await res.json()).toMatchObject({ ready: false, reason: expect.stringMatching(/claude/i) });
+        expect(probed).not.toHaveBeenCalled();
+      } finally {
+        rmSync(agentAccountsPath(), { force: true });
+      }
     });
 
     it('reports a configured profile as unavailable when its bindings are absent', async () => {

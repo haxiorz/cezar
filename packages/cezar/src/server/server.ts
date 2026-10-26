@@ -4970,6 +4970,7 @@ export function createApp(deps: ServerDeps) {
       // turned off, answered `ready` (PR #925 review).
       const providersBlocked = await providerActionError(
         providersRequiredByHarness(body.roles ? { profile, roles: body.roles } : { profile }, agentic.agentHarness),
+        { repoRoot },
       );
       if (providersBlocked) return c.json({ profile, ready: false, reason: providersBlocked, models: [] });
       const prober =
