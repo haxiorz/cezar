@@ -136,6 +136,9 @@ export interface ThreadReduceOptions {
   /** A harness run's step names by id: its phases share turns, so each phase boundary gets a
    *  divider labelled with the phase. Absent for every other run, whose transcript has none. */
   stepNames?: ReadonlyMap<string, string>
+  /** A harness run: its phase sessions never render an ask card, so a cardless `CEZ:ASK` reads as
+   *  its questions (user reports 2026-07-27/28). Every other run keeps the raw fallback (#757). */
+  askAsProse?: boolean
 }
 
 /** What the strip under the thread says. Pure so the mapping is table-testable. */
@@ -272,16 +275,16 @@ const isAskQuestion = (value: unknown): value is UiAskQuestion =>
  *
  *  `stripAsk` gates the `CEZ:ASK` strip on the turn actually holding an ask card (#473): the
  *  card is the only other place the questions exist, so a marker whose card never materialized
- *  (invalid payload, a non-interactive harness phase, or the session died before turn-end)
- *  must stay VISIBLE — but visible as readable questions, not as the raw protocol JSON it was
- *  repeatedly reported as. `askMarkerAsProse` rewrites anything ask-shaped; only a payload too
- *  broken to read as questions stays raw, because raw is then the only honest rendering. */
-function stripDoneMarker(text: string, stripAsk: boolean): string {
+ *  (invalid payload, or the session died before turn-end) must stay visible as raw text — the
+ *  user can still read the question and answer via the composer. Hiding it would delete the
+ *  question from the thread entirely. `askAsProse` (harness runs only, whose non-interactive
+ *  phases never render a card) shows an ask-shaped payload as its questions instead of raw JSON. */
+function stripDoneMarker(text: string, stripAsk: boolean, askAsProse = false): string {
   let trailing = text
     .replace(/\s*CEZ:DONE\s*$/, '')
     .replace(/\s*CEZ:MONITORING\s*$/, '')
   if (stripAsk) trailing = trailing.replace(/\s*CEZ:ASK[ \t]+\{[\s\S]*\}\s*$/, '')
-  else trailing = askMarkerAsProse(trailing) ?? trailing
+  else if (askAsProse) trailing = askMarkerAsProse(trailing) ?? trailing
   if (!trailing.includes('CEZ:')) return trailing
   return trailing
     .split('\n')
@@ -320,7 +323,8 @@ function askMarkerAsProse(trailing: string): string | null {
     blocks.push(lines.join('\n'))
   }
   if (blocks.length === 0) return null
-  return trailing.replace(/CEZ:ASK[ \t]+\{[\s\S]*\}\s*$/, blocks.join('\n\n'))
+  // A replacer: ask text may hold `$&`-style patterns a replacement string would expand.
+  return trailing.replace(/CEZ:ASK[ \t]+\{[\s\S]*\}\s*$/, () => blocks.join('\n\n'))
 }
 
 /**
@@ -868,7 +872,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         ...(draft.completed !== undefined ? { completed: draft.completed } : {}),
         items: draft.entries.map(({ entry }) =>
           entry.kind === 'message' && entry.role === 'assistant'
-            ? { ...entry, text: stripDoneMarker(entry.text, hasAskCard || provisionalAsk) }
+            ? { ...entry, text: stripDoneMarker(entry.text, hasAskCard || provisionalAsk, options.askAsProse) }
             : entry,
         ),
       }

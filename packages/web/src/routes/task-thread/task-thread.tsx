@@ -107,11 +107,11 @@ export function TaskThreadRoute() {
     [harnessSteps],
   )
   const thread = useMemo(
-    () => reduceThread(history.visibleEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames }),
+    () => reduceThread(history.visibleEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames, askAsProse: stepNames !== undefined }),
     [history.visibleEvents, runStatus, run.data?.runner, stepNames],
   )
   const currentThread = useMemo(
-    () => reduceThread(history.currentEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames }),
+    () => reduceThread(history.currentEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames, askAsProse: stepNames !== undefined }),
     [history.currentEvents, runStatus, run.data?.runner, stepNames],
   )
 

@@ -2500,8 +2500,8 @@ describe('CEZ:ASK parks as waiting and emits ask.requested (#473)', () => {
       header: string;
       options: Array<{ label: string; description?: string }>;
     }>;
-    expect(questions[0]!.header).toBe('Implementat…');
-    expect(questions[0]!.options[0]).toEqual({ label: 'Minimal', description: `${'d'.repeat(279)}…` });
+    expect(questions[0]!.header).toBe('Implementati');
+    expect(questions[0]!.options[0]).toEqual({ label: 'Minimal', description: 'd'.repeat(280) });
     expect(events.filter((event) => event.type === 'text').some((event) => String(event.text).includes('CEZ:ASK'))).toBe(false);
   }, 30_000);
 

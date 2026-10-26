@@ -980,12 +980,12 @@ describe('reduceThread — AskUser cards (#473)', () => {
 // Regression (user reports 2026-07-27 and 2026-07-28, same complaint twice): a
 // harness phase session ends its turn with a CEZ:ASK no card will ever render
 // (phase sessions are non-interactive), and the thread showed ~1.5 KB of raw
-// protocol JSON where four questions should be. Ask-shaped payloads without a
-// card now render as the questions themselves; only a payload too broken to
-// read as questions stays raw.
+// protocol JSON where four questions should be. In a harness run, ask-shaped payloads without a
+// card render as the questions themselves; only a payload too broken to read as questions stays
+// raw. An ordinary run keeps main's raw fallback (#757, PR #925 review).
 describe('cardless CEZ:ASK rendering', () => {
-  const allItems = (events: RunEvent[]): ThreadEntry[] =>
-    reduceThread(events).turns.flatMap((turn) => turn.items)
+  const allItems = (events: RunEvent[], askAsProse = true): ThreadEntry[] =>
+    reduceThread(events, { askAsProse }).turns.flatMap((turn) => turn.items)
   const payload = JSON.stringify({
     questions: [
       {
@@ -1036,6 +1036,27 @@ describe('cardless CEZ:ASK rendering', () => {
       }),
     ]).find((i) => i.kind === 'message') as { text: string } | undefined
     expect(msg?.text).toBe(raw)
+  })
+
+  it('leaves an ordinary run\'s cardless marker as raw text, as on main', () => {
+    const text = `Before I write the spec:\n\nCEZ:ASK ${payload}`
+    const msg = allItems(
+      [line(1, 'item.completed', { item: { kind: 'message', id: 'm1', role: 'assistant', text } })],
+      false,
+    ).find((i) => i.kind === 'message') as { text: string } | undefined
+    expect(msg?.text).toBe(text)
+  })
+
+  it('keeps replacement patterns in the question literal', () => {
+    const literal = JSON.stringify({
+      questions: [{ header: 'Price', question: "Charge $& or $' per seat?", options: [{ label: 'a' }] }],
+    })
+    const msg = allItems([
+      line(1, 'item.completed', {
+        item: { kind: 'message', id: 'm1', role: 'assistant', text: `Q:\n\nCEZ:ASK ${literal}` },
+      }),
+    ]).find((i) => i.kind === 'message') as { text: string } | undefined
+    expect(msg?.text).toBe("Q:\n\n**Price** — Charge $& or $' per seat?\n- a")
   })
 })
 
