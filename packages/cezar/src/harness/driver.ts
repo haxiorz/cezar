@@ -425,9 +425,13 @@ function preserveAndRestorePacket(cwd: string, paths: readonly string[], artifac
       if (existsSync(parent) && lstatSync(parent).isSymbolicLink()) throw new Error(`packet path has a symlink parent: ${path}`);
     }
   }
-  // Preserve before restoring; an existing artifact belongs to a crash interrupted recovery.
-  if (!existsSync(artifactPath)) {
-    writeFileSync(artifactPath, harnessDiff(cwd, paths, `${artifactPath}.index`), { flag: 'wx' });
+  // Preserve before restoring; an existing artifact belongs to a crash interrupted recovery, and the
+  // exclusive create is the only check, so nothing can slip in between (CodeQL js/file-system-race).
+  const diff = harnessDiff(cwd, paths, `${artifactPath}.index`);
+  try {
+    writeFileSync(artifactPath, diff, { flag: 'wx' });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
   }
   const head = new Set(headPaths);
   for (const path of affected.filter((path) => !head.has(path))) {
