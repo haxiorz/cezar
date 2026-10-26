@@ -1,11 +1,13 @@
 import { NetworkIcon } from 'lucide-react'
 import { Link, useParams } from 'react-router'
 
-import { useHarnessStatus } from '@/api/queries'
+import { useHarnessStatus } from '@/api/harness'
 import type { HarnessCertification, HarnessModel } from '@open-mercato/cezar-api-client'
 import { CenteredState } from '@/components/centered-state'
 import { cn } from '@/lib/utils'
-import { HARNESS_PROFILE_OPTIONS } from '../new-task-form'
+import {
+  HARNESS_PROFILE_OPTIONS,
+} from '../new-task-harness-form'
 
 /**
  * Project settings → Harness (spec 2026-07-23-harness-orchestration; user feedback

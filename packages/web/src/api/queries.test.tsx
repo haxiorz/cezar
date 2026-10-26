@@ -13,8 +13,6 @@ import {
   useReferenceProjectId,
   useProjectRepoBase,
   queryKeys,
-  useAcceptContestedHarness,
-  useHarnessInvocation,
   useProviderStatus,
   useRefreshProviderStatus,
   useRetryProviderAuth,
@@ -39,8 +37,8 @@ import {
   STAR_COUNT_REFRESH_MS,
   workspaceQueryKeys,
   __clearRememberedStatusesForTests,
-  useHarnessStatus,
 } from './queries'
+import { useAcceptContestedHarness, useHarnessInvocation, useHarnessStatus } from './harness'
 
 const fetchMock = vi.fn<typeof fetch>()
 

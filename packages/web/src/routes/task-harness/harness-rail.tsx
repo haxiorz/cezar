@@ -1,6 +1,9 @@
 import { BotIcon, LoaderCircleIcon, RotateCcwIcon, ShieldCheckIcon, WaypointsIcon } from 'lucide-react'
 
-import { useCouncilDecision, useRun } from '@/api/queries'
+import {
+  useRun,
+} from '@/api/queries'
+import { useCouncilDecision } from '@/api/harness'
 import type { HarnessLedgerResponse, HarnessPhaseRecord } from '@open-mercato/cezar-api-client'
 import { Pill } from '@/components/pill'
 import { StatusDot } from '@/components/status-dot'

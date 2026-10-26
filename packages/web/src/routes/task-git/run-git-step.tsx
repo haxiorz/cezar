@@ -9,7 +9,7 @@ import { toast } from '@/components/ui/toaster'
 import { gitActionPolicy, trunkGitActionPolicy, type GitAction, type GitActionId } from '@/lib/git-actions'
 import { ownedTaskPr } from '@/lib/tasks-table'
 
-import { harnessPublishBlockedReason } from '../task-harness/harness-state'
+import { harnessPublishBlockedReason } from '../task-harness/harness-publish'
 import { useAskAnswer } from '../task-thread/ask-answer'
 import {
   commitPrompt,

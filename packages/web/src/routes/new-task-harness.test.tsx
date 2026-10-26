@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { HarnessRoles } from '@open-mercato/cezar-api-client'
 
 import { HarnessPanel, HarnessSetupDialog, ModelPickerPill } from './new-task-harness'
-import type { HarnessModelOption } from './new-task-form'
+import type {
+  HarnessModelOption,
+} from './new-task-harness-form'
 
 /**
  * The Multi-model tab's role-based surface (user feedback 2026-07-24): pick models for

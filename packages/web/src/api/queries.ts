@@ -6,7 +6,6 @@ import { mergeRun } from './events'
 
 import {
   ApiError,
-  acceptContestedHarness,
   browseFs,
   checkoutProject,
   createProject,
@@ -14,7 +13,6 @@ import {
   connectProvider,
   continueRun,
   continueProjectRun,
-  councilDecision,
   createAgentProfile,
   editQueuedMessage,
   getAgentConfig,
@@ -30,8 +28,6 @@ import {
   getGithubPrChanges,
   getGithubRefStatus,
   getGroup,
-  getHarnessStatus,
-  getHarnessInvocation,
   getRunHarness,
   getHealth,
   getImportableSkills,
@@ -63,7 +59,11 @@ import {
   getSkills,
   getSkillsWhenReady,
   getTodos,
-  getTrackerAssociation, getTrackerConnection, getProjectSecrets, getWorkspaceSecrets, getE2eStatus,
+  getTrackerAssociation,
+  getTrackerConnection,
+  getProjectSecrets,
+  getWorkspaceSecrets,
+  getE2eStatus,
   getTrackerCandidates,
   getTrackerItem,
   getTrackerItems,
@@ -88,7 +88,6 @@ import {
   markRunSeen,
   markRunUnseen,
   patchRun,
-  probeHarness,
   putAgentConfigFile,
   pinProjectRun,
   pinRun,
@@ -120,9 +119,6 @@ import type {
   CheckoutProjectInput,
   CreateProjectInput,
   CreateAgentProfileInput,
-  HarnessProfile,
-  HarnessRoles,
-  HarnessInvocationRecord,
   RunEvent,
   ApiRun,
   HealthResponse,
@@ -1190,80 +1186,8 @@ export function useRunHarness(id: string | undefined, enabled = true, events: re
   return query
 }
 
-/** A reviewer's conversation, cached per invocation revision: a feedback continuation may
- *  reuse the invocation id and rewrite its prompt/result artifacts. */
-export function useHarnessInvocation(
-  id: string | undefined,
-  invocationId: string | null,
-  revision?: HarnessInvocationRecord,
-) {
-  return useQuery({
-    queryKey: [
-      ...queryKeys.runs.harness(id ?? ''), 'invocation', invocationId ?? '',
-      revision?.inputSha256, revision?.status, revision?.attempt,
-      revision?.startedAt, revision?.endedAt, revision?.artifactSha256,
-    ] as const,
-    queryFn: ({ signal }) => getHarnessInvocation(id as string, invocationId as string, { signal }),
-    enabled: Boolean(id) && Boolean(invocationId),
-    retry: false,
-    staleTime: Number.POSITIVE_INFINITY,
-  })
-}
 
-export function useAcceptContestedHarness(id: string) {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (reason: string) => acceptContestedHarness(id, reason),
-    onSuccess: ({ outcome, decisions, resumed }) => {
-      if (resumed) {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.runs.harness(id) })
-        void queryClient.invalidateQueries({ queryKey: queryKeys.runs.detail(id) })
-        void queryClient.invalidateQueries({ queryKey: queryKeys.runs.list() })
-        return
-      }
-      // BOTH halves, or publishing never unlocks (review 2026-07-27): the gate
-      // requires the matching `accept-contested` decision row as well as the
-      // acceptance stamp on `outcome`, and this query never refetches on its own
-      // (`staleTime: Infinity`, no polling), so a partial patch is permanent —
-      // the panel said "accepted" while Finish and Draft PR stayed disabled.
-      queryClient.setQueryData<import('@open-mercato/cezar-api-client').HarnessLedgerResponse>(
-        queryKeys.runs.harness(id),
-        (ledger) => {
-          if (!ledger) return ledger
-          const rows =
-            decisions ??
-            (outcome.acceptedAt && outcome.acceptanceReason
-              ? [
-                  ...(ledger.decisions ?? []),
-                  {
-                    at: outcome.acceptedAt,
-                    kind: 'accept-contested',
-                    by: outcome.acceptedBy ?? 'user',
-                    detail: outcome.acceptanceReason,
-                  },
-                ]
-              : ledger.decisions)
-          return { ...ledger, outcome, ...(rows ? { decisions: rows } : {}) }
-        },
-      )
-    },
-  })
-}
 
-/** Resolve a paused council: retry the failed reviewers or proceed with the
- *  survivors. The run resumes server-side, so the run + ledger queries are
- *  invalidated rather than patched — the driver rewrites both immediately. */
-export function useCouncilDecision(id: string) {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (action: 'retry' | 'proceed') => councilDecision(id, action),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.runs.harness(id) })
-      void queryClient.invalidateQueries({ queryKey: queryKeys.runs.detail(id) })
-      void queryClient.invalidateQueries({ queryKey: queryKeys.runs.list() })
-    },
-  })
-}
 
 /**
  * One run of a NAMED project — what a surface outside `/p/:projectId` has to use.
@@ -1623,32 +1547,7 @@ export function useConfig(enabled = true) {
 
 // ---- cez-harness (spec 2026-07-23-harness-orchestration) -----------------------------------
 
-/** Installed/configured harness summary + model roster (Settings → Harness, composer panel). */
-export function useHarnessStatus(enabled = true) {
-  return useQuery({
-    queryKey: queryKeys.harness.status,
-    queryFn: ({ signal }) => getHarnessStatus({ signal }),
-    enabled,
-    // "Configure models" rewrites the roster on disk; a cached answer hid it for five minutes
-    // (PR #925 review). Status is a cheap config read — the billed probe keeps its cache.
-    refetchOnMount: 'always',
-  })
-}
 
-/** Probe one profile's readiness. Keyed per profile so switching the segment shows each
- *  profile's own cached answer instantly; probes are live model calls, so the cache stands. */
-export function useHarnessProbe(
-  profile: HarnessProfile | undefined,
-  roles: HarnessRoles | undefined,
-  enabled = true,
-) {
-  const key = profile ?? JSON.stringify(roles ?? null)
-  return useQuery({
-    queryKey: queryKeys.harness.probe(key),
-    queryFn: () => probeHarness(profile, roles),
-    enabled,
-  })
-}
 
 /** The worktree management panel (#483). Invalidated by the global event stream when a run
  *  finishes or is reclaimed, so the on-disk list and total stay live while the panel is open. */

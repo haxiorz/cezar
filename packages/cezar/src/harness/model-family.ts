@@ -16,7 +16,7 @@
  *
  * The admission check and the quorum check therefore measured different things,
  * and the coarsest of them gated the run. Every layer now resolves through
- * `providerFamilyOf` here. `web/app/src/routes/new-task-form.ts` keeps a
+ * `providerFamilyOf` here. `packages/web/src/routes/new-task-harness-form.ts` keeps a
  * byte-faithful mirror (the browser cannot import server code) — the table below
  * and that mirror must change together; `model-family.test.ts` pins them.
  */

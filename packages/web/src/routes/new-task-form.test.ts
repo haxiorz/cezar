@@ -10,6 +10,28 @@ import type {
 } from '@open-mercato/cezar-api-client'
 
 import {
+  looksLikeQuestion,
+  projectDefaultSource,
+  buildAutomationTask,
+  availableRunners,
+  buildCreateRunBody,
+  harnessSetupPrefill,
+  runsInPlace,
+  harnessWorkflowName,
+  withoutHarnessWorkflows,
+  MODELS_BY_RUNNER,
+  modelsForRunner,
+  modelCatalogStatus,
+  modelConflictsWithRunner,
+  pushRecentSource,
+  resolveModel,
+  resolveRunner,
+  resolveSource,
+  sourceExists,
+  startedRunPath,
+  type TaskSource,
+} from './new-task-form'
+import {
   HARNESS_MODES,
   HARNESS_PRESETS_MAX,
   HARNESS_PROFILE_OPTIONS,
@@ -27,31 +49,11 @@ import {
   normalizeHarnessPresets,
   rolesEqual,
   sessionRoleOptions,
-  looksLikeQuestion,
-  projectDefaultSource,
-  buildAutomationTask,
-  availableRunners,
-  buildCreateRunBody,
   harnessStartBlock,
-  harnessSetupPrefill,
-  runsInPlace,
-  harnessWorkflowName,
-  withoutHarnessWorkflows,
-  MODELS_BY_RUNNER,
-  modelsForRunner,
-  modelCatalogStatus,
-  modelConflictsWithRunner,
   probeReadinessFor,
-  pushRecentSource,
   REVIEWER_GATEWAYS,
   reviewerOptions,
-  resolveModel,
-  resolveRunner,
-  resolveSource,
-  sourceExists,
-  startedRunPath,
-  type TaskSource,
-} from './new-task-form'
+} from './new-task-harness-form'
 
 const check = (name: BackendCheck['name'], available: boolean): BackendCheck => ({ name, available })
 

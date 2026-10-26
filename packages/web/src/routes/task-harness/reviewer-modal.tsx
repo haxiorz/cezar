@@ -1,7 +1,7 @@
 import { ChevronDownIcon, RotateCcwIcon } from 'lucide-react'
 import { useState } from 'react'
 
-import { useCouncilDecision, useHarnessInvocation } from '@/api/queries'
+import { useCouncilDecision, useHarnessInvocation } from '@/api/harness'
 import type {
   HarnessInvocationRecord,
   HarnessLedgerResponse,

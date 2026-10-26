@@ -217,7 +217,7 @@ describe('the composer\'s reviewer gateways', () => {
     const text = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8');
     const server = text('./reviewer-binding.ts').match(/const GATEWAYS[\s\S]*?= \{([\s\S]*?)\n\};/)?.[1] ?? '';
     const gateways = [...server.matchAll(/^  ([a-z-]+): \{/gm)].map((match) => match[1]);
-    const mirror = text('../../../web/src/routes/new-task-form.ts').match(
+    const mirror = text('../../../web/src/routes/new-task-harness-form.ts').match(
       /REVIEWER_GATEWAYS: readonly string\[\] = \[([^\]]*)\]/,
     )?.[1];
     expect(gateways.length).toBeGreaterThan(0);

@@ -101,7 +101,7 @@ describe('providerFamilyOf', () => {
 
 describe('the web mirror stays in step', () => {
   const mirror = readFileSync(
-    join(import.meta.dirname, '../../../web/src/routes/new-task-form.ts'),
+    join(import.meta.dirname, '../../../web/src/routes/new-task-harness-form.ts'),
     'utf8',
   );
   const source = readFileSync(join(import.meta.dirname, 'model-family.ts'), 'utf8');

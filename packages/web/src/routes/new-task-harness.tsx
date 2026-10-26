@@ -60,7 +60,7 @@ import {
   visibleHarnessPresets,
   type HarnessMode,
   type HarnessModelOption,
-} from './new-task-form'
+} from './new-task-harness-form'
 
 /**
  * The Multi-model tab's surface (user feedback 2026-07-24): pick MODELS FOR ROLES, not a

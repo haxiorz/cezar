@@ -85,15 +85,7 @@ import type {
   GithubPrMergeStateResponse,
   GithubPrChangesData,
   GroupResponse,
-  HarnessAcceptContestedResponse,
-  HarnessCouncilDecisionInput,
-  HarnessCouncilDecisionResponse,
-  HarnessInvocationDetail,
   HarnessLedgerResponse,
-  HarnessProbeResponse,
-  HarnessProfile,
-  HarnessRoles,
-  HarnessStatusResponse,
   HealthResponse,
   HostUsage,
   AttachmentEntry,
@@ -365,7 +357,7 @@ function unscoped(url: string): string {
  * value — whose type the caller gets from the route, not from a hand-written declaration.
  */
 /** The per-request options `hc` takes, from this module's `ReadOptions`. */
-const init = (opts?: ReadOptions) => ({ init: { signal: opts?.signal } })
+export const init = (opts?: ReadOptions) => ({ init: { signal: opts?.signal } })
 
 /**
  * Accepts a route that answers more than one FORMAT — `/repo/commit/:sha` serves a structured
@@ -480,7 +472,7 @@ async function requestText(path: string, init: RequestInit = {}): Promise<string
   return body
 }
 
-const runPath = (id: string, suffix = ''): string => `/runs/${encodeURIComponent(id)}${suffix}`
+export const runPath = (id: string, suffix = ''): string => `/runs/${encodeURIComponent(id)}${suffix}`
 
 // ---- reads --------------------------------------------------------------------------------
 
@@ -775,33 +767,7 @@ export async function getConfig(opts?: ReadOptions): Promise<ConfigResponse> {
 
 // ---- cez-harness (spec 2026-07-23-harness-orchestration) ---------------------------------
 
-/** Installed/configured harness summary + the model roster for Settings and the composer. */
-export async function getHarnessStatus(opts?: ReadOptions): Promise<HarnessStatusResponse> {
-  return unwrap(
-    await cez.api.v1.p[':projectId'].harness.status.$get(
-      { param: { projectId: queryScope() } },
-      init(opts),
-    ),
-    '/harness/status',
-  )
-}
 
-/** Readiness of one profile before starting a harness run. */
-export async function probeHarness(
-  profile: HarnessProfile | undefined,
-  roles?: HarnessRoles,
-): Promise<HarnessProbeResponse> {
-  return unwrap(
-    await cez.api.v1.p[':projectId'].harness.probe.$post({
-      param: { projectId: queryScope() },
-      json: {
-        ...(profile ? { profile } : {}),
-        ...(roles ? { roles } : {}),
-      },
-    }),
-    '/harness/probe',
-  )
-}
 
 /** The run's harness ledger — 404s (throws) when the run has none. */
 export async function getRunHarness(
@@ -817,53 +783,8 @@ export async function getRunHarness(
   ))
 }
 
-/** One reviewer invocation's prompt and result — the conversation behind a
- *  verdict. Fetched on demand: prompts embed diff context and are far too large
- *  to ride along with every ledger read. */
-export async function getHarnessInvocation(
-  id: string,
-  invocationId: string,
-  opts: ReadOptions = {},
-): Promise<HarnessInvocationDetail> {
-  return unwrap(
-    await cez.api.v1.p[':projectId'].runs[':id'].harness.invocations[':invocationId'].$get(
-      { param: { projectId: queryScope(), id, invocationId } },
-      init(opts),
-    ),
-    runPath(id, `/harness/invocations/${encodeURIComponent(invocationId)}`),
-  )
-}
 
-/** Resolve a council paused below quorum: `retry` buys the failed reviewers one
- *  more attempt, `proceed` continues with the survivors. Recorded in the ledger
- *  and the run resumes immediately (council resilience 2026-07-29). */
-export async function councilDecision(
-  id: string,
-  action: HarnessCouncilDecisionInput['action'],
-): Promise<HarnessCouncilDecisionResponse> {
-  return unwrap(
-    await cez.api.v1.p[':projectId'].runs[':id'].harness['council-decision'].$post({
-      param: { projectId: queryScope(), id },
-      json: { action },
-    }),
-    runPath(id, '/harness/council-decision'),
-  )
-}
 
-/** Explicitly accept a contested harness result before publishing it. The reason is retained
- *  in the durable ledger; this is intentionally separate from commit/push/PR actions. */
-export async function acceptContestedHarness(
-  id: string,
-  reason: string,
-): Promise<HarnessAcceptContestedResponse> {
-  return unwrap(
-    await cez.api.v1.p[':projectId'].runs[':id'].harness['accept-contested'].$post({
-      param: { projectId: queryScope(), id },
-      json: { reason },
-    }),
-    runPath(id, '/harness/accept-contested'),
-  )
-}
 
 /** The selected project's agent-owned config catalog and current file state. */
 export async function getAgentConfig(opts: ReadOptions = {}): Promise<AgentConfigListing> {

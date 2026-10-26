@@ -13,11 +13,10 @@ import { useParams } from 'react-router'
 
 import { ApiError } from '@/api/client'
 import {
-  useAcceptContestedHarness,
-  useHarnessInvocation,
   useRun,
   useRunHarness,
 } from '@/api/queries'
+import { useAcceptContestedHarness, useHarnessInvocation } from '@/api/harness'
 import { useRunEvents } from '@/api/run-events'
 import type {
   ApiRun,
