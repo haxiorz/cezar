@@ -108,7 +108,6 @@ describe('PlanDock', () => {
       />,
     )
     expect(document.querySelector('[data-slot="plan-count"]')?.textContent).toBe('· 1/1')
-    fireEvent.click(head())
 
     const rows = [...document.querySelectorAll('[data-slot="plan-item"]')]
     expect(rows.map((row) => row.getAttribute('data-status'))).toEqual(['completed', 'cancelled'])
@@ -121,47 +120,6 @@ describe('PlanDock', () => {
     const cancelledIcon = rows[1]!.querySelector('svg')!
     expect(cancelledIcon.querySelector('path')?.getAttribute('d')).toBe('m8.5 15.5 7-7')
     expect(cancelledIcon.getAttribute('class')).not.toContain('animate-pulse')
-  })
-
-  it('starts a completed plan collapsed so finished work does not crowd the transcript', () => {
-    render(
-      <PlanDock
-        runId="dock-complete"
-        entries={[
-          { content: 'Implement', status: 'completed' },
-          { content: 'Validate', status: 'completed' },
-        ]}
-      />,
-    )
-    expect(dock().getAttribute('data-state')).toBe('collapsed')
-    expect(head().getAttribute('aria-expanded')).toBe('false')
-    expect(document.querySelector('[data-slot="plan-list"]')).toBeNull()
-    expect(document.querySelector('[data-slot="plan-count"]')?.textContent).toBe('· 2/2')
-  })
-
-  it('automatically collapses when the last live plan item completes', () => {
-    const view = render(
-      <PlanDock
-        runId="dock-completing"
-        entries={[
-          { content: 'Implement', status: 'completed' },
-          { content: 'Validate', status: 'in_progress' },
-        ]}
-      />,
-    )
-    expect(dock().getAttribute('data-state')).toBe('open')
-
-    view.rerender(
-      <PlanDock
-        runId="dock-completing"
-        entries={[
-          { content: 'Implement', status: 'completed' },
-          { content: 'Validate', status: 'completed' },
-        ]}
-      />,
-    )
-    expect(dock().getAttribute('data-state')).toBe('collapsed')
-    expect(document.querySelector('[data-slot="plan-list"]')).toBeNull()
   })
 
   it('collapsing folds the list to "Plan · N/M — {activeForm of the current item}"', () => {
@@ -199,6 +157,22 @@ describe('PlanDock', () => {
     second.unmount()
     render(<PlanDock runId="dock-memory-other" entries={GOLDEN} />)
     expect(dock().getAttribute('data-state')).toBe('open')
+  })
+
+  // PR #925 review: a branch-era change collapsed finished plans, forgot an explicit expand on every
+  // remount, and kept the next plan after Continue hidden.
+  it('keeps a finished plan open on desktop, across a remount and into the next plan', () => {
+    const done: PlanEntry[] = [{ content: 'Implement', status: 'completed' }]
+    const first = render(<PlanDock runId="dock-finished" entries={done} />)
+    expect(dock().getAttribute('data-state')).toBe('open')
+    first.unmount()
+
+    const second = render(<PlanDock runId="dock-finished" entries={done} />)
+    expect(dock().getAttribute('data-state')).toBe('open')
+    second.rerender(
+      <PlanDock runId="dock-finished" entries={[...done, { content: 'Follow up', status: 'in_progress' }]} />,
+    )
+    expect(document.querySelector('[data-slot="plan-list"]')).not.toBeNull()
   })
 
   // Regression: codex ended the turn at "1/4" without a final `plan.updated`, and the
