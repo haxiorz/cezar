@@ -142,19 +142,12 @@ describe('the GitHub tab against the live dry-run server', () => {
     browser.waitForFunction(
       `document.querySelectorAll('[data-slot="gh-workflow-option"]').length === ${workflows.workflows.length}`,
     )
+    // The full name: the menu's fuzzy match also finds q-u-i-c-k in a harness workflow's
+    // description, which a local `multiModel` config lists (PR #925 review).
+    browser.fill('[data-slot="command-input"]', 'quick-task')
     browser.waitForFunction(
-      `document.querySelector('[data-slot="gh-workflow-menu"]') !== null`,
+      `document.querySelectorAll('[data-slot="gh-workflow-option"]').length === 1`,
     )
-    expect(browser.count('[data-slot="gh-workflow-option"]')).toBe(workflows.workflows.length)
-    browser.fill('input[placeholder="search workflows…"]', 'quick')
-    browser.waitForFunction(
-      `document.querySelector('input[placeholder="search workflows…"]')?.value === 'quick'`,
-    )
-    const filteredWorkflows = browser.evaluate(
-      `Array.from(document.querySelectorAll('[data-slot="gh-workflow-option"]')).map((el) => el.dataset.workflow)`,
-    ) as string[]
-    expect(filteredWorkflows).toContain('quick-task')
-    expect(filteredWorkflows.length).toBeLessThan(workflows.workflows.length)
 
     // Same settle rule as above: the screenshot must show the whole truth, nav item included.
     browser.waitForFunction(`document.querySelector('nav a[href="${scoped('/github')}"]') !== null`)
