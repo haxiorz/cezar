@@ -74,7 +74,7 @@ import {
   runActionFlags,
 } from './run-actions'
 import { GitActions } from '../task-git/git-toolbar'
-import { holdGitSteps, useRunGitStep, type RunGitStep } from '../task-git/run-git-step'
+import { holdGitSteps, useHarnessPublishBlock, useRunGitStep, type RunGitStep } from '../task-git/run-git-step'
 import { RunConfirmDialog } from './run-confirm-dialog'
 import { useRunEngine } from './run-engine'
 import { WorkflowSteps } from './step-rail'
@@ -1371,8 +1371,9 @@ function ActionsKebab({
   showRunControls: boolean
 }) {
   const canTerminal = useCanOpenTerminal(run)
+  const acceptBlocked = useHarnessPublishBlock(run)
   const commands = buildTaskCommands(
-    { run, canResume: canTerminal, git: git.action, gitPending: git.pending, workspace: null, terminalAvailable: false, openChoices: [], taskUrl: '' },
+    { run, canResume: canTerminal, git: git.action, gitPending: git.pending, workspace: null, terminalAvailable: false, openChoices: [], taskUrl: '', acceptBlocked },
     {
       markRead: () => actions.markRead.mutate(),
       markUnread: () => actions.markUnread.mutate(),

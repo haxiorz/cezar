@@ -11,6 +11,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { z } from 'zod';
 import { readHarnessFsEntry } from './fs-read.js';
 import { readLedger, saveLedger } from './ledger.js';
+import type { HarnessLedger } from './types.js';
 
 const issueClaimSchema = z.object({
   version: z.literal(1),
@@ -139,6 +140,20 @@ export function releaseIssueClaim(path: string, runId: string): { ok: true } | {
       ? { ok: true }
       : { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/** A run parked on its staged handoff or on a decision resumes under the same lease, so it keeps
+ *  its claim; any other ending gives it up (PR #925 review). */
+export function issueClaimStaysHeld(ledger: Pick<HarnessLedger, 'stage' | 'outcome'>): boolean {
+  return ledger.stage.status === 'staged' || Boolean(ledger.outcome.pendingDecision);
+}
+
+/** The release rule every ending without the driver shares: a queued or starting cancel (PR #925
+ *  review). */
+export function releaseLedgerIssueClaimUnlessParked(dataDir: string, runId: string): void {
+  const read = readLedger(dataDir, runId);
+  if (read.status !== 'valid' || issueClaimStaysHeld(read.ledger)) return;
+  releaseLedgerIssueClaim(dataDir, runId);
 }
 
 /** Release the claim a run's ledger records. Every path that deletes a harness run calls this

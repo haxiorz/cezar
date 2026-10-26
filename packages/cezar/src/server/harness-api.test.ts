@@ -671,6 +671,25 @@ describe('harness API', () => {
       expect(((await push.json()) as { error?: string }).error ?? '').not.toMatch(/contested/i);
     });
 
+    // PR #925 review: Finish ("Accept changes without a PR") skipped the gate publishing applies,
+    // so a contested outcome settled as done without its risk ever being accepted.
+    it('refuses to accept a contested harness review until its risk is accepted', async () => {
+      const run = mkHarnessRun('review');
+      const ledger = createLedger({
+        workflow: HARNESS_FIX_ISSUE,
+        requestedProfile: 'standard',
+        subject: { kind: 'brief', text: 'x' },
+      });
+      ledger.stage = { status: 'staged', stagedPaths: ['src/x.ts'] };
+      ledger.outcome = { status: 'contested', blockingReasons: ['[major] replay race remains'] };
+      saveLedger(dataDir, run.id, ledger);
+
+      const blocked = await post(`/api/v1/runs/${run.id}/finish`, {});
+      expect(blocked.status).toBe(409);
+      expect(((await blocked.json()) as { error: string }).error).toMatch(/contested/i);
+      expect(store.getRun(run.id)?.status).toBe('review');
+    });
+
     it('records a spec-risk reason and resumes a pre-implementation pause', async () => {
       const run = store.createRun({
         title: 't',

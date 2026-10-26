@@ -5959,6 +5959,10 @@ export function createApp(deps: ServerDeps) {
       const id = c.req.param('id');
       const before = store.getRun(id);
       if (!before) return c.json({ error: 'not found' }, 404);
+      // Accepting a harness review is publishing's twin: the same gate, or a contested outcome
+      // finished as done without its risk ever being accepted (PR #925 review).
+      const acceptBlock = before.status === 'review' ? harnessPublishBlockReason(before, dataDir) : null;
+      if (acceptBlock) return c.json({ error: acceptBlock }, 409);
       const finished = manager.finish(id);
       if (!finished) return c.json({ error: 'no open session' }, 409);
       // Finishing a harness phase session leaves the driver conducting the run, and the driver

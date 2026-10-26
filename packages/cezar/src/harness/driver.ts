@@ -76,7 +76,7 @@ import {
 } from './prompt-budget.js';
 import { harnessStageResultSchema, samePathSet } from './stage-result.js';
 import { loadTrustedHarnessSkill } from './skill-binding.js';
-import { acquireIssueClaim, releaseIssueClaim } from './issue-claim.js';
+import { acquireIssueClaim, issueClaimStaysHeld, releaseIssueClaim } from './issue-claim.js';
 import { readHarnessFsEntry } from './fs-read.js';
 import { pinnedGitEnv, pinWorktreeGitDir, resolveTrustedGitDir, verifyWorktreeGitPointer } from '../git-pin.js';
 import { harnessPhaseSkills } from './skill-routing.js';
@@ -5744,8 +5744,7 @@ export async function runHarnessDriver(
     });
     return null;
   } finally {
-    // A run parked on a decision resumes under the same lease (PR #925 review).
-    if (ledger.stage.status !== 'staged' && !ledger.outcome.pendingDecision) releaseHeldIssueClaim();
+    if (!issueClaimStaysHeld(ledger)) releaseHeldIssueClaim();
     offInterrupt();
   }
 }

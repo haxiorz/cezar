@@ -158,7 +158,7 @@ import {
   type HarnessRolesInput,
 } from '../harness/driver.ts';
 import { createLedger, harnessFeedbackClosedReason, readLedger, saveLedger } from '../harness/ledger.ts';
-import { releaseLedgerIssueClaim } from '../harness/issue-claim.ts';
+import { releaseLedgerIssueClaim, releaseLedgerIssueClaimUnlessParked } from '../harness/issue-claim.ts';
 import { HARNESS_FIX_ISSUE, isHarnessWorkflow } from '../harness/workflows.ts';
 import {
   HARNESS_PROFILES,
@@ -2500,6 +2500,17 @@ export class RunManager {
     this.dropActive(runId, state);
   }
 
+  /** A turn that completed is the ONLY evidence the provider's window actually reopened, so it is
+   *  what retires the consecutive-resume counter — which in turn releases the account hold for every
+   *  other task queued behind it (spec 2026-08-03-auto-resume-after-usage-limit). `settleSuccess`
+   *  does the same for a run that finishes outright. Every turn-end path calls this: a harness phase
+   *  that skipped it held its account for the rest of the run (PR #925 review). */
+  private noteWindowProven(runId: string): void {
+    if (this.store.getRun(runId)?.autoResumeAttempts !== undefined) {
+      this.store.updateRun(runId, { autoResumeAttempts: undefined });
+    }
+  }
+
   /** Fence a continuation failure to the async owner that started it. */
   private failOwnedContinuation(runId: string, ownerToken: symbol, message: string): void {
     const state = this.active.get(runId);
@@ -2548,6 +2559,8 @@ export class RunManager {
     if (acceptReview && !landOnAccept) {
       this.store.updateRun(runId, { status: 'done' });
       this.store.appendEvent(runId, { type: 'lifecycle', message: 'review accepted — finished without a PR' });
+      // Finish while settling: the route saw an active run and left the claim to this drop.
+      if (this.store.getRun(runId)?.harness) releaseLedgerIssueClaim(this.dataDir, runId);
     }
     state?.releaseWorktree?.();
     state?.releaseRepoRoot?.();
@@ -3828,6 +3841,8 @@ export class RunManager {
       this.startNowRequested.delete(runId);
       this.store.updateRun(runId, { status: 'cancelled', finishedAt: new Date().toISOString() });
       this.store.appendEvent(runId, { type: 'lifecycle', message: 'cancelled while queued' });
+      // The driver never ran, so its own release rule did not either (PR #925 review).
+      if (this.store.getRun(runId)?.harness) releaseLedgerIssueClaimUnlessParked(this.dataDir, runId);
       // A queued run never entered `active`, so it never reaches `dropActive` — the one terminal
       // transition that misses the settle hook. Without this a parent waiting on a child the user
       // cancelled from the queue would wait for a report nobody would ever send.
@@ -3842,6 +3857,7 @@ export class RunManager {
       this.cancelledStarting.add(runId);
       this.store.updateRun(runId, { status: 'cancelled', finishedAt: new Date().toISOString(), currentStepId: undefined });
       this.store.appendEvent(runId, { type: 'lifecycle', message: 'run cancelled' });
+      if (this.store.getRun(runId)?.harness) releaseLedgerIssueClaimUnlessParked(this.dataDir, runId);
       return true;
     }
     state.cancelled = true;
@@ -5094,14 +5110,7 @@ export class RunManager {
             this.releaseSlot();
           }
         }
-        // A turn that completed is the ONLY evidence the provider's window actually reopened, so
-        // it is what retires the consecutive-resume counter — which in turn releases the account
-        // hold for every other task queued behind it (spec
-        // 2026-08-03-auto-resume-after-usage-limit). `settleSuccess` does the same for a run that
-        // finishes outright; this covers the far more common "parked for the user" ending.
-        if (this.store.getRun(runId)?.autoResumeAttempts !== undefined) {
-          this.store.updateRun(runId, { autoResumeAttempts: undefined });
-        }
+        this.noteWindowProven(runId);
         // A nudged turn did NOT park, so it must not report that it did: the handoff file is
         // the rolling context the agent reads back on resume (spec 007), not a log, and an
         // autonomous run writing up to MAX_AUTO_CONTINUES "status=waiting" lines would tell it
@@ -7422,6 +7431,7 @@ export class RunManager {
         turnText = this.store.redactRunText(runId, turnText);
         void this.recordTurnEnd(runId, turnText, state); // titleSummary + diffStat (#389)
         if (phaseResultPath) {
+          this.noteWindowProven(runId);
           // Harness phase session (turn-driven): close on a delivered result,
           // nudge a session that ended its turn early — e.g. to await a
           // background subagent, its home-harness habit — and keep the CLI
@@ -7661,10 +7671,7 @@ export class RunManager {
           }, AUTO_END_DELAY_MS);
           autoEnd.unref?.();
         }
-        // The window is proven open — see the twin in `runContinuation`.
-        if (this.store.getRun(runId)?.autoResumeAttempts !== undefined) {
-          this.store.updateRun(runId, { autoResumeAttempts: undefined });
-        }
+        this.noteWindowProven(runId);
         // Cez's own heartbeat — the handoff stays current even when the
         // agent forgets to write (spec 007).
         // A nudged turn did NOT park — see the twin in `runContinuation` for why the handoff
