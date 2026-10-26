@@ -809,7 +809,7 @@ const NO_HOLDS: AccountHolds = { deadline: new Set(), inFlight: new Set() };
  *    it blocks fresh work but not other resumes. Blocking those deadlocked a live workspace.
  */
 function accountHeldFor(
-  run: Pick<RunRecord, 'runner' | 'agentProfile' | 'harness' | 'steps' | 'status' | 'autoResumeAttempts'>,
+  run: Pick<RunRecord, 'runner' | 'agentProfile' | 'harness' | 'steps' | 'status' | 'autoResumeAttempts' | 'autoResumeAccount'>,
   holds: AccountHolds,
   fallbackRunner: RunnerId,
 ): boolean {
@@ -829,11 +829,13 @@ function accountHeldFor(
  * persists it), and only started runs can be holding.
  */
 export function runAccountKey(
-  run: Pick<RunRecord, 'runner' | 'agentProfile' | 'harness' | 'steps'>,
+  run: Pick<RunRecord, 'runner' | 'agentProfile' | 'harness' | 'steps' | 'autoResumeAccount'>,
   fallbackRunner: RunnerId,
 ): string {
   // A harness phase runs on its own role's account, and its failed step records which: the limit
-  // is that account's, not the composer's (PR #925 review).
+  // is that account's, not the composer's. The resume resets that step, so the account is also
+  // kept on the run until the window is proven (PR #925 review).
+  if (run.harness && run.autoResumeAccount) return run.autoResumeAccount;
   const limited = run.harness
     ? [...run.steps].reverse().find((step) => step.status === 'failed' && step.backend && isUsageLimitMessage(step.error ?? ''))
     : undefined;
@@ -2511,10 +2513,12 @@ export class RunManager {
    *  other task queued behind it (spec 2026-08-03-auto-resume-after-usage-limit). `settleSuccess`
    *  does the same for a run that finishes outright. Every turn-end path calls this: a harness phase
    *  that skipped it held its account for the rest of the run (PR #925 review). */
-  private noteWindowProven(runId: string): void {
-    if (this.store.getRun(runId)?.autoResumeAttempts !== undefined) {
-      this.store.updateRun(runId, { autoResumeAttempts: undefined });
-    }
+  private noteWindowProven(runId: string, account?: string): void {
+    const run = this.store.getRun(runId);
+    if (run?.autoResumeAttempts === undefined) return;
+    // Another account's turn proves nothing about the limited one's window (PR #925 review).
+    if (run.autoResumeAccount && account && account !== run.autoResumeAccount) return;
+    this.store.updateRun(runId, { autoResumeAttempts: undefined, autoResumeAccount: undefined });
   }
 
   /** Fence a continuation failure to the async owner that started it. */
@@ -3247,6 +3251,12 @@ export class RunManager {
       return;
     }
     const wakeAt = new Date(limit.resetAt.getTime() + AUTO_RESUME_GRACE_MS);
+    // From the step that just failed: a stored account belongs to the previous limit.
+    if (run.harness) {
+      this.store.updateRun(runId, {
+        autoResumeAccount: runAccountKey({ ...run, autoResumeAccount: undefined }, run.runner ?? 'claude'),
+      });
+    }
     this.armAutoResume(runId, wakeAt.getTime());
     this.store.appendEvent(runId, {
       type: 'lifecycle',
@@ -3278,6 +3288,7 @@ export class RunManager {
       return;
     }
     const attempts = (run.autoResumeAttempts ?? 0) + 1;
+    const account = run.autoResumeAccount;
     // #1300: a workflow interruption must return to its executor after the resumed session.
     // The saved workflow and failed step/session already supply the recovery checkpoint,
     // including when the queued run is reconstructed after a restart.
@@ -3314,7 +3325,8 @@ export class RunManager {
       });
       return;
     }
-    this.store.updateRun(runId, { autoResumeAttempts: attempts });
+    // `continueRun` retired the deadline and its account; the resume in flight keeps both.
+    this.store.updateRun(runId, { autoResumeAttempts: attempts, ...(account ? { autoResumeAccount: account } : {}) });
     this.store.appendEvent(runId, {
       type: 'lifecycle',
       message: `usage limit reset — resuming automatically (${attempts}/${MAX_AUTO_RESUMES})`,
@@ -3644,8 +3656,8 @@ export class RunManager {
     this.autoResumeTimers.delete(runId);
     const run = this.store.getRun(runId);
     if (!run) return;
-    if (run.autoResumeAt !== undefined || run.autoResumeAttempts !== undefined) {
-      this.store.updateRun(runId, { autoResumeAt: undefined, autoResumeAttempts: undefined });
+    if (run.autoResumeAt !== undefined || run.autoResumeAttempts !== undefined || run.autoResumeAccount !== undefined) {
+      this.store.updateRun(runId, { autoResumeAt: undefined, autoResumeAttempts: undefined, autoResumeAccount: undefined });
     }
   }
 
@@ -7438,7 +7450,8 @@ export class RunManager {
         turnText = this.store.redactRunText(runId, turnText);
         void this.recordTurnEnd(runId, turnText, state); // titleSummary + diffStat (#389)
         if (phaseResultPath) {
-          this.noteWindowProven(runId);
+          const recorded = this.store.getRun(runId)?.steps.find((entry) => entry.id === step.id);
+          this.noteWindowProven(runId, `${recorded?.backend ?? backend}:${recorded?.profileId ?? 'default'}`);
           // Harness phase session (turn-driven): close on a delivered result,
           // nudge a session that ended its turn early — e.g. to await a
           // background subagent, its home-harness habit — and keep the CLI
@@ -8269,6 +8282,7 @@ export class RunManager {
         finishedAt: new Date().toISOString(),
         currentStepId: undefined,
         autoResumeAttempts: undefined,
+        autoResumeAccount: undefined,
       });
       this.store.appendEvent(runId, {
         type: 'lifecycle',
@@ -8295,6 +8309,7 @@ export class RunManager {
       // counter starts over — otherwise a task that legitimately met the limit once a week would
       // creep toward the cap forever and stop resuming for no reason anyone could see.
       autoResumeAttempts: undefined,
+      autoResumeAccount: undefined,
     });
     this.store.appendEvent(runId, {
       type: 'lifecycle',

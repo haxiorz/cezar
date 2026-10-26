@@ -352,6 +352,9 @@ export const runRecordSchema = z.object({
   /** Consecutive automatic resumes since the last human turn — the safety cap's counter.
    *  Persisted so a restart cannot reset a loop back to zero. */
   autoResumeAttempts: z.number().int().min(0).optional().catch(undefined),
+  /** The account (`backend:profile`) a harness run's usage limit closed: its holds and its resume
+   *  stay keyed to that account, not the composer's (PR #925 review). */
+  autoResumeAccount: z.string().max(200).optional().catch(undefined),
   createdAt: z.string(),
   startedAt: z.string().optional(),
   finishedAt: z.string().optional(),
@@ -629,6 +632,7 @@ function isRepoScopedRef(url: string, task: string, handle?: RepoHandle | null):
 function clearPendingAutoResume(run: RunRecord): void {
   run.autoResumeAt = undefined;
   run.autoResumeAttempts = undefined;
+  run.autoResumeAccount = undefined;
 }
 
 /** The OS refused the write (EPERM/EACCES/EROFS) — the file is there, cezar may not touch it. */
