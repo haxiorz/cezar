@@ -48,7 +48,7 @@ describe('telemetry routes', () => {
   });
 
   const post = (path: string, body: unknown, over: Partial<ServerDeps> = {}) =>
-    apiRequest(createApp({ repoRoot, store, manager: { isActive: () => false } as unknown as RunManager, version: '0.0.0-test', ...over }), path, {
+    apiRequest(createApp({ repoRoot, store, manager: {} as RunManager, version: '0.0.0-test', ...over }), path, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),

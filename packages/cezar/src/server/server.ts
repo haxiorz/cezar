@@ -5313,7 +5313,7 @@ export function createApp(deps: ServerDeps) {
       const parsed = { data: c.req.valid('json') };
       const retiresQuestion = parsed.data.archived !== false && store.getRun(id)?.awaitingAnswerSince !== undefined;
       const run = store.setArchived(id, parsed.data.archived !== false);
-      if (run?.archived && !manager.isActive(id)) releaseLedgerIssueClaim(dataDir, id);
+      if (run?.archived && run.harness && !manager.isActive(id)) releaseLedgerIssueClaim(dataDir, id);
       if (run && parsed.data.archived !== false) stopTaskProcesses(id);
       if (run && retiresQuestion) manager.notifyQuestionRetired?.(id);
       // Labelled with the button that did it.
@@ -5963,7 +5963,7 @@ export function createApp(deps: ServerDeps) {
       if (!finished) return c.json({ error: 'no open session' }, 409);
       // Finishing a harness phase session leaves the driver conducting the run, and the driver
       // releases its own claim (PR #925 review) — as archive/remove-worktree/delete check too.
-      if (!manager.isActive(id)) releaseLedgerIssueClaim(dataDir, id);
+      if (before.harness && !manager.isActive(id)) releaseLedgerIssueClaim(dataDir, id);
       if (before.status === 'review') track('review_decided', { label: 'accepted' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json({ finished: true });
     })
@@ -6514,7 +6514,7 @@ export function createApp(deps: ServerDeps) {
             type: 'note',
             message: `${draft ? 'draft PR' : 'PR'} created: ${outcome.url}${outcome.dryRun ? ' (dry run — no real PR)' : ''}`,
           });
-          releaseLedgerIssueClaim(dataDir, id);
+          if (run.harness) releaseLedgerIssueClaim(dataDir, id);
           return outcome;
         })()
           .then((outcome) => ({ outcome, branch }))
@@ -6566,7 +6566,7 @@ export function createApp(deps: ServerDeps) {
           stopTaskProcesses(id);
           if (run.worktreePath) await removeWorktree(repoRoot, run.worktreePath, run.branch);
           store.updateRun(id, { worktreePath: undefined, branch: undefined });
-          releaseLedgerIssueClaim(dataDir, id);
+          if (run.harness) releaseLedgerIssueClaim(dataDir, id);
           if (run.prHead) await manager.sweepPrHeadRefs();
           return c.json({ removed: true });
         });
@@ -6586,7 +6586,7 @@ export function createApp(deps: ServerDeps) {
           // Layouts go with the task, and only with it — archiving keeps them (spec §5.3).
           deleteRunLayouts(dataDir, id);
           if (run.worktreePath) await removeWorktree(repoRoot, run.worktreePath, run.branch);
-          releaseLedgerIssueClaim(dataDir, id);
+          if (run.harness) releaseLedgerIssueClaim(dataDir, id);
           const deleted = store.deleteRun(id);
           // The run's `refs/cezar/pr/<n>` goes with the last run that needed it (Phase 3).
           if (deleted && run.prHead) await manager.sweepPrHeadRefs();

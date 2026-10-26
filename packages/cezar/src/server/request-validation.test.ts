@@ -45,7 +45,6 @@ describe('request validation bounds (#429)', () => {
         continueText = opts.text;
         return { ok: true };
       },
-      isActive: () => false,
       notifyQuestionRetired: (id: string) => {
         retiredQuestionRunId = id;
         retiredQuestionCount += 1;

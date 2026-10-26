@@ -1464,7 +1464,9 @@ export class RunManager {
       cancelAndWait: id => this.cancelAndWait(id),
       onWorktreeRemoved: () => this.sweepPrHeadRefs(),
       onTaskDeleted: id => deleteRunLayouts(this.dataDir, id),
-      beforeTaskDeleted: id => releaseLedgerIssueClaim(this.dataDir, id),
+      beforeTaskDeleted: (id) => {
+        if (this.store.getRun(id)?.harness) releaseLedgerIssueClaim(this.dataDir, id);
+      },
       cancelPending: id => {
         const queued = this.queue.indexOf(id);
         if (queued >= 0) this.queue.splice(queued, 1);
@@ -2483,7 +2485,6 @@ export class RunManager {
     return true;
   }
 
-  /** Fence a continuation failure to the async owner that started it. */
   private failCrashedRun(runId: string, ownerToken: symbol, message: string): void {
     const state = this.active.get(runId);
     if (!state || state.ownerToken !== ownerToken || state.cancelled) return;
@@ -2495,10 +2496,11 @@ export class RunManager {
     this.clearIdleTimer(state);
     this.clearAutosaveTimer(state);
     this.starting.delete(runId);
-    this.interruptLiveWork(state);
+    this.interruptLiveWork(state, Boolean(this.store.getRun(runId)?.harness));
     this.dropActive(runId, state);
   }
 
+  /** Fence a continuation failure to the async owner that started it. */
   private failOwnedContinuation(runId: string, ownerToken: symbol, message: string): void {
     const state = this.active.get(runId);
     if (!state || state.ownerToken !== ownerToken || state.cancelled) return;
@@ -2507,13 +2509,14 @@ export class RunManager {
       error: `continue crashed: ${message}`,
       finishedAt: new Date().toISOString(),
     });
-    this.interruptLiveWork(state);
+    this.interruptLiveWork(state, Boolean(this.store.getRun(runId)?.harness));
     this.dropActive(runId, state);
   }
 
   /** Concurrent harness reviewers live only in `liveSessions`: a crash that dropped the run left
-   *  them running, unstoppable and billing, holding no slot (PR #925 review). */
-  private interruptLiveWork(state: ActiveRun): void {
+   *  them running, unstoppable and billing, holding no slot (PR #925 review). The main session is
+   *  the caller's to stop: cancel already has, and an ordinary run's crash leaves it as on main. */
+  private interruptLiveWork(state: ActiveRun, includeSession = false): void {
     for (const handler of state.interruptHandlers) {
       try {
         handler();
@@ -2521,6 +2524,7 @@ export class RunManager {
       }
     }
     for (const session of state.liveSessions) {
+      if (session === state.session && !includeSession) continue;
       try {
         session.interrupt();
       } catch {
@@ -7234,12 +7238,13 @@ export class RunManager {
         // numeric task such as "432" still gives the model enough context to
         // describe the work — and therefore derive a useful title (#432).
         systemPrompt = skillSystemPrompt(skill);
-        // A directory skill also needs its companion files and `requires:` closure on disk (spec
-        // 2026-07-24-vendored-cez-skills, run 9788d87f). In place the cwd is the user's checkout,
-        // where a copy shadows the real skill for good — the `provisionTaskSkills` refusal (PR #925
-        // review) — bar the opt-in harness setup. Idempotent: a placed skill is skipped.
+        // A bundled or harness directory skill also needs its companion files and `requires:`
+        // closure on disk (spec 2026-07-24-vendored-cez-skills, run 9788d87f); an ordinary run's
+        // skills stay as main provisions them (PR #925 review). In place the cwd is the user's
+        // checkout, where a copy shadows the real skill for good — bar the opt-in harness setup.
         const inPlace = resolvePath(state.cwd) === resolvePath(this.repoRoot);
         const seeded =
+          (state.includeHarnessSkills || skill.source === 'bundled') &&
           (!inPlace || isBundledHarnessSkill(skill)) &&
           (await ensureSkillOnDisk(state.cwd, skill, state.skills ?? skills).catch(() => false));
         if (seeded && !installed.includes(skill.name) && skill.path.endsWith('SKILL.md')) {
@@ -7307,10 +7312,27 @@ export class RunManager {
     let phaseInfrastructureFailure: string | null = null;
     const phaseToolCommandBytes = new Map<string, number>();
 
-    // Council reviewers share one step id: each session adds ITS increments to the stored totals,
-    // or the last writer's `start + own` erased its siblings' usage (PR #925 review).
+    // Council reviewers share one step id: each concurrent session adds ITS increments to the
+    // stored totals, or the last writer's `start + own` erased its siblings' usage (PR #925
+    // review). Every other step keeps main's `start + session total`.
     const storedStep = () => this.store.getRun(runId)?.steps.find((s) => s.id === step.id);
+    const stepRecord = storedStep();
+    const startTokens = stepRecord?.tokensUsed ?? 0;
+    let stepCost = stepRecord?.costUsd ?? 0;
     let sessionTokens = 0;
+    const recordTokens = (total: number): void => {
+      if (!concurrentPhase) {
+        this.store.updateStep(runId, step.id, { tokensUsed: startTokens + total });
+        return;
+      }
+      const added = Math.max(0, total - sessionTokens);
+      sessionTokens = Math.max(sessionTokens, total);
+      this.store.updateStep(runId, step.id, { tokensUsed: (storedStep()?.tokensUsed ?? 0) + added });
+    };
+    const recordCost = (usd: number): void => {
+      stepCost = (concurrentPhase ? (storedStep()?.costUsd ?? 0) : stepCost) + usd;
+      this.store.updateStep(runId, step.id, { costUsd: stepCost });
+    };
     let turnText = '';
     let sessionError: string | undefined;
     const sink = this.makeUiSink(runId, step.id);
@@ -7391,14 +7413,8 @@ export class RunManager {
         // Codex/OpenCode mint their own session id — persist it so resume works.
         this.store.updateStep(runId, step.id, { sessionId: event.sessionId, backend });
       }
-      if (event.type === 'token-usage') {
-        const added = Math.max(0, event.tokensUsed - sessionTokens);
-        sessionTokens = Math.max(sessionTokens, event.tokensUsed);
-        this.store.updateStep(runId, step.id, { tokensUsed: (storedStep()?.tokensUsed ?? 0) + added });
-      }
-      if (event.type === 'cost') {
-        this.store.updateStep(runId, step.id, { costUsd: (storedStep()?.costUsd ?? 0) + event.usd });
-      }
+      if (event.type === 'token-usage') recordTokens(event.tokensUsed);
+      if (event.type === 'cost') recordCost(event.usd);
       if (event.type === 'turn-end') {
         // v2 `turn.completed` already flushed the coalescers; the v1 turn
         // boundary flushes again (idempotent) as a backstop.
@@ -7858,11 +7874,7 @@ export class RunManager {
       // v2 counterpart of v1's `done` (spec: the mappers leave session-close
       // events to the RunManager — only it knows how the session settled).
       sink.sessionEnded(state.cancelled ? 'cancelled' : 'end_turn');
-      if (!state.cancelled && this.active.get(runId) === state) {
-        const added = Math.max(0, result.tokensUsed - sessionTokens);
-        sessionTokens = Math.max(sessionTokens, result.tokensUsed);
-        this.store.updateStep(runId, step.id, { tokensUsed: (storedStep()?.tokensUsed ?? 0) + added });
-      }
+      if (!state.cancelled && this.active.get(runId) === state) recordTokens(result.tokensUsed);
       // A harness phase stopped over the memory limit delivered nothing on purpose: as a runner
       // failure it spends no attempt and the run pauses, instead of retrying at once with the
       // ceiling off for the rest of the run (PR #925 review).

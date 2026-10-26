@@ -23,6 +23,7 @@ import {
   splitPatch,
   type ChangesPayload,
 } from './git-changes.ts';
+import { pinWorktreeGitDir } from '../git-pin.ts';
 import { createApp } from './server.ts';
 import { apiRequest } from './loopback-request.testkit.ts';
 
@@ -263,6 +264,7 @@ describe('collectChanges — structured diff vs base', () => {
   it.runIf(process.platform !== 'win32' && process.getuid?.() !== 0)(
     'reads through the real index stat cache, and still lists staged, deleted and untracked files',
     async () => {
+      pinWorktreeGitDir(dir, join(dir, '.git')); // a harness worktree reads through a scratch index
       g(dir, 'config', 'core.trustctime', 'false');
       const past = new Date(Date.now() - 60_000);
       for (const name of ['locked.txt', 'staged.txt', 'gone.txt']) {

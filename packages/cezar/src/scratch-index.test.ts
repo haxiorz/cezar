@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { pinWorktreeGitDir } from './git-pin.ts';
 import { seedScratchIndex, worktreeShortstat } from './git-worktree.ts';
 import { collectChanges } from './server/git-changes.ts';
 
@@ -28,6 +29,7 @@ describe.skipIf(process.platform === 'win32')('scratch git indexes', () => {
     git(repo, 'add', '.');
     git(repo, 'commit', '-qm', 'base');
     writeFileSync(join(repo, 'b.txt'), 'new\n');
+    pinWorktreeGitDir(repo, join(repo, '.git')); // scratch indexes are a harness worktree's
     victim = join(root, 'victim');
     writeFileSync(victim, 'victim\n');
   });

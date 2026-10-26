@@ -244,7 +244,7 @@ describe('the real implementation still honours the contract', () => {
     expect(start).toBeGreaterThanOrEqual(0);
     return source.slice(start, source.indexOf('\n  }\n', start));
   };
-  const liveWork = () => methodBody('  private interruptLiveWork(state: ActiveRun): void {');
+  const liveWork = () => methodBody('  private interruptLiveWork(');
 
   it('cancel() interrupts every live session, not only state.interrupt', () => {
     expect(methodBody('  private cancelOne(runId: string): boolean {')).toMatch(/this\.interruptLiveWork\(state\)/);

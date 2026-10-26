@@ -21,6 +21,7 @@ import {
   worktreeShortstat,
   worktreeSizeBytes,
 } from './git-worktree.ts';
+import { pinWorktreeGitDir } from './git-pin.ts';
 
 const run = promisify(execFile);
 
@@ -377,6 +378,7 @@ describe('worktreeShortstat (real git)', () => {
 
     it('never refreshes the real index while choosing a repointed-worktree anchor', async () => {
       const r = await repoWithForeignBranch();
+      pinWorktreeGitDir(r, join(r, '.git')); // a harness worktree reads through a scratch index
       const tracked = join(r, 'f.txt');
       const index = join(r, '.git', 'index');
       // Make the cached stat data stale without changing the tracked contents. A plain
@@ -402,6 +404,7 @@ describe('worktreeShortstat (real git)', () => {
       'runs every repointed diff-base probe under the scratch-index environment',
       async () => {
         const r = await repoWithForeignBranch();
+        pinWorktreeGitDir(r, join(r, '.git'));
         const trace = join(r, 'git-env.log');
         const bin = join(r, 'bin');
         const helper = join(bin, 'git');
@@ -702,6 +705,7 @@ describe('diff readers seed their scratch index from the real one', () => {
 
   it('reports exactly what a HEAD-seeded scratch index reported', async () => {
     const r = await busyRepo('cez-scratch-equal-');
+    pinWorktreeGitDir(r, join(r, '.git'));
     const base = (await run('git', ['merge-base', 'main', 'HEAD'], { cwd: r })).stdout.trim();
     const indexBefore = readFileSync(join(r, '.git', 'index'));
 

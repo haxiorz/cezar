@@ -168,6 +168,15 @@ async function scratchIndex(worktreePath: string): Promise<ScratchIndex | null> 
   }
 }
 
+/** The index a diff read uses. A harness worktree's index is part of its review subject, so it
+ *  is read through a private copy; any other worktree keeps main's intent-to-add on its own index
+ *  (PR #925 review). */
+async function readIndex(worktreePath: string): Promise<ScratchIndex | null> {
+  if (pinnedGitEnv(worktreePath)) return scratchIndex(worktreePath);
+  await git(worktreePath, ['add', '-N', '.']); // intent-to-add: untracked files show up
+  return null;
+}
+
 async function disposeScratchIndex(scratch: ScratchIndex | null): Promise<void> {
   if (scratch) await disposeScratchIndexPath(scratch.path);
 }
@@ -841,7 +850,7 @@ export async function worktreeDiff(
   cap = DIFF_CAP,
 ): Promise<string> {
   if (!isSafeGitRef(baseBranch)) return '(diff failed: refusing option-like base ref)';
-  const scratch = await scratchIndex(worktreePath);
+  const scratch = await readIndex(worktreePath);
   try {
     const mergeBase = await git(worktreePath, ['merge-base', baseBranch, 'HEAD']);
     const base = mergeBase.ok && mergeBase.stdout.trim() ? mergeBase.stdout.trim() : baseBranch;
@@ -868,7 +877,7 @@ export async function worktreeDiffStat(
   baseBranch: string,
 ): Promise<string> {
   if (!isSafeGitRef(baseBranch)) return '';
-  const scratch = await scratchIndex(worktreePath);
+  const scratch = await readIndex(worktreePath);
   try {
     const mergeBase = await git(worktreePath, ['merge-base', baseBranch, 'HEAD']);
     const base = mergeBase.ok && mergeBase.stdout.trim() ? mergeBase.stdout.trim() : baseBranch;
@@ -975,7 +984,7 @@ export async function worktreeChangedFiles(
   opts: { taskBranch?: string; runStartedAt?: string } = {},
 ): Promise<string[] | null> {
   if (!isSafeGitRef(baseBranch)) return null;
-  const scratch = await scratchIndex(worktreePath);
+  const scratch = await readIndex(worktreePath);
   try {
     const { base } = await resolveTaskDiffBase(
       (args) => git(worktreePath, args, { env: scratch?.env }),
@@ -996,7 +1005,7 @@ export async function worktreeShortstat(
   opts: { taskBranch?: string; runStartedAt?: string } = {},
 ): Promise<DiffStat | null> {
   if (!isSafeGitRef(baseBranch)) return null;
-  const scratch = await scratchIndex(worktreePath);
+  const scratch = await readIndex(worktreePath);
   try {
     const { base, repointedHead } = await resolveTaskDiffBase(
       (args) => git(worktreePath, args, { env: scratch?.env }),

@@ -114,10 +114,11 @@ export async function discoverSkills(
   repoRoot: string,
   opts: { bundledDir?: string | null; includeHarness?: boolean } = {},
 ): Promise<Skill[]> {
-  const layers = await discoverSkillLayers(repoRoot, opts);
   // Every bundled cez-* skill belongs to the opt-in multi-model feature: with it off, the catalog,
-  // picker and planner see no bundled skill (PR #925 review). Internal recovery keeps them.
+  // picker and planner see no bundled skill, and discovery never reads them (PR #925 review).
+  // Internal recovery keeps them.
   const includeBundled = opts.includeHarness === true || multiModelEnabled(repoRoot);
+  const layers = await discoverSkillLayers(repoRoot, includeBundled ? opts : { ...opts, bundledDir: null });
   const merged: Skill[] = [];
   const seen = new Set<string>();
   for (const skills of layers) {
