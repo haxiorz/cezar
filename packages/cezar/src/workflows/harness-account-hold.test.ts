@@ -47,14 +47,14 @@ describe('a usage-limit hold belongs to the account that hit the limit', () => {
       runner: 'claude',
       error: `phase "implement" failed: ${LIMIT}`,
       autoResumeAt: new Date(Date.now() + 3 * 3_600_000).toISOString(),
-      ...(harness ? { harness: { profile: 'standard', workflow: 'harness-fix-issue', issueId: '1' } } : {}),
+      ...(harness ? { autoResumeAccount: 'codex:default', harness: { profile: 'standard', workflow: 'harness-fix-issue', issueId: '1' } } : {}),
     });
   };
 
-  it('holds the harness phase account, not the composer account', () => {
+  it('guard: holds the harness phase account, not the composer account', () => {
     failedRun(true);
     const holds = manager.accountHolds();
-    expect(holds.deadline.has('codex:work')).toBe(true);
+    expect(holds.deadline.has('codex:default')).toBe(true);
     expect(holds.deadline.has('claude:default')).toBe(false);
   });
 
@@ -76,23 +76,62 @@ describe('a usage-limit hold belongs to the account that hit the limit', () => {
       harness: { profile: 'standard', workflow: workflow.name, issueId: '1' },
     });
     const internals = manager as unknown as {
-      scheduleAutoResumeIfLimited(runId: string): void;
+      scheduleAutoResumeIfLimited(runId: string, account?: string): void;
       fireAutoResume(runId: string): void;
       noteWindowProven(runId: string, account?: string): void;
     };
 
-    internals.scheduleAutoResumeIfLimited(run.id);
+    internals.scheduleAutoResumeIfLimited(run.id, 'codex:default');
     internals.fireAutoResume(run.id);
     expect(store.getRun(run.id)).toMatchObject({ status: 'queued', autoResumeAttempts: 1 });
-    expect(manager.accountHolds().inFlight).toEqual(new Set(['codex:work']));
+    expect(manager.accountHolds().inFlight).toEqual(new Set(['codex:default']));
 
     internals.noteWindowProven(run.id, 'claude:default');
-    expect(manager.accountHolds().inFlight).toEqual(new Set(['codex:work']));
-    internals.noteWindowProven(run.id, 'codex:work');
+    expect(manager.accountHolds().inFlight).toEqual(new Set(['codex:default']));
+    internals.noteWindowProven(run.id, 'codex:default');
     expect(manager.accountHolds().inFlight.size).toBe(0);
   });
 
-  it('keeps the run account for an ordinary run', () => {
+  it.each([false, true])('auto-resumes an advisor-only limit without holding an account (session=%s)', (hasSession) => {
+    failedRun(true);
+    const run = store.listRuns()[0]!;
+    const workflow = harnessWorkflowDefs().find((item) => item.name === HARNESS_FIX_ISSUE)!;
+    writeFileSync(join(root, '.ai/cezar/config.json'), JSON.stringify({ multiModel: true, skillsRepos: [] }));
+    manager.dispose();
+    manager = new RunManager(store, root, { semaphore: new WorkspaceSemaphore({ initial: { maxParallel: 0 } }) });
+    store.updateRun(run.id, { workflowDef: workflow, autoResumeAt: undefined, autoResumeAccount: undefined });
+    if (hasSession) store.updateStep(run.id, 'implement', { sessionId: 's-1' });
+    const internal = manager as unknown as {
+      scheduleAutoResumeIfLimited: (id: string) => void;
+      fireAutoResume: (id: string) => void;
+    };
+    internal.scheduleAutoResumeIfLimited(run.id);
+    expect(store.getRun(run.id)?.autoResumeAt).toBeDefined();
+    expect(store.getRun(run.id)?.autoResumeAccount).toBeUndefined();
+    expect(manager.accountHolds().deadline.size).toBe(0);
+    internal.fireAutoResume(run.id);
+    expect(store.getRun(run.id)).toMatchObject({ status: 'queued', autoResumeAttempts: 1 });
+    expect(store.getRun(run.id)?.autoResumeAccount).toBeUndefined();
+    expect(manager.accountHolds().inFlight.size).toBe(0);
+  });
+
+  it('schedules from persisted limited-account attribution without an active state', () => {
+    failedRun(true);
+    const run = store.listRuns()[0]!;
+    store.updateRun(run.id, { autoResumeAt: undefined });
+    store.updateStep(run.id, 'implement', { sessionId: 's-1' });
+    const internal = manager as unknown as {
+      active: Map<string, unknown>;
+      scheduleAutoResumeIfLimited: (id: string) => void;
+    };
+    expect(internal.active.has(run.id)).toBe(false);
+    internal.scheduleAutoResumeIfLimited(run.id);
+    expect(store.getRun(run.id)?.autoResumeAt).toBeDefined();
+    expect(store.getRun(run.id)?.autoResumeAccount).toBe('codex:default');
+    expect(manager.accountHolds().deadline).toEqual(new Set(['codex:default']));
+  });
+
+  it('guard: keeps the run account for an ordinary run', () => {
     failedRun(false);
     expect(manager.accountHolds().deadline.has('claude:default')).toBe(true);
   });

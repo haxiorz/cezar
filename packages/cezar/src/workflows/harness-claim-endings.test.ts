@@ -102,6 +102,19 @@ describe('a harness run that ends without its driver', () => {
     ).toThrow(HARNESS_TEXT_ONLY_ERROR);
   });
 
+  it('updates the issue of an edited harness task through dequeue hydration', () => {
+    const run = manager.startRun(workflow, { task: 'Fix issue #642' });
+    expect(manager.editTask(run.id, 'Fix issue #999')).toBe(true);
+    expect(store.getRun(run.id)).toMatchObject({ task: 'Fix issue #999', issueNumber: 999, harness: { issueId: '999' } });
+    const internal = manager as unknown as {
+      pendingJobs: Map<string, { input: Parameters<RunManager['startRun']>[1] }>;
+      hydrateQueuedInput: (id: string, input: Parameters<RunManager['startRun']>[1]) => Parameters<RunManager['startRun']>[1];
+    };
+    expect(internal.hydrateQueuedInput(run.id, internal.pendingJobs.get(run.id)!.input).harness?.issueId).toBe('999');
+    expect(manager.editTask(run.id, 'Fix something')).toBe(false);
+    expect(store.getRun(run.id)?.harness?.issueId).toBe('999');
+  });
+
   it('keeps the claim of a run parked on its staged handoff', async () => {
     const { run, claimPath } = claimedRun('staged');
     await manager.recover();
