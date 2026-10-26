@@ -335,6 +335,41 @@ describe('harness runtime bridge', () => {
     expect(check).toMatchObject({ status: 'passed', evidence: 'gate-ran' });
   }, 10_000);
 
+  // PR #925 review: the SIGKILL escalation was skipped once the shell exited, and the gate settled
+  // only on 'close', so a worker that ignored SIGTERM held its pipe and the gate never resolved.
+  describe.skipIf(process.platform === 'win32')('a gate process that ignores SIGTERM', () => {
+    const stubborn = (pidFile: string) =>
+      `node -e "process.on('SIGTERM',()=>{});require('fs').writeFileSync('${pidFile}',String(process.pid));setInterval(()=>{},1000)"`;
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const waitDead = async (pid: number) => {
+      const deadline = Date.now() + 10_000;
+      while (alive(pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+      return !alive(pid);
+    };
+
+    it('times the gate out and kills the process', async () => {
+      const pidFile = join(dir, 'gate.pid');
+      // `; true` keeps bash as the group leader: it dies on SIGTERM and leaves node behind.
+      const [check] = await runValidationCommands([`${stubborn(pidFile)}; true`], dir, { timeoutMs: 1_500 });
+      expect(check?.status).toBe('failed');
+      expect(await waitDead(Number(readFileSync(pidFile, 'utf8')))).toBe(true);
+    }, 30_000);
+
+    it('settles a passing gate whose background child keeps the pipe open, then ends that child', async () => {
+      const pidFile = join(dir, 'bg.pid');
+      const [check] = await runValidationCommands([`${stubborn(pidFile)} & sleep 0.5`], dir);
+      expect(check?.status).toBe('passed');
+      expect(await waitDead(Number(readFileSync(pidFile, 'utf8')))).toBe(true);
+    }, 30_000);
+  });
+
   it('bounds validation output exactly at the configured cap', async () => {
     const [check] = await runValidationCommands(
       [`node -e "process.stdout.write('x'.repeat(250000))"`],

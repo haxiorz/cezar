@@ -18,7 +18,7 @@ import { z } from 'zod';
 import { discoverSkills, type Skill } from '../skills.js';
 import type { HarnessValidationCheck } from './types.js';
 import { readHarnessFsEntry, readRegularFileFollowing } from './fs-read.js';
-import { trackAgentProcessTree } from '../core/process-tree.js';
+import { terminateAgentProcessTree, trackAgentProcessTree } from '../core/process-tree.js';
 
 /**
  * The runtime bridge (spec 2026-07-23-harness-orchestration, Architecture §2):
@@ -130,23 +130,11 @@ function signalProcessTreePid(pid: number | undefined, signal: 'SIGTERM' | 'SIGK
   }
 }
 
-function signalProcessTree(child: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): void {
-  signalProcessTreePid(child.pid, signal);
-}
-
-export function terminateProcessTree(
-  child: ChildProcess,
-  identity?: HarnessProcessIdentity,
-): void {
-  signalProcessTree(child, 'SIGTERM');
-  const watchdog = setTimeout(() => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    if (identity && processHasToken(identity) !== true) return;
-    if (identity) signalOwnedProcess(identity, 'SIGKILL');
-    else signalProcessTree(child, 'SIGKILL');
-  }, PROCESS_KILL_GRACE_MS);
-  child.once('close', () => clearTimeout(watchdog));
-  watchdog.unref?.();
+/** SIGTERM the child's whole group, then SIGKILL whatever outlives the grace window. Escalating
+ *  only while the leader lived left a SIGTERM-ignoring grandchild running, and the gate waiting on
+ *  its pipe for good (PR #925 review). */
+export function terminateProcessTree(child: ChildProcess): void {
+  terminateAgentProcessTree(child, PROCESS_KILL_GRACE_MS);
 }
 
 export interface HarnessProcessIdentity {
@@ -420,7 +408,7 @@ export class HarnessRuntime {
 
   kill(): void {
     this.killed = true;
-    if (this.current) terminateProcessTree(this.current, this.currentIdentity ?? undefined);
+    if (this.current) terminateProcessTree(this.current);
   }
 
   run(
@@ -466,7 +454,7 @@ export class HarnessRuntime {
         try {
           opts.onSpawn?.(identity!);
         } catch (error) {
-          terminateProcessTree(child, identity);
+          terminateProcessTree(child);
           this.current = null;
           this.currentIdentity = null;
           resolve({
@@ -484,7 +472,7 @@ export class HarnessRuntime {
       }
       const timer = setTimeout(() => {
         timedOut = true;
-        terminateProcessTree(child, identity);
+        terminateProcessTree(child);
       }, timeoutMs);
       timer.unref?.();
       const collect = (sink: 'out' | 'err') => (chunk: Buffer) => {
@@ -894,11 +882,11 @@ export async function runValidationCommands(
         };
         child.stdout.on('data', collect);
         child.stderr.on('data', collect);
-        const abort = () => terminateProcessTree(child, identity);
+        const abort = () => terminateProcessTree(child);
         opts.signal?.addEventListener('abort', abort, { once: true });
         const timer = setTimeout(() => {
           timedOut = true;
-          terminateProcessTree(child, identity);
+          terminateProcessTree(child);
         }, timeoutMs);
         timer.unref?.();
         const settle = (code: number | null, syntheticOutput?: string) => {
@@ -922,7 +910,7 @@ export async function runValidationCommands(
         try {
           if (identity) opts.onSpawn?.(identity, command, index);
         } catch (error) {
-          terminateProcessTree(child, identity);
+          terminateProcessTree(child);
           settle(
             null,
             `failed to persist validation process identity: ${
@@ -933,6 +921,15 @@ export async function runValidationCommands(
         }
         child.on('error', (err) => {
           settle(null, `failed to spawn: ${err.message}`);
+        });
+        // A grandchild that outlives the shell keeps its pipe open and 'close' never comes: after a
+        // bounded drain, end the group and settle on the exit code (PR #925 review).
+        child.once('exit', (code) => {
+          const drain = setTimeout(() => {
+            terminateProcessTree(child);
+            settle(code);
+          }, PROCESS_KILL_GRACE_MS);
+          child.once('close', () => clearTimeout(drain));
         });
         child.on('close', (code) => {
           settle(code);
