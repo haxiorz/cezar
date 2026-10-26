@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
@@ -179,10 +180,13 @@ export function createClaudeStageOnlySettings(
   sandboxWrapperPath?: string;
 } {
   const guardDir = join(artifactDir, 'claude-guard');
-  mkdirSync(guardDir, { recursive: true });
+  // Settings per output directory: each session's sandbox writes its own directory only, so one
+  // reviewer cannot write another's result (PR #925 review).
+  const sessionDir = join(guardDir, 'sessions', createHash('sha256').update(outputDir).digest('hex').slice(0, 16));
+  mkdirSync(sessionDir, { recursive: true });
   mkdirSync(outputDir, { recursive: true });
   const guardPath = join(guardDir, 'guard.mjs');
-  const settingsPath = join(guardDir, 'settings.json');
+  const settingsPath = join(sessionDir, 'settings.json');
   writeFileSync(guardPath, GUARD_SCRIPT, { encoding: 'utf8', mode: 0o700 });
   const hooks = {
     PreToolUse: [
@@ -229,8 +233,8 @@ export function createClaudeStageOnlySettings(
   };
   let sandboxWrapperPath: string | undefined;
   if (useStandaloneSandbox) {
-    const sandboxSettingsPath = join(guardDir, 'sandbox-runtime.json');
-    sandboxWrapperPath = join(guardDir, 'sandbox-wrapper.mjs');
+    const sandboxSettingsPath = join(sessionDir, 'sandbox-runtime.json');
+    sandboxWrapperPath = join(sessionDir, 'sandbox-wrapper.mjs');
     writeFileSync(
       sandboxSettingsPath,
       `${JSON.stringify(

@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { canonicalizeAdvisorRefs } from './advisor-identity.js';
 import { acquireIssueClaim, releaseIssueClaim } from './issue-claim.js';
@@ -134,6 +134,44 @@ describe('harness safety primitives', () => {
     expect(taken).toMatchObject({ ok: true });
     if (!taken.ok) throw new Error(taken.error);
     expect(JSON.parse(readFileSync(taken.claim.path, 'utf8'))).toMatchObject({ runId: 'run-b', dataDir: '/p/one' });
+  });
+
+  // PR #925 review: every reviewer shared one writable output root, so one could write another's
+  // verdict and the driver counted it toward quorum.
+  it('confines each session to its own output directory', () => {
+    const root = tempDir('cez-claude-sessions-');
+    const worktree = join(root, 'worktree');
+    const artifacts = join(root, 'artifacts');
+    const own = join(artifacts, 'agent-output', 'phase-review-r1');
+    const sibling = join(artifacts, 'agent-output', 'phase-review-r2');
+    mkdirSync(worktree);
+
+    const linux = createClaudeStageOnlySettings(artifacts, worktree, own, 'linux');
+    const linuxSibling = createClaudeStageOnlySettings(artifacts, worktree, sibling, 'linux');
+    expect(linux.settingsPath).not.toBe(linuxSibling.settingsPath);
+    const allowed = (path: string) =>
+      (JSON.parse(readFileSync(path, 'utf8')) as { sandbox: { filesystem: { allowWrite: string[] } } }).sandbox.filesystem.allowWrite;
+    expect(allowed(linux.settingsPath)).toEqual([own]);
+    expect(allowed(linuxSibling.settingsPath)).toEqual([sibling]);
+
+    const mac = createClaudeStageOnlySettings(artifacts, worktree, own, 'darwin');
+    const macRuntime = JSON.parse(readFileSync(join(dirname(mac.settingsPath), 'sandbox-runtime.json'), 'utf8')) as {
+      filesystem: { allowWrite: string[] };
+    };
+    expect(macRuntime.filesystem.allowWrite).toContain(own);
+    expect(macRuntime.filesystem.allowWrite).not.toContain(sibling);
+
+    const command = (JSON.parse(readFileSync(mac.settingsPath, 'utf8')) as {
+      hooks: { PreToolUse: Array<{ hooks: Array<{ command: string }> }> };
+    }).hooks.PreToolUse[0]!.hooks[0]!.command;
+    const invoke = (file_path: string) =>
+      execFileSync(process.execPath, [JSON.parse(command.slice('node '.length)) as string], {
+        input: JSON.stringify({ tool_input: { file_path } }),
+        env: { ...process.env, ...mac.env },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    expect(() => invoke(join(own, 'result.json'))).not.toThrow();
+    expect(() => invoke(join(sibling, 'result.json'))).toThrow();
   });
 
   it('materializes a strict Claude sandbox and rejects writes outside its two roots', () => {
@@ -325,8 +363,8 @@ describe('harness safety primitives', () => {
     ]);
 
     const macArtifacts = join(root, 'mac');
-    createClaudeStageOnlySettings(macArtifacts, worktree, join(macArtifacts, 'out'), 'darwin');
-    const runtime = JSON.parse(readFileSync(join(macArtifacts, 'claude-guard', 'sandbox-runtime.json'), 'utf8')) as {
+    const mac = createClaudeStageOnlySettings(macArtifacts, worktree, join(macArtifacts, 'out'), 'darwin');
+    const runtime = JSON.parse(readFileSync(join(dirname(mac.settingsPath), 'sandbox-runtime.json'), 'utf8')) as {
       network: { allowedDomains: string[] };
       filesystem: { denyRead: string[]; denyWrite: string[] };
     };

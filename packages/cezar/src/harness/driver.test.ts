@@ -726,7 +726,8 @@ describe('harness driver — standard fix-issue graph', () => {
     });
     const resultPath = join(
       harnessAgentOutputDir(h.host.dataDir, h.host.runId),
-      'phase-qualify-result.json',
+      'phase-qualify',
+      'result.json',
     );
     writeFileSync(
       resultPath,
@@ -2217,7 +2218,8 @@ describe('harness driver — standard fix-issue graph', () => {
 
     const qualifyPath = join(
       harnessAgentOutputDir(first.host.dataDir, first.host.runId),
-      'phase-qualify-result.json',
+      'phase-qualify',
+      'result.json',
     );
     writeFileSync(
       qualifyPath,
@@ -2970,6 +2972,34 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
 
     expect(await runHarnessDriver(h.host, { ...input, roles }, h.deps)).toBeNull();
     expect(attempts.get(planted)).toBe(2);
+  });
+
+  // PR #925 review: every reviewer shared one writable output root with predictable result names,
+  // so one reviewer could write another's verdict.
+  it('gives each council reviewer its own writable output directory', async () => {
+    const h = makeHarness(dir);
+    for (const phase of ['qualify', 'diagnose', 'implement']) {
+      h.agentBehavior.set(phase, (req) => {
+        writeFileSync(req.resultPath, JSON.stringify(phaseDefaults[phase]), 'utf8');
+        return null;
+      });
+    }
+    const sessions: Array<{ outputDir?: string; resultPath: string }> = [];
+    h.agentBehavior.set('review', (req) => {
+      sessions.push({ outputDir: req.env?.CEZ_HARNESS_OUTPUT_DIR, resultPath: req.resultPath });
+      writeFileSync(req.resultPath, JSON.stringify({ verdict: 'approve', findings: [] }), 'utf8');
+      return null;
+    });
+    const reviewers = [
+      { runner: 'claude' as const, model: 'opus' },
+      { runner: 'claude' as const, model: 'sonnet' },
+      { runner: 'codex' as const, model: '' },
+    ];
+
+    expect(await runHarnessDriver(h.host, { ...input, roles: { ...roles, reviewers } }, h.deps)).toBeNull();
+    expect(sessions).toHaveLength(2);
+    for (const session of sessions) expect(dirname(session.resultPath)).toBe(session.outputDir);
+    expect(new Set(sessions.map((session) => session.outputDir)).size).toBe(2);
   });
 
   // PR #925 review: one reviewer that threw rejected the council pool, so the driver unwound while

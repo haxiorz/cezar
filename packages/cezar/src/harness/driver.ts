@@ -700,7 +700,7 @@ export async function runHarnessDriver(
   mkdirSync(artifactDir, { recursive: true });
   const agentOutputDir = harnessAgentOutputDir(host.dataDir, host.runId);
   mkdirSync(agentOutputDir, { recursive: true });
-  const phaseLocationContract = (skill: string | undefined): string =>
+  const phaseLocationContract = (skill: string | undefined, outputDir: string): string =>
     [
       'Harness location contract:',
       `- Active repository root: ${host.cwd}. Use repo-relative paths from this directory; it is the only checkout this phase may inspect or edit.`,
@@ -709,7 +709,7 @@ export async function runHarnessDriver(
             `- The original checkout at ${host.repoRoot} is not this phase's subject. Do not read from or write to it.`,
           ]
         : []),
-      `- Phase-output directory: ${agentOutputDir}. Use the exact spec, report, and result paths supplied in the task; never derive a sibling path or append "-harness" to the worktree.`,
+      `- Phase-output directory: ${outputDir}. Use the exact spec, report, and result paths supplied in the task; never derive a sibling path or append "-harness" to the worktree.`,
       ...(skill
         ? [
             `- The complete ${skill} playbook is already injected in your system instructions. Follow it directly; do not invoke the Skill tool or read a SKILL.md file.`,
@@ -718,7 +718,8 @@ export async function runHarnessDriver(
     ].join('\n');
   const noGitHubAuthDir = join(artifactDir, 'no-github-auth');
   mkdirSync(noGitHubAuthDir, { recursive: true });
-  let claudeGuard: ReturnType<typeof createClaudeStageOnlySettings> | undefined;
+  // One guard per output directory: each session's sandbox may write its own directory only.
+  const claudeGuards = new Map<string, ReturnType<typeof createClaudeStageOnlySettings>>();
   // Resolved from the main repository, never through the worktree's model-writable `.git`
   // pointer; every host-side git call here and in the runtime uses it (git-pin.ts, PR #925 review).
   const trustedGitDir = resolveTrustedGitDir(host.repoRoot, host.cwd);
@@ -1076,10 +1077,15 @@ export async function runHarnessDriver(
     // A phase without a role runs on Claude, and says so: left unset it fell to the task's runner
     // (OpenCode, Cursor…) with no guard or sandbox, while the ledger recorded Claude (PR #925 review).
     const runner = request.runner ?? 'claude';
+    const outputDir = dirname(request.resultPath);
     if (runner === 'claude') {
       try {
-        claudeGuard ??= createClaudeStageOnlySettings(artifactDir, host.cwd, agentOutputDir);
-        guardEnv = claudeGuard.env;
+        let guard = claudeGuards.get(outputDir);
+        if (!guard) {
+          guard = createClaudeStageOnlySettings(artifactDir, host.cwd, outputDir);
+          claudeGuards.set(outputDir, guard);
+        }
+        guardEnv = guard.env;
       } catch (error) {
         return `Claude stage-only sandbox unavailable: ${error instanceof Error ? error.message : String(error)}`;
       }
@@ -1104,8 +1110,9 @@ export async function runHarnessDriver(
         ...guardEnv,
         CEZ_PROCESS_TOKEN: token,
         CEZ_HARNESS_STAGE_ONLY: '1',
-        // The one directory outside the worktree a stage-only phase may write.
-        CEZ_HARNESS_OUTPUT_DIR: agentOutputDir,
+        // The one directory outside the worktree a stage-only phase may write: its own, so no
+        // session can write another reviewer's verdict (PR #925 review).
+        CEZ_HARNESS_OUTPUT_DIR: outputDir,
         GIT_ALLOW_PROTOCOL: '',
         GIT_TERMINAL_PROMPT: '0',
         GIT_ASKPASS: '/usr/bin/false',
@@ -1224,8 +1231,13 @@ export async function runHarnessDriver(
     return ledger.decisions.slice(restart + 1);
   };
 
-  const resultPathFor = (phaseId: string) =>
-    join(agentOutputDir, `phase-${phaseId}-result.json`);
+  /** A session's result, in a directory that session alone may write (PR #925 review). */
+  const ownResultPath = (slug: string): string => {
+    const dir = join(agentOutputDir, slug);
+    mkdirSync(dir, { recursive: true });
+    return join(dir, 'result.json');
+  };
+  const resultPathFor = (phaseId: string) => ownResultPath(`phase-${phaseId}`);
 
   /**
    * Pull the first schema-valid JSON object out of arbitrary session output.
@@ -1440,7 +1452,7 @@ export async function runHarnessDriver(
     const phasePrompt = `${prompt}${boundaryAppendix}`;
     const renderedPrompt = `${phasePrompt
       .replaceAll('$CEZ_HARNESS_RESULT_FILE', sessionResultPath)
-      .replaceAll('$CEZ_HARNESS_ARTIFACT_DIR', agentOutputDir)}\n\n${phaseLocationContract(skill)}\n\n${PHASE_SESSION_CONTRACT}`;
+      .replaceAll('$CEZ_HARNESS_ARTIFACT_DIR', dirname(resultPath))}\n\n${phaseLocationContract(skill, dirname(resultPath))}\n\n${PHASE_SESSION_CONTRACT}`;
     const budgetError = promptBudgetError(completeModelPrompt(skill, renderedPrompt));
     if (budgetError) return { error: `${phaseId}: ${budgetError}` };
     const modelId = ref ? roleRefId(ref) : 'claude';
@@ -1662,7 +1674,7 @@ export async function runHarnessDriver(
           timeoutMs: PHASE_TIMEOUTS_MS[timeoutKey] ?? 30 * 60_000,
           env: {
             CEZ_HARNESS_RESULT_FILE: resultPath,
-            CEZ_HARNESS_ARTIFACT_DIR: agentOutputDir,
+            CEZ_HARNESS_ARTIFACT_DIR: dirname(resultPath),
           },
           ...(ref
             ? { runner: ref.runner, model: ref.model, effort: ref.effort }
@@ -4184,8 +4196,8 @@ export async function runHarnessDriver(
           const specRunnerWork = pool(specRunnerReviewers, MAX_PARALLEL_REVIEWERS, containReviewerThrow(councilId, outcomes, councilReviewers, async (reviewer, idx) => {
             if (host.isCancelled()) return;
             const label = roleRefId(reviewer);
-            const resultPath = join(agentOutputDir, `phase-${councilId}-r${idx + 1}-result.json`);
-            const renderedPrompt = `${specPromptText.replaceAll('$CEZ_HARNESS_RESULT_FILE', resultPath)}\n\n${phaseLocationContract(phaseSkills.preImplement)}\n\n${PHASE_SESSION_CONTRACT}`;
+            const resultPath = ownResultPath(`phase-${councilId}-r${idx + 1}`);
+            const renderedPrompt = `${specPromptText.replaceAll('$CEZ_HARNESS_RESULT_FILE', resultPath)}\n\n${phaseLocationContract(phaseSkills.preImplement, dirname(resultPath))}\n\n${PHASE_SESSION_CONTRACT}`;
             const budgetError = promptBudgetError(
               completeModelPrompt(phaseSkills.preImplement, renderedPrompt),
             );
@@ -4265,7 +4277,7 @@ export async function runHarnessDriver(
                 prompt: attemptPrompt,
                 resultPath,
                 timeoutMs: PHASE_TIMEOUTS_MS.review ?? 30 * 60_000,
-                env: { CEZ_HARNESS_RESULT_FILE: resultPath, CEZ_HARNESS_ARTIFACT_DIR: agentOutputDir },
+                env: { CEZ_HARNESS_RESULT_FILE: resultPath, CEZ_HARNESS_ARTIFACT_DIR: dirname(resultPath) },
                 runner: reviewer.runner,
                 model: reviewer.model,
                 effort: reviewer.effort,
@@ -5084,10 +5096,10 @@ export async function runHarnessDriver(
         const runnerReviewerWork = pool(runnerReviewers, MAX_PARALLEL_REVIEWERS, containReviewerThrow(reviewId, outcomes, councilReviewers, async (reviewer, idx) => {
           if (host.isCancelled()) return;
           const label = roleRefId(reviewer);
-          const resultPath = join(agentOutputDir, `phase-${reviewId}-r${idx + 1}-result.json`);
+          const resultPath = ownResultPath(`phase-${reviewId}-r${idx + 1}`);
           const renderedPrompt = `${councilReviewPromptText
             .replaceAll('$CEZ_HARNESS_RESULT_FILE', resultPath)
-            .replaceAll('$CEZ_HARNESS_ARTIFACT_DIR', agentOutputDir)}\n\n${phaseLocationContract(phaseSkills.codeReview)}\n\n${PHASE_SESSION_CONTRACT}`;
+            .replaceAll('$CEZ_HARNESS_ARTIFACT_DIR', dirname(resultPath))}\n\n${phaseLocationContract(phaseSkills.codeReview, dirname(resultPath))}\n\n${PHASE_SESSION_CONTRACT}`;
           const budgetError = promptBudgetError(
             completeModelPrompt(phaseSkills.codeReview, renderedPrompt),
           );
@@ -5167,7 +5179,7 @@ export async function runHarnessDriver(
               prompt: attemptPrompt,
               resultPath,
               timeoutMs: PHASE_TIMEOUTS_MS.review ?? 30 * 60_000,
-              env: { CEZ_HARNESS_RESULT_FILE: resultPath, CEZ_HARNESS_ARTIFACT_DIR: agentOutputDir },
+              env: { CEZ_HARNESS_RESULT_FILE: resultPath, CEZ_HARNESS_ARTIFACT_DIR: dirname(resultPath) },
               runner: reviewer.runner,
               model: reviewer.model,
               effort: reviewer.effort,
