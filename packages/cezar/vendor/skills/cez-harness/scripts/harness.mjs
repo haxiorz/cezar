@@ -882,7 +882,7 @@ async function runHttpReviewerWithCredential(model, prompt, key, timeoutMs = nul
 function locateKimiBinary(model) {
   const candidates = [model.binaryEnv && process.env[model.binaryEnv], join(homedir(), '.kimi', 'bin', 'kimi', 'kimi'), 'kimi'].filter(Boolean)
   for (const candidate of [...new Set(candidates)]) {
-    const result = spawnSync(candidate, ['--version'], { encoding: 'utf8', stdio: 'pipe' })
+    const result = spawnSync(candidate, ['--version'], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: 'pipe' })
     if (!result.error && result.status === 0) return candidate
   }
   return null
@@ -1214,7 +1214,7 @@ function pinnedGitEnv(cwd) {
 }
 
 function git(args, cwd, options = {}) {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8', stdio: options.stdio || 'pipe', env: { ...process.env, ...pinnedGitEnv(cwd), ...(options.env || {}) } })
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: options.stdio || 'pipe', env: { ...process.env, ...pinnedGitEnv(cwd), ...(options.env || {}) } })
   if (result.status !== 0) throw new Error((result.stderr || result.stdout || `git ${args[0]} failed`).trim())
   return result.stdout
 }
@@ -1316,7 +1316,7 @@ function ensureIgnoredRunDir(runDir, worktree) {
   const rel = relative(worktree, runDir)
   if (rel === '') throw new Error('Harness artifact directory must not be the worktree root')
   if (rel.startsWith('..') || isAbsolute(rel)) return
-  const result = spawnSync('git', ['check-ignore', '-q', '--no-index', '--', rel], { cwd: worktree, stdio: 'ignore', env: { ...process.env, ...pinnedGitEnv(worktree) } })
+  const result = spawnSync('git', ['check-ignore', '-q', '--no-index', '--', rel], { cwd: worktree, maxBuffer: 256 * 1024 * 1024, stdio: 'ignore', env: { ...process.env, ...pinnedGitEnv(worktree) } })
   if (result.status !== 0) throw new Error(`Harness artifact directory inside the worktree must be ignored by Git: ${rel}`)
 }
 

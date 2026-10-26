@@ -11,7 +11,7 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, sep } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -265,6 +265,7 @@ function makeHarness(dir: string) {
             JSON.stringify({
               version: 1,
               state,
+              events: [{ state: 'implementing' }],
               packet: manifest,
               currentDiff: {
                 sha256: 'a'.repeat(64),
@@ -438,6 +439,131 @@ describe('harness driver — standard fix-issue graph', () => {
     },
   });
 
+  it.each(['blocked', 'planned', 'claimed', 'aborted'])('[round2-2] keeps pre-existing approved spec after real preflight refusal in %s', async (priorState) => {
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'test@local');
+    git('config', 'user.name', 'test');
+    writeFileSync(join(dir, 'README.md'), '# base');
+    git('add', 'README.md');
+    git('commit', '-qm', 'base');
+    pinWorktreeGitDir(dir, join(dir, '.git'));
+    writeFileSync(join(dir, '.git/info/exclude'), '.ai/cezar/\n.claude/\n');
+    const specPath = '.ai/specs/approved.md';
+    mkdirSync(join(dir, '.ai/specs'), { recursive: true });
+    writeFileSync(join(dir, specPath), '# Council-approved spec\n');
+    const h = makeHarness(dir);
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    h.agentBehavior.set('packet-plan', (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ summary: 'spec packet', packets: [{
+        version: 1, id: 'PK-01', title: 'spec', objective: 'implement approved spec', risk: 'low',
+        allowedPaths: [specPath], invariants: ['preserve spec'], acceptanceCriteria: ['implemented'],
+      }] }));
+      return null;
+    });
+    const realConfig = join(dir, '.ai/cezar/real-config.json');
+    const risks = { low: 1, medium: 1, high: 1, critical: 1 };
+    const worker = join(dir, '.ai/cezar/codex');
+    writeFileSync(worker, '#!/bin/sh\nexit 99\n');
+    chmodSync(worker, 0o755);
+    writeFileSync(realConfig, JSON.stringify({ agentHarness: {
+      version: 1, delivery: { mode: 'stage-only' },
+      models: {
+        worker: { family: 'openai', model: 'test', adapter: 'command', reasoningEffort: 'high', roles: ['worker'],
+          workerSecurity: { network: 'disabled', remoteWrites: 'disabled', refWrites: 'disabled', enforcedBy: 'codex-workspace-write-sandbox' },
+          commands: { worker: [worker, 'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral', '--config', 'model_reasoning_effort={reasoningEffort}', '--sandbox', 'workspace-write', '--cd', '{worktree}', '--model', '{model}', '-'] } },
+        reviewer: { family: 'deepseek', model: 'test', adapter: 'command', roles: ['reviewer'], commands: { review: [process.execPath, '-e', 'process.exit(99)'] } },
+      },
+      profiles: { 'high-assurance': { workers: ['worker'], reviewers: ['reviewer'], packetPolicy: {
+        mode: 'adversarial', reviewersByRisk: risks, minimumFamiliesByRisk: risks, verificationReviewers: 1,
+        lenses: ['correctness'], separateFixer: true, maxFixCycles: 1, blockingSeverities: ['blocker', 'major'],
+        budgets: { maxWorkerInvocations: 2, maxReviewerInvocations: 2, maxFixerInvocations: 2, maxReviewInputBytes: 1_000_000 },
+      } } },
+    } }));
+    const script = new URL('../../vendor/skills/cez-harness/scripts/harness.mjs', import.meta.url).pathname;
+    const create = h.deps.createRuntime!;
+    h.deps.createRuntime = (opts) => {
+      const fake = create(opts);
+      return { ...fake, run: async (op, args, options) => {
+        if (!['packet-run', 'packet-release'].includes(op)) return fake.run(op, args, options);
+        const configArgs = [...args];
+        const i = configArgs.indexOf('--config');
+        if (i >= 0) configArgs.splice(i, 2);
+        const real = spawnSync(process.execPath, [script, op, ...configArgs, '--config', realConfig], {
+          cwd: dir, encoding: 'utf8', env: { ...process.env, CEZ_HARNESS_REVIEW_SKILL: 'cez-code-review' },
+        });
+        return { ok: real.status === 0, exitCode: real.status ?? 1, stdout: real.stdout, stderr: real.stderr, durationMs: 0 };
+      } };
+    };
+    const packetInput = { ...input, profile: 'high-assurance' as const };
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toContain(`Packet allowed paths already contain uncommitted changes: ${specPath}`);
+    const resultPath = join(harnessArtifactDir(h.host.dataDir, h.host.runId), 'packet-runtime/packets/PK-01/packet-result.json');
+    const ledger = JSON.parse(readFileSync(resultPath, 'utf8'));
+    expect(ledger.events.some((event: { state: string }) => event.state === 'implementing')).toBe(false);
+    writeFileSync(resultPath, JSON.stringify({ ...ledger, state: priorState }));
+    if (priorState === 'aborted') {
+      const released = spawnSync(process.execPath, [script, 'packet-release', '--run-dir', dirname(dirname(dirname(resultPath))), '--packet', 'PK-01', '--reason', 'interrupted release'], { cwd: dir, encoding: 'utf8' });
+      expect(released.status, released.stderr).toBe(0);
+      const driverLedger = loadLedger(h.host.dataDir, h.host.runId)!;
+      driverLedger.invocations.push({
+        id: 'packet-release:PK-01:1', phaseId: 'packet-PK-01', role: 'recovery',
+        binding: { runner: 'harness', model: 'packet-release' }, status: 'interrupted', attempt: 1,
+        inputSha256: createHash('sha256').update(JSON.stringify({ inputHashVersion: 2, operation: 'packet-release', packetId: 'PK-01', state: 'blocked', reason: 'cezar recovered an interrupted packet process and is starting one bounded replacement attempt' })).digest('hex'),
+      });
+      saveLedger(h.host.dataDir, h.host.runId, driverLedger);
+    }
+    const next = await runHarnessDriver(h.host, packetInput, h.deps);
+    expect(existsSync(join(dir, specPath))).toBe(true);
+    expect(readFileSync(join(dir, specPath), 'utf8')).toBe('# Council-approved spec\n');
+    expect(next).toContain(`Packet allowed paths already contain uncommitted changes: ${specPath}`);
+    expect(h.events.some((event) => String(event.message).includes('failed-attempt diff preserved'))).toBe(false);
+  });
+
+  it('[round2-3] normalizes trailing slash packet scopes in the persisted manifest', async () => {
+    const h = makeHarness(dir);
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    h.agentBehavior.set('packet-plan', (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ summary: 'directory', packets: [{
+        version: 1, id: 'PK-01', title: 'directory', objective: 'implement', risk: 'low',
+        allowedPaths: ['src/x///'], invariants: ['safe'], acceptanceCriteria: ['done'],
+      }] }));
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, { ...input, profile: 'high-assurance' }, h.deps)).toBeNull();
+    const manifest = join(harnessArtifactDir(h.host.dataDir, h.host.runId), 'packet-manifest-PK-01.json');
+    expect(JSON.parse(readFileSync(manifest, 'utf8')).allowedPaths).toEqual(['src/x']);
+  });
+
+  it('[round2-3] rejects mixed-case Git metadata components', async () => {
+    const h = makeHarness(dir);
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    h.agentBehavior.set('packet-plan', (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ summary: 'unsafe', packets: [{
+        version: 1, id: 'PK-01', title: 'unsafe', objective: 'implement', risk: 'low',
+        allowedPaths: ['src/.GiT/config'], invariants: ['safe'], acceptanceCriteria: ['done'],
+      }] }));
+      return null;
+    });
+    const error = await runHarnessDriver(h.host, { ...input, profile: 'high-assurance' }, h.deps);
+    expect(error).not.toBeNull();
+    expect(error).toContain('unsafe allowed path');
+    expect(h.ops.some((op) => op.id === 'packet-run')).toBe(false);
+  });
+
+  it.each(['src/../x', 'src//x', 'src/./x', '/src/x', 'src/\\x', 'src/.git/config'])('guard: packet path validation still refuses %s', async (path) => {
+    const h = makeHarness(dir);
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    h.agentBehavior.set('packet-plan', (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ summary: 'unsafe', packets: [{
+        version: 1, id: 'PK-01', title: 'unsafe', objective: 'implement', risk: 'low',
+        allowedPaths: [path], invariants: ['safe'], acceptanceCriteria: ['done'],
+      }] }));
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, { ...input, profile: 'high-assurance' }, h.deps)).toContain('unsafe allowed path');
+    expect(h.ops.some((op) => op.id === 'packet-run')).toBe(false);
+  });
+
   it('[925-1] resets the index without reflog drift in the real vendored runtime', () => {
     const cwd = join(dir, 'real-repo');
     mkdirSync(cwd);
@@ -540,7 +666,7 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(failed.map((invocation) => invocation.error)).toEqual(['review timed out', 'missing provider credential', 'provider usage limit reached']);
   });
 
-  it('[925-4] preserves failed packet edits and cleans only its allowed paths before replacement', async () => {
+  it('guard: [925-4] preserves failed packet edits and cleans only its allowed paths before replacement', async () => {
     const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
     git('init', '-q', '-b', 'main');
     git('config', 'user.email', 'test@local');
@@ -740,6 +866,53 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
     expect(reviews).toBe(2);
     expect(h.calls.filter((call) => call.id === 'fix-2')).toHaveLength(1);
+  });
+
+  it('[round2-10] clamps long qualification evidence without repurchasing the phase', async () => {
+    const h = makeHarness(dir);
+    h.agentBehavior.set('qualify', (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ outcome: 'no_action', evidence: 'e'.repeat(25_000) }));
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    expect(h.calls.filter((call) => call.id === 'qualify')).toHaveLength(1);
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.outcome.status).toBe('no-action');
+  });
+
+  it.each(['summary', 'title', 'findings', 'evidence'])('[round2-10] clamps pre-implementation %s and keeps the most severe findings', async (field) => {
+    const h = makeHarness(dir);
+    h.agentBehavior.set('spec', (req) => {
+      mkdirSync(join(dir, '.ai/specs'), { recursive: true });
+      writeFileSync(join(dir, '.ai/specs/feature.md'), '# feature');
+      writeFileSync(req.resultPath, JSON.stringify({ summary: 'feature', specPath: '.ai/specs/feature.md' }));
+      return null;
+    });
+    h.agentBehavior.set('pre-implement', (req) => {
+      const blocker = { severity: 'blocker', title: `must retain blocker${field === 'title' ? 'x'.repeat(700) : ''}`, evidence: field === 'evidence' ? 'e'.repeat(5_000) : 'confirmed' };
+      writeFileSync(req.resultPath, JSON.stringify({ status: 'blocked', summary: field === 'summary' ? 's'.repeat(25_000) : 'blocked', reportPath: 'audit.md', findings: [
+        ...(field === 'findings' ? Array.from({ length: 60 }, () => ({ severity: 'nit', title: 'cosmetic', evidence: 'confirmed' })) : []),
+        blocker,
+      ] }));
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, { ...input, workflow: HARNESS_IMPLEMENT_FEATURE }, h.deps)).toContain('explicit acceptance is required');
+    expect(h.calls.filter((call) => call.id === 'pre-implement')).toHaveLength(1);
+    const pending = loadLedger(h.host.dataDir, h.host.runId)?.outcome.pendingDecision;
+    expect(pending?.kind).toBe('spec');
+    if (pending?.kind !== 'spec') throw new Error('missing spec decision');
+    expect(pending.findings[0]).toContain('must retain blocker');
+    expect(pending.findings.length).toBeLessThanOrEqual(50);
+  });
+
+  it('guard: qualification still rejects an invalid semantic outcome', async () => {
+    const h = makeHarness(dir);
+    h.agentBehavior.set('qualify', (req) => {
+      writeFileSync(req.resultPath, JSON.stringify({ outcome: 'maybe', evidence: 'valid evidence' }));
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, input, h.deps)).toContain('outcome');
+    expect(h.calls.filter((call) => call.id === 'qualify')).toHaveLength(2);
+    expect(h.ops.some((op) => op.id === 'stage')).toBe(false);
   });
 
   it('[925-8] clamps diagnosis lists instead of spending a contract retry', async () => {
@@ -1033,7 +1206,7 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(ledger?.phases.find((p) => p.id === 'qualify')?.status).toBe('failed');
   });
 
-  it('rejects an oversized phase artifact without parsing it into memory', async () => {
+  it('guard: rejects an oversized phase artifact without parsing it into memory', async () => {
     const h = makeHarness(dir);
     let attempts = 0;
     h.agentBehavior.set('qualify', (req) => {
@@ -3409,6 +3582,157 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     implement: { changedPaths: ['src/a.ts'], suggestedCommit: 'fix: x' },
   };
 
+  it.each(['rows', 'op-error', 'throw'])('[round2-5] leaves advisor usage-limit windows unspent (%s)', async (mode) => {
+    const h = makeHarness(dir);
+    let windows = 0;
+    h.setCouncilBehavior((ids) => {
+      windows += 1;
+      if (windows > 2) return undefined;
+      if (mode === 'throw') throw new Error('provider usage limit reached');
+      return mode === 'op-error' ? { ok: false, stderr: 'provider usage limit reached' } : {
+        ok: true, result: { reviewers: ids.map((id) => ({ id, status: 'failed', error: 'provider usage limit reached' })) },
+      };
+    });
+    for (let window = 0; window < 2; window += 1) {
+      expect(await runHarnessDriver(h.host, input, h.deps)).toMatch(/quorum/);
+      expect(loadLedger(h.host.dataDir, h.host.runId)?.invocations.filter((row) => row.id.startsWith('advisor:')).at(-1)?.status).toBe('interrupted');
+    }
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    expect(windows).toBe(3);
+  });
+
+  it('guard: a permanent advisor failure still spends the bounded retry budget', async () => {
+    const h = makeHarness(dir);
+    let calls = 0;
+    h.setCouncilBehavior((ids) => {
+      calls += 1;
+      return { ok: true, result: { reviewers: ids.map((id) => ({ id, status: 'failed', error: 'invalid provider configuration' })) } };
+    });
+    expect(await runHarnessDriver(h.host, input, h.deps)).toMatch(/quorum/);
+    expect(calls).toBe(2);
+    const advisor = loadLedger(h.host.dataDir, h.host.runId)?.invocations.find((row) => row.id.startsWith('advisor:'));
+    expect(advisor).toMatchObject({ status: 'failed', attempt: 2 });
+  });
+
+  it('[round2-6] reads a real verbose multi-advisor result larger than two MB', async () => {
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'test@local');
+    git('config', 'user.name', 'test');
+    mkdirSync(join(dir, 'src/runs'), { recursive: true });
+    writeFileSync(join(dir, 'src/runs/store.ts'), 'base\n');
+    git('add', 'src');
+    git('commit', '-qm', 'base');
+    pinWorktreeGitDir(dir, join(dir, '.git'));
+    writeFileSync(join(dir, '.git/info/exclude'), '.ai/cezar/\n.claude/\n');
+    const h = makeHarness(dir);
+    h.agentBehavior.set('implement', (req) => {
+      writeFileSync(join(dir, 'src/runs/store.ts'), 'implementation\n');
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/runs/store.ts'] }));
+      return null;
+    });
+    const command = join(dir, '.ai/cezar/reviewer.cjs');
+    writeFileSync(command, `process.stdin.resume(); process.stdin.on('end', () => process.stdout.write(JSON.stringify({ verdict: 'approve', notes: [], findings: Array.from({length: 10}, (_, i) => ({severity: 'minor', category: 'quality', title: 'finding ' + i, location: {path: 'src/runs/store.ts'}, evidence: 'e'.repeat(70000), impact: 'cosmetic', remediation: 'consider', confidence: 1})) })));`);
+    const create = h.deps.createRuntime!;
+    const script = new URL('../../vendor/skills/cez-harness/scripts/harness.mjs', import.meta.url).pathname;
+    let resultBytes = 0;
+    h.deps.createRuntime = (opts) => {
+      const fake = create(opts);
+      return { ...fake, run: async (op, args, options) => {
+        if (op !== 'review') return fake.run(op, args, options);
+        const configPath = args[args.indexOf('--config') + 1]!;
+        const cfg = JSON.parse(readFileSync(configPath, 'utf8'));
+        for (const model of Object.values(cfg.agentHarness.models) as Array<Record<string, unknown>>) {
+          model.adapter = 'command';
+          model.commands = { review: [process.execPath, command] };
+        }
+        writeFileSync(configPath, JSON.stringify(cfg));
+        const real = spawnSync(process.execPath, [script, op, ...args], {
+          cwd: dir, encoding: 'utf8', env: { ...process.env, CEZ_HARNESS_REVIEW_SKILL: 'cez-code-review' },
+        });
+        const resultPath = join(args[args.indexOf('--output-dir') + 1]!, 'review-result.json');
+        if (existsSync(resultPath)) resultBytes = readFileSync(resultPath).length;
+        return { ok: real.status === 0, exitCode: real.status ?? 1, stdout: real.stdout, stderr: real.stderr, durationMs: 0 };
+      } };
+    };
+    const verboseInput = { ...input, roles: { ...roles, reviewers: [
+      { runner: 'claude' as const, model: 'opus' },
+      { runner: 'codex' as const, model: 'gpt-5.6-sol' },
+      { runner: 'codex' as const, model: 'gpt-5.5-mini' },
+    ] } };
+    const error = await runHarnessDriver(h.host, verboseInput, h.deps);
+    expect(resultBytes, error ?? undefined).toBeGreaterThan(2_000_000);
+    expect(error).toBeNull();
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.invocations.filter((row) => row.id.startsWith('advisor:')).map((row) => row.status)).toEqual(['completed', 'completed']);
+  }, 15_000);
+
+  it('[round2-7] bounds open spec questions and preserves their full artifact', async () => {
+    const h = makeHarness(dir);
+    h.agentBehavior.set('spec', (req) => {
+      mkdirSync(join(dir, '.ai/specs'), { recursive: true });
+      writeFileSync(join(dir, '.ai/specs/feature.md'), '# feature');
+      writeFileSync(req.resultPath, JSON.stringify({ summary: 'feature', specPath: '.ai/specs/feature.md',
+        openQuestions: Array.from({ length: 50 }, (_, i) => `question ${i} ${'界'.repeat(1_200)}`),
+      }));
+      return null;
+    });
+    let prompt = '';
+    h.agentBehavior.set('review', (req) => {
+      prompt = req.prompt;
+      writeFileSync(req.resultPath, JSON.stringify({ verdict: 'approve', findings: [] }));
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, { ...input, workflow: HARNESS_IMPLEMENT_FEATURE }, h.deps)).toBeNull();
+    expect(Buffer.byteLength(prompt)).toBeLessThan(180_000);
+    const artifact = join(harnessArtifactDir(h.host.dataDir, h.host.runId), 'findings-prior-rounds.json');
+    expect(prompt).toContain(artifact);
+    expect(JSON.parse(readFileSync(artifact, 'utf8')).unresolvedSpecFindings).toHaveLength(50);
+  });
+
+  it.each([['guard: short review history preserves earlier requirements', false], ['[round2-7] bounds resumed history for session prompts and advisor criteria', true]] as const)('%s', async (_name, large) => {
+    const h = makeHarness(dir);
+    let stopped = false;
+    h.host.isCancelled = () => stopped;
+    h.agentBehavior.set('review', () => { stopped = true; return 'stopped'; });
+    await runHarnessDriver(h.host, input, h.deps);
+    const ledger = loadLedger(h.host.dataDir, h.host.runId)!;
+    if (!ledger.rounds?.implementation) throw new Error('missing implementation checkpoint');
+    ledger.rounds.implementation.history = [{
+      round: 1,
+      demanded: large ? Array.from({ length: 200 }, (_, i) => `[major] demand ${i} ${'界'.repeat(800)}`) : ['[blocker] keep the invariant'],
+      response: large ? 'response '.repeat(30_000) : 'the fix preserves the invariant',
+    }];
+    saveLedger(h.host.dataDir, h.host.runId, ledger);
+    const resumed = makeHarness(dir);
+    let prompt = '';
+    let criteria = '';
+    resumed.agentBehavior.set('review', (req) => {
+      prompt = req.prompt;
+      writeFileSync(req.resultPath, JSON.stringify({ verdict: 'approve', findings: [] }));
+      return null;
+    });
+    const create = resumed.deps.createRuntime!;
+    resumed.deps.createRuntime = (opts) => {
+      const fake = create(opts);
+      return { ...fake, run: async (op, args, options) => {
+        if (op === 'review') criteria = readFileSync(args[args.indexOf('--criteria-file') + 1]!, 'utf8');
+        return fake.run(op, args, options);
+      } };
+    };
+    expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+    for (const text of [prompt, criteria]) {
+      expect(Buffer.byteLength(text)).toBeLessThan(180_000);
+      expect(text).toContain(large ? 'findings-prior-rounds.json' : 'keep the invariant');
+      expect(text.toLowerCase()).toContain('earlier');
+      if (!large) expect(text).toContain('the fix preserves the invariant');
+    }
+    if (large) {
+      const artifact = join(harnessArtifactDir(resumed.host.dataDir, resumed.host.runId), 'findings-prior-rounds.json');
+      expect(JSON.parse(readFileSync(artifact, 'utf8')).roundHistory[0].demanded).toHaveLength(200);
+      expect(readFileSync(artifact, 'utf8')).toContain('界'.repeat(800));
+    }
+  });
+
   it('routes each phase to its role model, and reviews through structured calls', async () => {
     const h = makeHarness(dir);
     const seen: Array<{ id: string; runner?: string; model?: string }> = [];
@@ -4631,7 +4955,7 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     }
   });
 
-  it('carries the spec author\'s recorded assumptions to the run log and the reviewer', async () => {
+  it('guard: carries the spec author\'s recorded assumptions to the run log and the reviewer', async () => {
     const h = makeHarness(dir);
     let reviewPrompt = '';
     h.agentBehavior.set('spec', (req) => {

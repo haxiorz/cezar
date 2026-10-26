@@ -34,6 +34,12 @@ export function advisorCouncilTimeoutMs(
   })) + 120_000;
 }
 
+/** Sealed runtime output repeats findings; the smallest legal subject part is 1 KiB (PR #925 review). */
+export function advisorCouncilResultMaxBytes(members: number, subjectBytes: number): number {
+  const parts = subjectBytes <= 1_024 ? 1 : 2 * Math.ceil(subjectBytes / (1_024 - 4)) + 1;
+  return 1_000_000 + Math.max(1, members) * parts * 2_000_000 * 4;
+}
+
 export interface PromptFinding {
   severity: 'blocker' | 'major' | 'minor' | 'nit';
   title: string;

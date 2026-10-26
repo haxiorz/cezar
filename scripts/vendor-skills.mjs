@@ -676,13 +676,20 @@ const VALID_POLICY = new Set(['advisory', 'quorum', 'all-required'])`,
 }
 
 function git(args, cwd, options = {}) {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8', stdio: options.stdio || 'pipe', env: { ...process.env, ...pinnedGitEnv(cwd), ...(options.env || {}) } })`,
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: options.stdio || 'pipe', env: { ...process.env, ...pinnedGitEnv(cwd), ...(options.env || {}) } })`,
     'pinned repository for runtime git',
+  );
+  // Bound every synchronous subprocess consistently with the driver (PR #925 review).
+  text = replaceRequired(
+    text,
+    "spawnSync(candidate, ['--version'], { encoding: 'utf8', stdio: 'pipe' })",
+    "spawnSync(candidate, ['--version'], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: 'pipe' })",
+    'subprocess output buffer',
   );
   text = replaceRequired(
     text,
     "spawnSync('git', ['check-ignore', '-q', '--no-index', '--', rel], { cwd: worktree, stdio: 'ignore' })",
-    "spawnSync('git', ['check-ignore', '-q', '--no-index', '--', rel], { cwd: worktree, stdio: 'ignore', env: { ...process.env, ...pinnedGitEnv(worktree) } })",
+    "spawnSync('git', ['check-ignore', '-q', '--no-index', '--', rel], { cwd: worktree, maxBuffer: 256 * 1024 * 1024, stdio: 'ignore', env: { ...process.env, ...pinnedGitEnv(worktree) } })",
     'pinned repository for ignore checks',
   );
   text = replaceRequired(

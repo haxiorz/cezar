@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { copyFile, stat, utimes } from 'node:fs/promises';
+import { promisify } from 'node:util';
 import {
   cpSync,
   existsSync,
@@ -75,6 +77,7 @@ import {
   promptExcerpt,
   boundedFindings,
   advisorCouncilTimeoutMs,
+  advisorCouncilResultMaxBytes,
 } from './prompt-budget.js';
 import { harnessStageResultSchema, samePathSet } from './stage-result.js';
 import { loadTrustedHarnessSkill } from './skill-binding.js';
@@ -376,37 +379,60 @@ export function resetIndexToHead(cwd: string): void {
   // Only a pinned harness worktree: never whatever repository happens to enclose `cwd`.
   const env = pinnedGitEnv(cwd);
   if (!env) return;
+  const git = (args: string[]) => execFileSync('git', args, {
+    cwd,
+    stdio: 'ignore',
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env },
+  });
   try {
-    execFileSync('git', ['read-tree', 'HEAD'], {
-      cwd,
-      stdio: 'ignore',
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env },
-    });
+    git(['read-tree', '-m', 'HEAD']);
   } catch {
-    // The stage op's own index checks still refuse anything left behind.
+    try { git(['read-tree', 'HEAD']); } catch {
+      // The stage op's own index checks still refuse anything left behind.
+    }
   }
 }
 
 // A private index preserves binary/untracked edits without touching the captured refs (PR #925 review).
-function harnessDiff(cwd: string, paths: readonly string[], indexPath: string): Buffer {
-  const env = { ...process.env, ...pinnedGitEnv(cwd), GIT_INDEX_FILE: indexPath, GIT_TERMINAL_PROMPT: '0' };
-  const git = (args: string[]) => execFileSync('git', args, { cwd, env, maxBuffer: 256 * 1024 * 1024 });
+export async function harnessDiff(cwd: string, paths: readonly string[], indexPath: string): Promise<Buffer> {
+  const pinned = pinnedGitEnv(cwd);
+  if (!pinned) throw new Error('packet worktree has no pinned Git directory');
+  const env = { ...process.env, ...pinned, GIT_INDEX_FILE: indexPath, GIT_TERMINAL_PROMPT: '0' };
+  const git = async (args: string[]) => (await promisify(execFile)('git', args, {
+    cwd, env, encoding: 'buffer', maxBuffer: 256 * 1024 * 1024,
+  })).stdout;
   try {
-    git(['read-tree', 'HEAD']);
-    const scopes = paths.filter((path) => {
-      try { lstatSync(join(cwd, path)); return true; } catch {
-        return git(['ls-files', '-z', '--', `:(literal)${path}`]).length > 0;
+    let seeded = false;
+    if (paths.length === 0) {
+      try {
+        // Preserve the stat cache, including its timestamp boundary (PR #925 review).
+        const realIndex = join(pinned.GIT_DIR!, 'index');
+        const { atime, mtime } = await stat(realIndex);
+        await copyFile(realIndex, indexPath);
+        await utimes(indexPath, atime, mtime);
+        seeded = true;
+      } catch {
+        // A missing or unreadable index can still be seeded from HEAD.
       }
-    }).map((path) => `:(literal)${path}`);
-    if (scopes.length || paths.length === 0) git(['add', '-A', ...(scopes.length ? ['--', ...scopes] : [])]);
-    return git(['diff', '--cached', '--no-ext-diff', '--binary', 'HEAD', '--', ...scopes]);
+    }
+    if (!seeded) await git(['read-tree', 'HEAD']);
+    const scopes: string[] = [];
+    for (const path of paths) {
+      let present = false;
+      try { lstatSync(join(cwd, path)); present = true; } catch {
+        present = (await git(['ls-files', '-z', '--', `:(literal)${path}`])).length > 0;
+      }
+      if (present) scopes.push(`:(literal)${path}`);
+    }
+    if (scopes.length || paths.length === 0) await git(['add', '-A', ...(scopes.length ? ['--', ...scopes] : [])]);
+    return await git(['diff', '--cached', '--no-ext-diff', '--binary', 'HEAD', '--', ...scopes]);
   } finally {
     rmSync(indexPath, { force: true });
     rmSync(`${indexPath}.lock`, { force: true });
   }
 }
 
-function preserveAndRestorePacket(cwd: string, paths: readonly string[], artifactPath: string): void {
+export async function preserveAndRestorePacket(cwd: string, paths: readonly string[], artifactPath: string): Promise<string | undefined> {
   const pinned = pinnedGitEnv(cwd);
   if (!pinned) {
     if (!paths.some((path) => existsSync(join(cwd, path)))) return;
@@ -422,16 +448,31 @@ function preserveAndRestorePacket(cwd: string, paths: readonly string[], artifac
   for (const path of affected) {
     for (let parent = dirname(resolve(cwd, path)); parent !== resolve(cwd); parent = dirname(parent)) {
       if (!parent.startsWith(resolve(cwd) + sep)) throw new Error(`packet path escapes the worktree: ${path}`);
-      if (existsSync(parent) && lstatSync(parent).isSymbolicLink()) throw new Error(`packet path has a symlink parent: ${path}`);
+      let symlink = false;
+      try { symlink = lstatSync(parent).isSymbolicLink(); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      if (symlink) throw new Error(`packet path has a symlink parent: ${path}`);
     }
   }
-  // Preserve before restoring; an existing artifact belongs to a crash interrupted recovery, and the
-  // exclusive create is the only check, so nothing can slip in between (CodeQL js/file-system-race).
-  const diff = harnessDiff(cwd, paths, `${artifactPath}.index`);
+  const diff = await harnessDiff(cwd, paths, `${artifactPath}.index`);
+  const temporaryPath = `${artifactPath}.tmp-${randomUUID()}`;
+  let preservedPath = artifactPath;
   try {
-    writeFileSync(artifactPath, diff, { flag: 'wx' });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    writeFileSync(temporaryPath, diff, { flag: 'wx' });
+    // Reserve without a check-then-write; never trust an older recovery artifact (PR #925 review).
+    for (let number = 1; ; number += 1) {
+      try {
+        writeFileSync(preservedPath, '', { flag: 'wx' });
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        preservedPath = `${artifactPath}.${number}`;
+      }
+    }
+    renameSync(temporaryPath, preservedPath);
+  } finally {
+    rmSync(temporaryPath, { force: true });
   }
   const head = new Set(headPaths);
   for (const path of affected.filter((path) => !head.has(path))) {
@@ -441,9 +482,10 @@ function preserveAndRestorePacket(cwd: string, paths: readonly string[], artifac
   if (headPaths.length) {
     git(['restore', '--source=HEAD', '--staged', '--worktree', '--', ...headPaths.map((path) => `:(literal)${path}`)]);
   }
-  if (harnessDiff(cwd, paths, `${artifactPath}.index`).length) {
+  if ((await harnessDiff(cwd, paths, `${artifactPath}.index`)).length) {
     throw new Error('packet allowed paths still contain uncommitted changes after restoration');
   }
+  return preservedPath;
 }
 
 function currentChangedPaths(cwd: string): string[] | null {
@@ -488,7 +530,7 @@ export function councilFamilyOf(ref: HarnessReviewerRef): string {
 
 const qualifyResultSchema = z.object({
   outcome: z.enum(['work_needed', 'no_action']),
-  evidence: z.string().max(HARNESS_RESULT_LIMITS.summary),
+  evidence: z.string().transform((value) => value.slice(0, HARNESS_RESULT_LIMITS.summary)),
 });
 
 const diagnoseResultSchema = z.object({
@@ -514,18 +556,20 @@ const specResultSchema = z.object({
 
 const preImplementResultSchema = z.object({
   status: z.enum(['ready', 'blocked']),
-  summary: z.string().max(HARNESS_RESULT_LIMITS.summary),
+  summary: z.string().transform((value) => value.slice(0, HARNESS_RESULT_LIMITS.summary)),
   reportPath: z.string().min(1).max(HARNESS_RESULT_LIMITS.path),
   findings: z
     .array(
       z.object({
         severity: z.enum(['blocker', 'major', 'minor', 'nit']),
-        title: z.string().min(1).max(HARNESS_RESULT_LIMITS.shortText),
-        evidence: z.string().max(HARNESS_RESULT_LIMITS.text).default(''),
+        title: z.string().min(1).transform((value) => value.slice(0, HARNESS_RESULT_LIMITS.shortText)),
+        evidence: z.string().transform((value) => value.slice(0, HARNESS_RESULT_LIMITS.text)).default(''),
       }),
     )
-    .max(HARNESS_RESULT_LIMITS.findings)
-    .default([]),
+    .default([])
+    .transform((findings) => [...findings]
+      .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity])
+      .slice(0, HARNESS_RESULT_LIMITS.findings)),
 });
 
 // Changed paths are allowlist hints: git derives the complete handoff, so a long list is clamped,
@@ -2806,11 +2850,22 @@ export async function runHarnessDriver(
         };
       }
     }
+    let subjectBytes: number;
+    try {
+      subjectBytes = op.artifact
+        ? Buffer.byteLength(readHarnessArtifactText(op.artifact, HARNESS_JSON_ARTIFACT_MAX_BYTES * 4))
+        : pinnedGitEnv(host.cwd)
+          ? (await harnessDiff(host.cwd, [], join(artifactDir, `council-subject-${randomUUID()}.index`))).length
+          : 0;
+    } catch (error) {
+      return { rows, error: `could not size the advisor council subject: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    const resultMaxBytes = advisorCouncilResultMaxBytes(op.members.length, subjectBytes);
     let recoverableCouncil: z.infer<typeof councilResultSchema> | null = null;
     let recoverableCouncilMtimeMs: number | null = null;
     try {
       // One read for bytes and mtime, so the recovered verdict and its age describe the same file.
-      const entry = readHarnessFsEntry(resultFile, HARNESS_JSON_ARTIFACT_MAX_BYTES);
+      const entry = readHarnessFsEntry(resultFile, resultMaxBytes);
       const parsed =
         entry.kind === 'file' && entry.content !== null
           ? councilResultSchema.safeParse(JSON.parse(entry.content.toString('utf8')) as unknown)
@@ -3002,11 +3057,6 @@ export async function runHarnessDriver(
       const fixedBytes = Buffer.byteLength(op.criteriaText) + 8_192 + rubricFiles.reduce(
         (bytes, path) => bytes + (existsSync(path) ? Buffer.byteLength(readHarnessArtifactText(path)) : 0), 0,
       );
-      const subjectBytes = op.artifact
-        ? Buffer.byteLength(readHarnessArtifactText(op.artifact, HARNESS_JSON_ARTIFACT_MAX_BYTES * 4))
-        : pinnedGitEnv(host.cwd)
-          ? harnessDiff(host.cwd, [], join(artifactDir, `council-subject-${randomUUID()}.index`)).length
-          : 0;
       const timeoutMs = advisorCouncilTimeoutMs(ids.map((id) => harnessObj.models?.[id] ?? {}), subjectBytes, fixedBytes);
       for (const member of pendingMembers) {
         const meta = invocationMeta.get(member.label)!;
@@ -3077,7 +3127,7 @@ export async function runHarnessDriver(
       let resultReadError: string | null = null;
       if (existsSync(resultFile)) {
         try {
-          raw = JSON.parse(readHarnessArtifactText(resultFile)) as unknown;
+          raw = JSON.parse(readHarnessArtifactText(resultFile, resultMaxBytes)) as unknown;
         } catch (readError) {
           resultReadError = readError instanceof Error ? readError.message : String(readError);
         }
@@ -3101,7 +3151,7 @@ export async function runHarnessDriver(
           error = `advisor council failed: ${(result.error ?? result.stderr.slice(-300)).trim() || `exit ${result.exitCode}, no diagnostics on stderr`}`;
         }
         for (const invocation of running.values()) {
-          finishInvocation(invocation, 'failed', { error });
+          finishInvocation(invocation, isUsageLimitMessage(error ?? '') ? 'interrupted' : 'failed', { error });
         }
       } else {
         for (const member of pendingMembers) {
@@ -3141,7 +3191,7 @@ export async function runHarnessDriver(
               modelId: member.label,
             });
           } else {
-            finishInvocation(invocation, 'failed', {
+            finishInvocation(invocation, isUsageLimitMessage(failureReason ?? '') ? 'interrupted' : 'failed', {
               error: failureReason,
             });
           }
@@ -3150,7 +3200,7 @@ export async function runHarnessDriver(
     } catch (err) {
       error = `advisor council failed: ${err instanceof Error ? err.message : String(err)}`;
       for (const invocation of running.values()) {
-        if (invocation.status === 'running') finishInvocation(invocation, 'failed', { error });
+        if (invocation.status === 'running') finishInvocation(invocation, isUsageLimitMessage(error ?? '') ? 'interrupted' : 'failed', { error });
       }
     }
     return { rows, error };
@@ -3292,8 +3342,9 @@ export async function runHarnessDriver(
         for (const dependency of packet.dependencies) {
           if (!ids.has(dependency)) return `packet ${packet.id} references unknown dependency ${dependency}`;
         }
+        packet.allowedPaths = packet.allowedPaths.map((path) => path.replace(/\/+$/, ''));
         for (const rawPath of packet.allowedPaths) {
-          if (rawPath.startsWith('/') || rawPath.includes('\\') || /[\x00-\x1f\x7f]/.test(rawPath) || rawPath.split('/').some((part) => ['..', '.', '.git', ''].includes(part))) {
+          if (rawPath.startsWith('/') || rawPath.includes('\\') || /[\x00-\x1f\x7f]/.test(rawPath) || rawPath.split('/').some((part) => ['..', '.', '.git', ''].includes(part.toLowerCase()))) {
             return `packet ${packet.id} contains unsafe allowed path ${rawPath}`;
           }
           const path = rawPath.replace(/\/+$/, '');
@@ -3448,11 +3499,13 @@ export async function runHarnessDriver(
       // every Continue dead-ended on it (PR #925 review).
       const inFlightStates = ['planned', 'claimed', 'implementing', 'reviewing', 'fixing', 'blocked'];
 
-      const restoreAttempt = (id: string): string | null => {
+      const restoreAttempt = async (id: string): Promise<string | null> => {
+        // Only the runtime's clean-path preflight authorizes destructive recovery (PR #925 review).
+        if (!Array.isArray(state?.events) || !state.events.some((event) => event?.state === 'implementing')) return null;
         const artifactPath = join(artifactDir, `packet-failed-diff-${id}.patch`);
         try {
-          preserveAndRestorePacket(host.cwd, source.allowedPaths, artifactPath);
-          host.emit({ type: 'note', message: `packet ${id} failed-attempt diff preserved at ${artifactPath}; its allowed paths restored to HEAD` });
+          const preservedPath = await preserveAndRestorePacket(host.cwd, source.allowedPaths, artifactPath);
+          host.emit({ type: 'note', message: `packet ${id} failed-attempt diff preserved at ${preservedPath ?? artifactPath}; its allowed paths restored to HEAD` });
           return null;
         } catch (error) {
           return `packet ${id} replacement refused: could not preserve and restore its allowed paths (${error instanceof Error ? error.message : String(error)}); diff artifact: ${artifactPath}`;
@@ -3487,7 +3540,7 @@ export async function runHarnessDriver(
           });
         }
         if (!readPacket(`${source.id}-resume-${attempt + 1}`)) {
-          const restoreError = restoreAttempt(effectiveId);
+          const restoreError = await restoreAttempt(effectiveId);
           if (restoreError) return restoreError;
         }
         attempt += 1;
@@ -3544,7 +3597,7 @@ export async function runHarnessDriver(
         finishInvocation(releaseInvocation, 'completed', {
           artifactPath: releaseArtifactPath,
         });
-        const restoreError = restoreAttempt(effectiveId);
+        const restoreError = await restoreAttempt(effectiveId);
         if (restoreError) return restoreError;
         attempt += 1;
         effectiveId = `${source.id}-resume-${attempt}`;
@@ -4916,31 +4969,27 @@ export async function runHarnessDriver(
     /** Prior rounds — and any open spec question — rendered for a reviewer. */
     const priorRoundsAppendix = (): string => {
       if (roundHistory.length === 0 && unresolvedSpecFindings.length === 0) return '';
-      const lines: string[] = [];
-      if (unresolvedSpecFindings.length > 0) {
-        lines.push(
-          ``,
-          `The specification review closed WITHOUT resolving these, and the build proceeded anyway:`,
-          ...unresolvedSpecFindings.map((f) => `  - ${f}`),
-          `Treat them as known-open design questions. If the diff has to pick a side, the pick is`,
-          `not itself a defect — say which side it took and whether it is defensible.`,
-        );
-      }
-      if (roundHistory.length === 0) return lines.join('\n');
-      lines.push('', `Earlier rounds of this same review (newest last):`);
-      for (const entry of roundHistory) {
-        lines.push(``, `Round ${entry.round} required:`);
-        for (const d of entry.demanded) lines.push(`  - ${d}`);
-        lines.push(`Round ${entry.round} response: ${entry.response || '(not recorded)'}`);
-      }
-      lines.push(
-        ``,
-        `Judge the diff in front of you on its own merits — this history is context, not a verdict.`,
-        `But if your finding would reverse a change an earlier round required, say so explicitly in`,
-        `that finding's evidence and justify why the earlier round was wrong. Silently flipping the`,
-        `requirement back is what makes these loops unwinnable.`,
-      );
-      return lines.join('\n');
+      const path = join(artifactDir, 'findings-prior-rounds.json');
+      writeJsonAtomic(path, { unresolvedSpecFindings, roundHistory });
+      const findings = [
+        ...unresolvedSpecFindings.map((title) => ({ severity: 'major' as const, title: `Known-open design question: ${title}` })),
+        ...roundHistory.flatMap((entry) => entry.demanded.map((demand) => {
+          const severity = /^\[(blocker|major|minor|nit)\]/.exec(demand)?.[1] as keyof typeof SEVERITY_RANK | undefined;
+          return {
+            severity: severity ?? 'major' as const,
+            title: `Round ${entry.round} required: ${demand}`,
+            evidence: `Round ${entry.round} response: ${entry.response || '(not recorded)'}`,
+          };
+        })),
+      ];
+      return [
+        '',
+        'Context: known-open design questions and earlier rounds of this same review:',
+        boundedFindings(findings, path),
+        'A defensible choice on a known-open design question is not itself a defect.',
+        'Judge the current diff on its own merits; history is context, not a verdict.',
+        "If reversing an earlier requirement, explicitly justify why it was wrong in the finding's evidence.",
+      ].join('\n');
     };
 
     /** One extra fix/validate iteration is admitted after the final paid
