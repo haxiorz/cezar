@@ -143,7 +143,9 @@ describe('discoverSkills local entrypoints', () => {
     expect(skills.some((skill) => skill.name === 'agentic-setup')).toBe(false);
   });
 
-  it('gates only the bundled harness entrypoints while retaining generic playbooks and recovery dependencies', async () => {
+  // PR #925 review: generic bundled playbooks reached every user's catalog and planner prompt with
+  // multi-model off, on a protected surface (BACKWARD_COMPATIBILITY.md §2, §5).
+  it('hides every bundled skill while multi-model is off, and keeps them for recovery', async () => {
     const repoRoot = await mkdtemp(join(tmpdir(), 'cezar-skills-'));
     const bundled = await mkdtemp(join(tmpdir(), 'cez-bundled-'));
     const recovered = await mkdtemp(join(tmpdir(), 'cez-recovered-skills-'));
@@ -158,7 +160,7 @@ describe('discoverSkills local entrypoints', () => {
     }
     const publicNames = (await discoverSkills(repoRoot, { bundledDir: bundled }))
       .filter((skill) => skill.source === 'bundled').map((skill) => skill.name);
-    expect(publicNames).toEqual(['cez-code-review']);
+    expect(publicNames).toEqual([]);
 
     const internal = await discoverSkills(repoRoot, { bundledDir: bundled, includeHarness: true });
     const setup = internal.find((skill) => skill.name === 'cez-setup-harness')!;
@@ -177,6 +179,16 @@ describe('discoverSkills local entrypoints', () => {
     await mkdir(join(repoRoot, '.ai/skills/cez-setup-harness'), { recursive: true });
     await writeFile(join(repoRoot, '.ai/skills/cez-setup-harness/SKILL.md'), '---\nname: cez-setup-harness\n---\nExplicit local playbook');
     expect((await discoverSkills(repoRoot, { bundledDir: bundled })).find((skill) => skill.name === 'cez-setup-harness')?.source).toBe('ai');
+  });
+
+  it('keeps the shipped cez-* collection out of a fresh repo\'s catalog', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'cezar-skills-'));
+    tempDirs.push(repoRoot);
+    expect((await discoverSkills(repoRoot)).filter((skill) => skill.source === 'bundled')).toEqual([]);
+    const recovery = await discoverSkills(repoRoot, { includeHarness: true });
+    expect(recovery.filter((skill) => skill.source === 'bundled').map((skill) => skill.name)).toEqual(
+      expect.arrayContaining(['cez-code-review', 'cez-fix', 'cez-harness', 'cez-spec-writing']),
+    );
   });
 
   it('discovers bundled skills last and loses name collisions to every other source', async () => {

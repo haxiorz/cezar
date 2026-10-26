@@ -42,9 +42,9 @@ export interface Skill {
   };
 }
 
-/** The bundled multi-model harness skills: hidden unless multi-model is on, and the only skills
- *  a run copies into the user's own checkout — the harness setup runs in place by design and
- *  needs the runtime beside it (spec 2026-07-24-vendored-cez-skills, PR #925 review). */
+/** The bundled harness runtime skills: the only skills a run copies into the user's own
+ *  checkout — the harness setup runs in place by design and needs the runtime beside it (spec
+ *  2026-07-24-vendored-cez-skills, PR #925 review). */
 export function isBundledHarnessSkill(skill: Pick<Skill, 'name' | 'source'>): boolean {
   return skill.source === 'bundled' && (skill.name === 'cez-harness' || skill.name === 'cez-setup-harness');
 }
@@ -115,13 +115,14 @@ export async function discoverSkills(
   opts: { bundledDir?: string | null; includeHarness?: boolean } = {},
 ): Promise<Skill[]> {
   const layers = await discoverSkillLayers(repoRoot, opts);
-  // Internal recovery keeps its runtime available after the feature is hidden.
-  const includeHarness = opts.includeHarness === true || multiModelEnabled(repoRoot);
+  // Every bundled cez-* skill belongs to the opt-in multi-model feature: with it off, the catalog,
+  // picker and planner see no bundled skill (PR #925 review). Internal recovery keeps them.
+  const includeBundled = opts.includeHarness === true || multiModelEnabled(repoRoot);
   const merged: Skill[] = [];
   const seen = new Set<string>();
   for (const skills of layers) {
     for (const skill of skills) {
-      if (!includeHarness && isBundledHarnessSkill(skill)) continue;
+      if (!includeBundled && skill.source === 'bundled') continue;
       if (seen.has(skill.name)) continue;
       seen.add(skill.name);
       merged.push(skill);

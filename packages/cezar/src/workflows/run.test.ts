@@ -3953,7 +3953,9 @@ describe("registry /skill expansion on a fresh run's opening prompt (#278)", () 
 
   it("copies no step-skill directory into the user's own checkout on an in-place run (PR #925 review)", async () => {
     // A bundled directory skill: in a worktree its references/ must land beside the run; in place
-    // the copy would shadow the real skill and edit the user's info/exclude.
+    // the copy would shadow the real skill and edit the user's info/exclude. Bundled skills are
+    // discoverable only while multi-model is on.
+    writeFileSync(join(repoRoot, '.ai/cezar/config.json'), JSON.stringify({ multiModel: true }));
     const STEP_SKILL: WorkflowDef = {
       name: 'skill-step',
       source: 'built-in',
