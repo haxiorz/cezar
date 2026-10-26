@@ -1862,6 +1862,73 @@ describe('harness driver — standard fix-issue graph', () => {
     ).toMatchObject({ status: 'completed', artifactSha256: expect.any(String) });
   });
 
+  // PR #925 review: two Stops dead-ended a packet at "interrupted twice; manual recovery".
+  it('spends no packet replacement on a Stop or a host restart', async () => {
+    let cancelled = false;
+    let packetRuns = 0;
+    const entry = (interrupt: boolean) => {
+      const h = makeHarness(dir);
+      h.host.isCancelled = () => cancelled;
+      h.setPacketRunBehavior(() => {
+        packetRuns += 1;
+        if (!interrupt) return 'awaiting_validation';
+        cancelled = true;
+        return 'implementing';
+      });
+      h.deps.loadAgentic = async () => highAssuranceAgentic();
+      return h;
+    };
+    for (let stop = 0; stop < 2; stop += 1) {
+      cancelled = false;
+      const h = entry(true);
+      expect(await runHarnessDriver(h.host, { ...input, profile: 'high-assurance' }, h.deps)).toBeNull();
+    }
+    // The third attempt dies with the host: its worker never finished and nothing recorded it.
+    cancelled = false;
+    const crashed = entry(true);
+    const recorded = loadLedger(crashed.host.dataDir, crashed.host.runId)!.packets;
+    expect(
+      await runHarnessDriver(crashed.host, { ...input, profile: 'high-assurance' }, crashed.deps),
+    ).toBeNull();
+    const ledger = loadLedger(crashed.host.dataDir, crashed.host.runId)!;
+    const worker = ledger.invocations.find((invocation) => invocation.id === 'packet-run:PK-01:3')!;
+    worker.status = 'running';
+    worker.error = undefined;
+    worker.endedAt = undefined;
+    ledger.packets = recorded;
+    saveLedger(crashed.host.dataDir, crashed.host.runId, ledger);
+
+    cancelled = false;
+    const resumed = entry(false);
+    expect(
+      await runHarnessDriver(resumed.host, { ...input, profile: 'high-assurance' }, resumed.deps),
+    ).toBeNull();
+    expect(packetRuns).toBe(4);
+    const final = loadLedger(resumed.host.dataDir, resumed.host.runId)!;
+    expect(final.packets).toEqual([
+      expect.objectContaining({ effectiveId: 'PK-01-resume-4', attempt: 4, state: 'gated' }),
+    ]);
+    expect(
+      final.invocations
+        .filter((invocation) => invocation.id.startsWith('packet-run:PK-01:'))
+        .map((invocation) => invocation.status),
+    ).toEqual(['interrupted', 'interrupted', 'interrupted', 'completed']);
+  });
+
+  it('stops a packet for manual recovery after its runtime fails twice', async () => {
+    const h = makeHarness(dir);
+    h.setPacketRunBehavior(() => 'implementing');
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      expect(
+        await runHarnessDriver(h.host, { ...input, profile: 'high-assurance' }, h.deps),
+      ).toMatch(/packet PK-01 failed/i);
+    }
+    expect(
+      await runHarnessDriver(h.host, { ...input, profile: 'high-assurance' }, h.deps),
+    ).toMatch(/PK-01 failed twice in state implementing; manual recovery is required/);
+  });
+
   // PR #925 review: an HA message left unassigned after implement blocked stage on every resume.
   it('rejects a message stranded after high-assurance implementation instead of blocking stage forever', async () => {
     const first = makeHarness(dir);

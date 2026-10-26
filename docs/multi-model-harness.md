@@ -285,8 +285,9 @@ phase emits up to 12 packet manifests (`objective`, `risk`, `allowedPaths`,
 `invariants`, `acceptanceCriteria`, `dependencies`), and the driver validates the
 plan mechanically — no overlapping path leases, no dependency cycles. Each packet
 runs its own implement → driver-run gate → `packet-gate` promotion cycle, and only
-gated packets' paths feed the final stage allowlist. A packet interrupted twice
-stops for manual recovery rather than looping forever.
+gated packets' paths feed the final stage allowlist. A packet whose runtime fails
+twice stops for manual recovery rather than looping forever; a Stop or a cezar
+restart mid-packet releases the lease and resumes without spending that budget.
 
 ## The numbers
 

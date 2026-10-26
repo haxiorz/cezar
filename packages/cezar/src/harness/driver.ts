@@ -3196,11 +3196,6 @@ export async function runHarnessDriver(
         packetStateHasManifest(packetState, expected) &&
         typeof (packetState.currentDiff as { sha256?: unknown } | undefined)?.sha256 ===
           'string';
-      const releaseInvocationId = `packet-release:${source.id}:${attempt}`;
-      const releaseArtifactPath = join(
-        artifactDir,
-        `packet-release-result-${effectiveId}.json`,
-      );
       const releaseReason =
         'cezar recovered an interrupted packet process and is starting one bounded replacement attempt';
       const releaseInputSha256 = (priorState: string): string =>
@@ -3213,21 +3208,30 @@ export async function runHarnessDriver(
             reason: releaseReason,
           }),
         );
-      const interruptedRelease = ledger.invocations.find(
-        (invocation) => invocation.id === releaseInvocationId,
-      );
+      const inFlightStates = ['planned', 'claimed', 'implementing', 'reviewing', 'fixing'];
 
-      if (
-        stateName === 'aborted' &&
-        attempt < 2 &&
-        interruptedRelease &&
-        ['interrupted', 'completed'].includes(interruptedRelease.status) &&
-        ['planned', 'claimed', 'implementing', 'reviewing', 'fixing'].some(
-          (priorState) => interruptedRelease.inputSha256 === releaseInputSha256(priorState),
-        ) &&
-        packetStateHasManifest(state, manifestFor(effectiveId))
-      ) {
+      // A crash after a release leaves the recorded packet behind it, so follow every release
+      // this run already made, not only the first (PR #925 review).
+      for (;;) {
+        const interruptedRelease = ledger.invocations.find(
+          (invocation) => invocation.id === `packet-release:${source.id}:${attempt}`,
+        );
+        if (
+          stateName !== 'aborted' ||
+          !interruptedRelease ||
+          !['interrupted', 'completed'].includes(interruptedRelease.status) ||
+          !inFlightStates.some(
+            (priorState) => interruptedRelease.inputSha256 === releaseInputSha256(priorState),
+          ) ||
+          !packetStateHasManifest(state, manifestFor(effectiveId))
+        ) {
+          break;
+        }
         if (interruptedRelease.status === 'interrupted') {
+          const releaseArtifactPath = join(
+            artifactDir,
+            `packet-release-result-${effectiveId}.json`,
+          );
           writeFileSync(releaseArtifactPath, readFileSync(packetResultPath(effectiveId)));
           finishInvocation(interruptedRelease, 'completed', {
             artifactPath: releaseArtifactPath,
@@ -3239,13 +3243,17 @@ export async function runHarnessDriver(
         stateName = typeof state?.state === 'string' ? state.state : null;
       }
 
-      if (
-        stateName &&
-        ['planned', 'claimed', 'implementing', 'reviewing', 'fixing'].includes(stateName)
-      ) {
-        if (attempt >= 2) {
-          return `packet ${source.id} was interrupted twice in state ${stateName}; manual recovery is required`;
+      if (stateName && inFlightStates.includes(stateName)) {
+        // A Stop or a host restart interrupts a packet run without spending the one replacement;
+        // only a run that failed on its own does (PR #925 review).
+        const failedRuns = ledger.invocations.filter(
+          (invocation) =>
+            invocation.id.startsWith(`packet-run:${source.id}:`) && invocation.status === 'failed',
+        ).length;
+        if (failedRuns >= 2) {
+          return `packet ${source.id} failed twice in state ${stateName}; manual recovery is required`;
         }
+        const releaseInvocationId = `packet-release:${source.id}:${attempt}`;
         const releaseArgs = [
           '--run-dir',
           packetRunDir,
@@ -3444,6 +3452,17 @@ export async function runHarnessDriver(
             },
           );
           packetState = readPacket(effectiveId);
+          if (host.isCancelled()) {
+            finishInvocation(invocation, 'interrupted', { error: 'run cancelled during packet work' });
+            recordPacket(source.id, {
+              originalId: source.id,
+              effectiveId,
+              attempt,
+              state: packetState?.state ?? 'planned',
+              manifest,
+            });
+            return { ok: true };
+          }
           if (!result.ok || !packetState) {
             const reason =
               (result.error ?? result.stderr ?? '').trim() ||
