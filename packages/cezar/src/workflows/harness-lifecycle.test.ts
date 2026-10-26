@@ -145,6 +145,19 @@ describe('harness lifecycle boundaries', () => {
     expect(execFileSync('git', ['diff', '--cached', '--name-only'], { cwd: result.worktreePath, encoding: 'utf8' }).trim()).toBe('feature.txt');
   }, 15_000);
 
+  // PR #925 review: the auth latch read a driver note quoting an advisor's 401 as the run's own.
+  it('marks the notes its driver writes as the driver\'s', async () => {
+    config({ multiModel: true, skillsRepos: [] });
+    vi.mocked(runHarnessDriver).mockImplementation(async (host) => {
+      host.emit({ type: 'note', message: 'advisor council produced no result (401 Unauthorized)' });
+      return null;
+    });
+    const run = manager.startRun(workflow, { task: 'Fix issue #642' });
+    await vi.waitFor(() => expect(['review', 'failed', 'done']).toContain(store.getRun(run.id)?.status), { timeout: 10_000 });
+    const quoted = store.readEvents(run.id).find((event) => event.type === 'note' && String(event.message).includes('advisor council'));
+    expect(quoted?.origin).toBe('driver');
+  }, 15_000);
+
   it('never gives a recorded harness run permission to land in the checkout', async () => {
     config({ multiModel: true, taskWorkspace: 'in-place', landing: 'auto' });
     const run = store.createRun({ title: 't', workflow: workflow.name, task: 'Fix issue #642', steps: [] });

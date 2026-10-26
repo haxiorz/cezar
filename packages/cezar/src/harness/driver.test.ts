@@ -499,6 +499,28 @@ describe('harness driver — standard fix-issue graph', () => {
     ).toBe('cez-verify-in-repo');
   });
 
+  // PR #925 review: worker adapters and advisors spawned their CLIs on the default login, billing
+  // the personal subscription of a project bound to a work account.
+  it('runs the vendored runtime on the project\'s selected accounts', async () => {
+    const home = join(dir, 'home');
+    const codexWork = join(dir, 'codex-work');
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(home, 'agent-accounts.json'), JSON.stringify({
+      version: 1,
+      accounts: [{ id: 'work', provider: 'codex', configDir: codexWork }],
+      selections: { [dir]: { codex: 'work' } },
+    }));
+    vi.stubEnv('CEZ_HOME', home);
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(dir, 'claude-moved'));
+    try {
+      const h = makeHarness(dir);
+      expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+      expect(h.runtimeEnv()).toMatchObject({ CODEX_HOME: codexWork, CLAUDE_CONFIG_DIR: join(dir, 'claude-moved') });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('composes a repo-local om-code-review extension over the complete shared skill', async () => {
     const h = makeHarness(dir);
     const bundledRoot = join(dir, 'fake-bundled');

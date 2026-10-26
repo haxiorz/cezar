@@ -209,6 +209,22 @@ describe('watchProviderRuntimeAuthFailures', () => {
     },
   );
 
+  // PR #925 review: a driver note quoting an advisor's 401 latched the run's Claude login.
+  it('never latches a provider from a harness driver note, only from its sessions', () => {
+    const onInvalidated = watch();
+    const run = store.createRun({ title: 'harness', workflow: 'harness-fix-issue', task: 'work', runner: 'claude', steps: [] });
+
+    store.appendEvent(run.id, {
+      type: 'note',
+      origin: 'driver',
+      message: 'advisor council produced no result (401 Unauthorized: invalid API key)',
+    });
+    expect(onInvalidated).not.toHaveBeenCalled();
+
+    store.appendEvent(run.id, { type: 'note', message: 'claude: OAuth access token is invalid' });
+    expect(onInvalidated).toHaveBeenCalledWith(expect.objectContaining({ provider: 'claude', status: 'disconnected' }));
+  });
+
   it('ignores unrelated errors and non-message events', () => {
     const onInvalidated = watch();
     const run = store.createRun({

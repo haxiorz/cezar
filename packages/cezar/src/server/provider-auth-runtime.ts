@@ -29,6 +29,8 @@ export function watchProviderRuntimeAuthFailures(
 ): () => void {
   const onEvent = ({ runId, event }: { runId: string; event: RunEvent }): void => {
     if (!AUTH_ERROR_EVENT_TYPES.has(event.type)) return;
+    // A harness driver note quotes another provider's or an advisor's failure (PR #925 review).
+    if (event.origin === 'driver') return;
     const message = event.message;
     if (typeof message !== 'string' || !isRuntimeProviderAuthFailure(message)) return;
 

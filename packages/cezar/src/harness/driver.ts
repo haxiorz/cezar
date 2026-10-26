@@ -50,7 +50,7 @@ import {
   type Skill,
 } from '../skills.js';
 import { HARNESS_FIX_ISSUE, HARNESS_IMPLEMENT_FEATURE } from './workflows.js';
-import { createModelProber, sharedHarnessProbeCache, type ModelProber } from './probe.js';
+import type { ModelProber } from './probe.js';
 import { opencodeSeatingError, synthesizeReviewerBinding } from './reviewer-binding.js';
 import {
   MAX_PARALLEL_REVIEWERS,
@@ -61,7 +61,7 @@ import {
   type CouncilOutcome,
 } from './council-quorum.js';
 import { providerFamilyOf } from './model-family.js';
-import { createLiveTransport } from './probe-transports.js';
+import { accountEnvironment, createProjectProber, probeAccounts } from './probe-transports.js';
 import { resolveHarnessPlan } from './profile-plan.js';
 import {
   HARNESS_DECISION_FINDING_MAX,
@@ -240,7 +240,7 @@ export interface HarnessDriverDeps {
     opts?: Parameters<typeof runValidationCommands>[2],
   ) => Promise<HarnessValidationCheck[]>;
   exportConfig?: typeof exportTrustedConfig;
-  createProber?: (opts: { advisors: Record<string, unknown>; cwd: string }) => ModelProber;
+  createProber?: (opts: { advisors: Record<string, unknown>; cwd: string }) => ModelProber | Promise<ModelProber>;
   snapshotReviewSubject?: (cwd: string) => Promise<string>;
   snapshotStageSubject?: (cwd: string) => Promise<string>;
   /** Return the complete Git-derived changed-path set. The declared paths are
@@ -688,14 +688,8 @@ export async function runHarnessDriver(
   const releaseClaim = deps.releaseClaim ?? releaseIssueClaim;
   const createProber =
     deps.createProber ??
-    ((opts) =>
-      createModelProber({
-        transport: createLiveTransport({
-          advisors: opts.advisors as Parameters<typeof createLiveTransport>[0]['advisors'],
-          cwd: opts.cwd,
-        }),
-        cache: sharedHarnessProbeCache,
-      }));
+    ((opts: { advisors: Record<string, unknown>; cwd: string }) =>
+      createProjectProber({ repoRoot: host.repoRoot, cwd: opts.cwd, advisors: opts.advisors }));
 
   const artifactDir = harnessArtifactDir(host.dataDir, host.runId);
   mkdirSync(artifactDir, { recursive: true });
@@ -2213,7 +2207,7 @@ export async function runHarnessDriver(
       };
     }
     if (roles) {
-      const prober = createProber({
+      const prober = await createProber({
         advisors: (agentic.agentHarness?.models ?? {}) as Record<string, unknown>,
         cwd: host.cwd,
       });
@@ -2286,10 +2280,10 @@ export async function runHarnessDriver(
       }
     } else {
       const hostRef: HarnessRoleRef = { runner: 'claude', model: '' };
-      const verdict = await createProber({
+      const verdict = await (await createProber({
         advisors: {},
         cwd: host.cwd,
-      }).probe(hostRef);
+      })).probe(hostRef);
       ledger.models = [
         {
           id: 'claude',
@@ -2390,6 +2384,7 @@ export async function runHarnessDriver(
       ...harnessChildEnvironment(
         harnessConfigEnvironmentNames(runtimeAgentic.agentHarness),
       ),
+      ...accountEnvironment(await probeAccounts(host.repoRoot)),
       CEZ_HARNESS_REVIEW_SKILL: phaseSkills.codeReview,
       // The runtime pins its own git calls with these — never a process-wide GIT_DIR (git-pin.ts).
       ...(trustedGitDir ? { CEZ_HARNESS_GIT_DIR: trustedGitDir, CEZ_HARNESS_GIT_WORK_TREE: host.cwd } : {}),

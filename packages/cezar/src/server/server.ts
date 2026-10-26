@@ -207,13 +207,8 @@ import {
   saveLedger,
 } from '../harness/ledger.ts';
 import { loadAgenticConfig, resolveHarnessRuntimeInfo } from '../harness/runtime.ts';
-import {
-  createModelProber,
-  probeKey,
-  sharedHarnessProbeCache,
-  type ModelProber,
-} from '../harness/probe.ts';
-import { createLiveTransport } from '../harness/probe-transports.ts';
+import { probeKey, type ModelProber } from '../harness/probe.ts';
+import { createProjectProber } from '../harness/probe-transports.ts';
 import { certificationFor } from '../harness/certification.ts';
 import { resolveHarnessPlan } from '../harness/profile-plan.ts';
 import { harnessArtifactDir } from '../harness/driver.ts';
@@ -4979,15 +4974,7 @@ export function createApp(deps: ServerDeps) {
       if (providersBlocked) return c.json({ profile, ready: false, reason: providersBlocked, models: [] });
       const prober =
         deps.harnessProber ??
-        createModelProber({
-          transport: createLiveTransport({
-            advisors: (agentic.agentHarness?.models ?? {}) as Parameters<
-              typeof createLiveTransport
-            >[0]['advisors'],
-            cwd: repoRoot,
-          }),
-          cache: sharedHarnessProbeCache,
-        });
+        (await createProjectProber({ repoRoot, advisors: agentic.agentHarness?.models ?? {} }));
       const verdicts = await prober.probeAll(refs);
       const seen = new Set<string>();
       const models = refs.flatMap((ref) => {
@@ -5532,15 +5519,7 @@ export function createApp(deps: ServerDeps) {
         if (providersBlocked) return c.json({ error: providersBlocked }, 409);
         const prober =
           deps.harnessProber ??
-          createModelProber({
-            transport: createLiveTransport({
-              advisors: (agentic.agentHarness?.models ?? {}) as Parameters<
-                typeof createLiveTransport
-              >[0]['advisors'],
-              cwd: repoRoot,
-            }),
-            cache: sharedHarnessProbeCache,
-          });
+          (await createProjectProber({ repoRoot, advisors: agentic.agentHarness?.models ?? {} }));
         const verdicts = await prober.probeAll(refs);
         const unavailable = refs
           .filter(

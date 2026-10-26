@@ -28,7 +28,7 @@ import {
 } from '../core/private-mcp.ts';
 import { onUsage, registerRunProcess, unregisterRunProcess, type ProcessUsage } from '../core/process-usage.ts';
 import { describeReaped, reapTaskProcesses, taskProcessReapEnabled } from '../core/task-processes.ts';
-import { parseUsageLimit } from '../core/usage-limit.ts';
+import { isUsageLimitMessage, parseUsageLimit } from '../core/usage-limit.ts';
 import { createRunner } from '../core/runner-factory.ts';
 import type { RunnerId } from '../core/agent-runner.ts';
 import { modelConflictsWithRunner, modelNativeToRunner } from '../core/model-presets.ts';
@@ -809,7 +809,7 @@ const NO_HOLDS: AccountHolds = { deadline: new Set(), inFlight: new Set() };
  *    it blocks fresh work but not other resumes. Blocking those deadlocked a live workspace.
  */
 function accountHeldFor(
-  run: Pick<RunRecord, 'runner' | 'agentProfile' | 'status' | 'autoResumeAttempts'>,
+  run: Pick<RunRecord, 'runner' | 'agentProfile' | 'harness' | 'steps' | 'status' | 'autoResumeAttempts'>,
   holds: AccountHolds,
   fallbackRunner: RunnerId,
 ): boolean {
@@ -829,9 +829,15 @@ function accountHeldFor(
  * persists it), and only started runs can be holding.
  */
 export function runAccountKey(
-  run: Pick<RunRecord, 'runner' | 'agentProfile'>,
+  run: Pick<RunRecord, 'runner' | 'agentProfile' | 'harness' | 'steps'>,
   fallbackRunner: RunnerId,
 ): string {
+  // A harness phase runs on its own role's account, and its failed step records which: the limit
+  // is that account's, not the composer's (PR #925 review).
+  const limited = run.harness
+    ? [...run.steps].reverse().find((step) => step.status === 'failed' && step.backend && isUsageLimitMessage(step.error ?? ''))
+    : undefined;
+  if (limited?.backend) return `${limited.backend}:${limited.profileId ?? 'default'}`;
   return `${run.runner ?? fallbackRunner}:${run.agentProfile ?? 'default'}`;
 }
 
@@ -5954,7 +5960,8 @@ export class RunManager {
       dataDir: this.dataDir,
       repoRoot: this.repoRoot,
       isCancelled: () => state.cancelled,
-      emit,
+      // Stamped so the auth latch never reads a quoted reviewer or advisor failure as a session's.
+      emit: (event) => emit(event.type === 'note' ? { ...event, origin: 'driver' } : event),
       runAgent: (req) => {
         const step: WorkflowStepDef = {
           id: req.phaseId,

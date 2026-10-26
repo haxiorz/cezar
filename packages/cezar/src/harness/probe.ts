@@ -22,6 +22,9 @@ export interface ProberOptions {
   failureTtlMs?: number;
   now?: () => number;
   cache?: Map<string, ProbeCacheEntry>;
+  /** What else a verdict depends on (the project, the account): a shared cache otherwise answered
+   *  one project's or account's probe from another's (PR #925 review). */
+  scope?: (ref: ProbeRef) => string;
 }
 
 export interface ProbeCacheEntry {
@@ -66,7 +69,7 @@ export function createModelProber(opts: ProberOptions): ModelProber {
   const inFlight = new Map<string, Promise<ProbeVerdict>>();
 
   const probe = async (ref: ProbeRef): Promise<ProbeVerdict> => {
-    const key = probeKey(ref);
+    const key = `${opts.scope?.(ref) ?? ''}${probeKey(ref)}`;
     const hit = cache.get(key);
     if (hit && hit.expiresAt > now()) return hit.verdict;
 

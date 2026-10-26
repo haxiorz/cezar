@@ -4,10 +4,12 @@ import { createServer } from 'node:net';
 import { accessSync, constants, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
+import { PROFILE_ENV_VAR } from '../core/agent-profiles.js';
 import { ClaudeCliRunner } from '../core/claude-cli-runner.js';
+import { resolveProfileEnvForRoot } from '../workspace/agent-profiles.js';
 import { trackAgentProcessTree } from '../core/process-tree.js';
 import { advisorCredentialBindingIssue } from './advisor-identity.js';
-import type { ProbeRef, ProbeTransport, ProbeVerdict } from './probe.js';
+import { createModelProber, sharedHarnessProbeCache, type ModelProber, type ProbeRef, type ProbeTransport, type ProbeVerdict } from './probe.js';
 import { harnessChildEnvironment, terminateProcessTree } from './runtime.js';
 
 const PROBE_PROMPT = 'Reply with exactly: OK';
@@ -30,7 +32,7 @@ function freePort(): Promise<number> {
  * enough: an expired Claude subscription must never render green. */
 export async function probeClaude(
   ref: ProbeRef,
-  opts: { bin?: string; cwd?: string; timeoutMs?: number } = {},
+  opts: { bin?: string; cwd?: string; timeoutMs?: number; env?: Record<string, string> } = {},
 ): Promise<ProbeVerdict> {
   const timeoutMs = opts.timeoutMs ?? PROBE_TIMEOUT_MS;
   try {
@@ -38,6 +40,7 @@ export async function probeClaude(
       ...(opts.bin ? { bin: opts.bin } : {}),
       timeoutMs,
     }).run({
+      ...(opts.env ? { env: opts.env } : {}),
       systemPrompt: 'You are a readiness probe. Use no tools and follow the response format exactly.',
       userPrompt: PROBE_PROMPT,
       cwd: opts.cwd ?? process.cwd(),
@@ -60,13 +63,13 @@ export async function probeClaude(
  *  `message` (the schema-skew failure mode) is only visible if we post one. */
 export async function probeOpencode(
   ref: ProbeRef,
-  opts: { bin?: string; cwd?: string; timeoutMs?: number } = {},
+  opts: { bin?: string; cwd?: string; timeoutMs?: number; env?: Record<string, string> } = {},
 ): Promise<ProbeVerdict> {
   const bin = opts.bin ?? process.env.CEZ_OPENCODE_BIN ?? 'opencode';
   const port = await freePort();
   const child = spawn(bin, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
     cwd: opts.cwd ?? process.cwd(),
-    env: harnessChildEnvironment(),
+    env: { ...harnessChildEnvironment(), ...opts.env },
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: process.platform !== 'win32',
     windowsHide: true,
@@ -159,7 +162,7 @@ export async function probeOpencode(
  *  probe proves the CLI answers, it is not a reasoning benchmark. */
 export async function probeCodex(
   ref: ProbeRef,
-  opts: { bin?: string; cwd?: string; timeoutMs?: number } = {},
+  opts: { bin?: string; cwd?: string; timeoutMs?: number; env?: Record<string, string> } = {},
 ): Promise<ProbeVerdict> {
   const bin = opts.bin ?? process.env.CEZ_CODEX_BIN ?? 'codex';
   const args = [
@@ -177,7 +180,7 @@ export async function probeCodex(
   return new Promise<ProbeVerdict>((resolve) => {
     const child = spawn(bin, args, {
       cwd: opts.cwd ?? process.cwd(),
-      env: harnessChildEnvironment(),
+      env: { ...harnessChildEnvironment(), ...opts.env },
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
       windowsHide: true,
@@ -441,20 +444,27 @@ function probeCommandAdvisor(
     : { status: 'failed', detail: `${bin} is not on PATH` };
 }
 
+type LiveAdvisors = Record<string, { adapter?: string; model: string; preset?: string; endpoint?: string; credentialEnv?: string; authStoreProvider?: string; binaryEnv?: string; commands?: { probe?: string[]; review?: string[] } }>;
+type ProbeRunner = 'claude' | 'codex' | 'opencode';
+/** Each runner's selected account for a project: the id and the env that points its CLI at it. */
+export type ProbeAccounts = Partial<Record<ProbeRunner, { id: string; env: Record<string, string> }>>;
+
 export function createLiveTransport(deps: {
-  advisors?: Record<string, { adapter?: string; model: string; preset?: string; endpoint?: string; credentialEnv?: string; authStoreProvider?: string; binaryEnv?: string; commands?: { probe?: string[]; review?: string[] } }>;
+  advisors?: LiveAdvisors;
   cwd?: string;
   timeoutMs?: number;
+  accounts?: ProbeAccounts;
 }): ProbeTransport {
   return async (ref) => {
     if (process.env.CEZ_DRY_RUN === '1') {
       return { status: 'unverified', detail: 'Multi-model readiness probes are unavailable with CEZ_DRY_RUN=1.' };
     }
+    const env = (runner: ProbeRunner) => deps.accounts?.[runner]?.env;
     if (ref.runner === 'claude') {
-      return probeClaude(ref, { cwd: deps.cwd, timeoutMs: deps.timeoutMs });
+      return probeClaude(ref, { cwd: deps.cwd, timeoutMs: deps.timeoutMs, env: env('claude') });
     }
-    if (ref.runner === 'opencode') return probeOpencode(ref, { cwd: deps.cwd, timeoutMs: deps.timeoutMs });
-    if (ref.runner === 'codex') return probeCodex(ref, { cwd: deps.cwd, timeoutMs: deps.timeoutMs });
+    if (ref.runner === 'opencode') return probeOpencode(ref, { cwd: deps.cwd, timeoutMs: deps.timeoutMs, env: env('opencode') });
+    if (ref.runner === 'codex') return probeCodex(ref, { cwd: deps.cwd, timeoutMs: deps.timeoutMs, env: env('codex') });
     if (ref.runner === 'harness') {
       const advisor = deps.advisors?.[ref.model];
       if (!advisor) return { status: 'failed', detail: `advisor "${ref.model}" is not bound in agentHarness.models` };
@@ -471,4 +481,41 @@ export function createLiveTransport(deps: {
     }
     return { status: 'failed', detail: `unsupported harness probe transport: ${ref.runner}` };
   };
+}
+
+/** The project's selected agent accounts, resolved as its phases resolve them (spec
+ *  2026-07-29-agent-profiles): a probe on the default login certified an account the run never used,
+ *  or refused a start the run's own account would have served (PR #925 review). */
+export async function probeAccounts(
+  repoRoot: string | undefined,
+  source: NodeJS.ProcessEnv = process.env,
+): Promise<ProbeAccounts> {
+  const accounts: ProbeAccounts = {};
+  for (const runner of ['claude', 'codex', 'opencode'] as const) {
+    const { profile, env } = await resolveProfileEnvForRoot(repoRoot, runner, undefined, source);
+    // Harness children get an allowlisted env, so a default login the host moved must be passed on.
+    const name = PROFILE_ENV_VAR[runner];
+    const hostDir = name ? source[name] : undefined;
+    accounts[runner] = { id: profile.id, env: profile.isDefault && name && hostDir ? { [name]: hostDir } : env };
+  }
+  return accounts;
+}
+
+/** The env a runtime op needs to reach every CLI on the project's account: a trusted worker adapter
+ *  or an advisor may spawn any of them (PR #925 review). */
+export function accountEnvironment(accounts: ProbeAccounts): Record<string, string> {
+  return Object.assign({}, ...Object.values(accounts).map((account) => account?.env ?? {}));
+}
+
+/** One project's prober: its account per runner, and a cache scoped to the project and account. */
+export async function createProjectProber(opts: { repoRoot: string; cwd?: string; advisors?: unknown }): Promise<ModelProber> {
+  const accounts = await probeAccounts(opts.repoRoot);
+  return createModelProber({
+    transport: createLiveTransport({ advisors: opts.advisors as LiveAdvisors | undefined, cwd: opts.cwd ?? opts.repoRoot, accounts }),
+    cache: sharedHarnessProbeCache,
+    scope: (ref) => {
+      const account = ref.runner === 'harness' ? '' : accounts[ref.runner as ProbeRunner]?.id ?? '';
+      return `${opts.repoRoot}|${account}|`;
+    },
+  });
 }
