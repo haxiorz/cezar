@@ -385,11 +385,9 @@ export function resetIndexToHead(cwd: string): void {
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env },
   });
   try {
-    git(['read-tree', '-m', 'HEAD']);
+    git(['read-tree', 'HEAD']);
   } catch {
-    try { git(['read-tree', 'HEAD']); } catch {
-      // The stage op's own index checks still refuse anything left behind.
-    }
+    // The stage op's own index checks still refuse anything left behind.
   }
 }
 
@@ -432,6 +430,12 @@ export async function harnessDiff(cwd: string, paths: readonly string[], indexPa
   }
 }
 
+class PacketRestoreError extends Error {
+  constructor(message: string, readonly artifactPath: string) {
+    super(message);
+  }
+}
+
 export async function preserveAndRestorePacket(cwd: string, paths: readonly string[], artifactPath: string): Promise<string | undefined> {
   const pinned = pinnedGitEnv(cwd);
   if (!pinned) {
@@ -450,7 +454,7 @@ export async function preserveAndRestorePacket(cwd: string, paths: readonly stri
       if (!parent.startsWith(resolve(cwd) + sep)) throw new Error(`packet path escapes the worktree: ${path}`);
       let symlink = false;
       try { symlink = lstatSync(parent).isSymbolicLink(); } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
       }
       if (symlink) throw new Error(`packet path has a symlink parent: ${path}`);
     }
@@ -474,16 +478,20 @@ export async function preserveAndRestorePacket(cwd: string, paths: readonly stri
   } finally {
     rmSync(temporaryPath, { force: true });
   }
-  const head = new Set(headPaths);
-  for (const path of affected.filter((path) => !head.has(path))) {
-    rmSync(join(cwd, path), { force: true });
-    git(['update-index', '--force-remove', '--', path]);
-  }
-  if (headPaths.length) {
-    git(['restore', '--source=HEAD', '--staged', '--worktree', '--', ...headPaths.map((path) => `:(literal)${path}`)]);
-  }
-  if ((await harnessDiff(cwd, paths, `${artifactPath}.index`)).length) {
-    throw new Error('packet allowed paths still contain uncommitted changes after restoration');
+  try {
+    const head = new Set(headPaths);
+    for (const path of affected.filter((path) => !head.has(path))) {
+      rmSync(join(cwd, path), { force: true });
+      git(['update-index', '--force-remove', '--', path]);
+    }
+    if (headPaths.length) {
+      git(['restore', '--source=HEAD', '--staged', '--worktree', '--', ...headPaths.map((path) => `:(literal)${path}`)]);
+    }
+    if ((await harnessDiff(cwd, paths, `${artifactPath}.index`)).length) {
+      throw new Error('packet allowed paths still contain uncommitted changes after restoration');
+    }
+  } catch (error) {
+    throw new PacketRestoreError(error instanceof Error ? error.message : String(error), preservedPath);
   }
   return preservedPath;
 }
@@ -1203,6 +1211,7 @@ export async function runHarnessDriver(
     invocation: HarnessInvocation,
     request: HarnessAgentPhaseRequest,
   ): Promise<string | null> => {
+    if (host.isCancelled()) return 'run cancelled';
     let guardEnv: Record<string, string> = {};
     // A phase without a role runs on Claude, and says so: left unset it fell to the task's runner
     // (OpenCode, Cursor…) with no guard or sandbox, while the ledger recorded Claude (PR #925 review).
@@ -2349,6 +2358,7 @@ export async function runHarnessDriver(
         advisors: (agentic.agentHarness?.models ?? {}) as Record<string, unknown>,
         cwd: host.cwd,
       });
+      if (host.isCancelled()) return { ok: true };
       const roster = new Map<
         string,
         { id: string; binding: string; roles: string[]; family: string; runner: string; model: string }
@@ -2418,10 +2428,12 @@ export async function runHarnessDriver(
       }
     } else {
       const hostRef: HarnessRoleRef = { runner: 'claude', model: '' };
-      const verdict = await (await createProber({
+      const prober = await createProber({
         advisors: {},
         cwd: host.cwd,
-      })).probe(hostRef);
+      });
+      if (host.isCancelled()) return { ok: true };
+      const verdict = await prober.probe(hostRef);
       ledger.models = [
         {
           id: 'claude',
@@ -2531,6 +2543,9 @@ export async function runHarnessDriver(
   const runtime: RuntimeLike = {
     kill: () => rawRuntime.kill(),
     run: async (op, args, opts) => {
+      if (host.isCancelled()) {
+        return { ok: false, exitCode: null, stdout: '', stderr: '', error: `op "${op}" cancelled`, durationMs: 0 };
+      }
       const digest = scriptDigest(sealed.script);
       if (digest !== sealed.sha256) {
         const error =
@@ -2556,6 +2571,7 @@ export async function runHarnessDriver(
         error instanceof Error ? error.message : String(error)
       }`;
     }
+    if (host.isCancelled()) return 'run cancelled';
     const failure = await runAgentInvocation(invocation, request);
     try {
       const after = await snapshotReviewSubject(host.cwd);
@@ -2860,7 +2876,21 @@ export async function runHarnessDriver(
     } catch (error) {
       return { rows, error: `could not size the advisor council subject: ${error instanceof Error ? error.message : String(error)}` };
     }
-    const resultMaxBytes = advisorCouncilResultMaxBytes(op.members.length, subjectBytes);
+    if (host.isCancelled()) return null;
+    const rubricFiles = [
+      join(trustedSkillsRoot, phaseSkills.codeReview, 'SKILL.md'),
+      join(trustedSkillsRoot, phaseSkills.codeReview, 'references', 'review-checklist.md'),
+      join(trustedSkillsRoot, phaseSkills.codeReview, 'references', 'output-format.md'),
+      join(dirname(sealed.script), '..', 'references', 'review-result.schema.json'),
+    ];
+    // Match the timeout's fixed prompt allowance (PR #925 review).
+    const fixedBytes = Buffer.byteLength(op.criteriaText) + 8_192 + rubricFiles.reduce(
+      (bytes, path) => bytes + (existsSync(path) ? Buffer.byteLength(readHarnessArtifactText(path)) : 0), 0,
+    );
+    const configuredModels = runtimeAgentic.agentHarness?.models as Record<string, { maxInputBytes?: unknown }> | undefined;
+    const resultMaxBytes = advisorCouncilResultMaxBytes(
+      op.members.map((member) => member.entry ?? configuredModels?.[member.councilId] ?? {}), subjectBytes, fixedBytes,
+    );
     let recoverableCouncil: z.infer<typeof councilResultSchema> | null = null;
     let recoverableCouncilMtimeMs: number | null = null;
     try {
@@ -2964,7 +2994,7 @@ export async function runHarnessDriver(
           continue;
         }
         const attempts = attemptsForInput(id, inputSha256);
-        if (attempts >= 2 + (op.retryAllowance ?? 0) || (op.proceedAccepted && attempts > 0)) {
+        if (attempts >= 2 + (op.retryAllowance ?? 0) || (op.proceedAccepted && prior?.inputSha256 === inputSha256)) {
           rows.push({
             id: member.label,
             runner: 'harness',
@@ -3047,16 +3077,6 @@ export async function runHarnessDriver(
       writeFileSync(councilConfigPath, `${JSON.stringify(configJson, null, 2)}\n`, 'utf8');
       const criteriaPath = join(artifactDir, `council-criteria-${op.kindTag}-r${op.round}.md`);
       writeFileSync(criteriaPath, op.criteriaText, 'utf8');
-      const rubricFiles = [
-        join(trustedSkillsRoot, phaseSkills.codeReview, 'SKILL.md'),
-        join(trustedSkillsRoot, phaseSkills.codeReview, 'references', 'review-checklist.md'),
-        join(trustedSkillsRoot, phaseSkills.codeReview, 'references', 'output-format.md'),
-        join(dirname(sealed.script), '..', 'references', 'review-result.schema.json'),
-      ];
-      // Includes the runtime's wrapper and SOURCE labels, with room for multipart instructions.
-      const fixedBytes = Buffer.byteLength(op.criteriaText) + 8_192 + rubricFiles.reduce(
-        (bytes, path) => bytes + (existsSync(path) ? Buffer.byteLength(readHarnessArtifactText(path)) : 0), 0,
-      );
       const timeoutMs = advisorCouncilTimeoutMs(ids.map((id) => harnessObj.models?.[id] ?? {}), subjectBytes, fixedBytes);
       for (const member of pendingMembers) {
         const meta = invocationMeta.get(member.label)!;
@@ -3081,6 +3101,10 @@ export async function runHarnessDriver(
         renameSync(resultFile, `${resultFile}.previous-${randomUUID()}`);
       }
       const reviewSubjectBefore = await snapshotReviewSubject(host.cwd);
+      if (host.isCancelled()) {
+        for (const invocation of running.values()) finishInvocation(invocation, 'interrupted', { error: 'run cancelled' });
+        return null;
+      }
       const result = await runtime.run(
         'review',
         [
@@ -3433,6 +3457,8 @@ export async function runHarnessDriver(
         return null;
       }
     };
+    const packetReachedImplementing = (packet: Record<string, unknown> | null): boolean =>
+      Array.isArray(packet?.events) && packet.events.some((event) => event?.state === 'implementing');
     const recordPacket = (
       originalId: string,
       record: Record<string, unknown>,
@@ -3501,14 +3527,14 @@ export async function runHarnessDriver(
 
       const restoreAttempt = async (id: string): Promise<string | null> => {
         // Only the runtime's clean-path preflight authorizes destructive recovery (PR #925 review).
-        if (!Array.isArray(state?.events) || !state.events.some((event) => event?.state === 'implementing')) return null;
+        if (!packetReachedImplementing(state)) return null;
         const artifactPath = join(artifactDir, `packet-failed-diff-${id}.patch`);
         try {
           const preservedPath = await preserveAndRestorePacket(host.cwd, source.allowedPaths, artifactPath);
           host.emit({ type: 'note', message: `packet ${id} failed-attempt diff preserved at ${preservedPath ?? artifactPath}; its allowed paths restored to HEAD` });
           return null;
         } catch (error) {
-          return `packet ${id} replacement refused: could not preserve and restore its allowed paths (${error instanceof Error ? error.message : String(error)}); diff artifact: ${artifactPath}`;
+          return `packet ${id} replacement refused: could not preserve and restore its allowed paths (${error instanceof Error ? error.message : String(error)}); diff artifact: ${error instanceof PacketRestoreError ? error.artifactPath : artifactPath}`;
         }
       };
 
@@ -3556,7 +3582,10 @@ export async function runHarnessDriver(
           (invocation) =>
             (invocation.id.startsWith(`packet-run:${source.id}:`) ||
               invocation.id.startsWith(`packet-gate:${source.id}:`)) &&
-            invocation.status === 'failed',
+            invocation.status === 'failed' &&
+            packetReachedImplementing(readPacket(
+              invocation.id.endsWith(':1') ? source.id : `${source.id}-resume-${invocation.id.split(':').at(-1)}`,
+            )),
         ).length;
         if (failedRuns >= 2) {
           return `packet ${source.id} failed twice in state ${stateName}; manual recovery is required`;

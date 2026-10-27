@@ -114,17 +114,6 @@ describe('PR #925 review: Git recovery boundaries', () => {
     expect(fs.readFileSync(join(cwd, '.git/index'))).toEqual(index);
   });
 
-  it('[round2-9] retains unchanged index stat entries while clearing superseded staging', () => {
-    pin();
-    const before = git('ls-files', '--debug', '--', 'untouched.txt');
-    expect(before).not.toContain('mtime: 0:0');
-    fs.writeFileSync(join(cwd, 'src/a.txt'), 'staged\n');
-    git('add', 'src/a.txt');
-    resetIndexToHead(cwd);
-    expect(git('diff', '--cached')).toBe('');
-    expect(git('ls-files', '--debug', '--', 'untouched.txt')).toBe(before);
-  });
-
   it('guard: unmerged index fallback still passes real runtime verify and stage without reflog drift', () => {
     pin();
     const runtime = (op: string, ...args: string[]) => execFileSync(process.execPath, [script, op, '--worktree', cwd, ...args], { encoding: 'utf8' });

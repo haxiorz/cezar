@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import {
   chmodSync,
   existsSync,
@@ -439,7 +441,31 @@ describe('harness driver — standard fix-issue graph', () => {
     },
   });
 
-  it.each(['blocked', 'planned', 'claimed', 'aborted'])('[round2-2] keeps pre-existing approved spec after real preflight refusal in %s', async (priorState) => {
+  it.each([true, false])('[round3-1] cancellation while preparing the prober prevents probes (roles=%s)', async (withRoles) => {
+    const h = makeHarness(dir);
+    let cancelled = false;
+    let probes = 0;
+    h.host.isCancelled = () => cancelled;
+    h.deps.createProber = async () => {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      cancelled = true;
+      return {
+        probe: async () => { probes += 1; return { status: 'ready', detail: 'stub' }; },
+        probeAll: async () => { probes += 1; return new Map(); },
+        clearCache: () => undefined,
+      };
+    };
+    const roles = withRoles ? {
+      orchestrator: { runner: 'claude' as const, model: 'sonnet' },
+      implementer: { runner: 'codex' as const, model: 'gpt-5.6-sol' },
+      reviewers: [{ runner: 'claude' as const, model: 'opus' }],
+    } : undefined;
+    expect(await runHarnessDriver(h.host, { ...input, roles }, h.deps)).toBeNull();
+    expect(probes).toBe(0);
+    expect(h.calls).toEqual([]);
+  });
+
+  it.each(['blocked', 'planned', 'claimed', 'aborted', 'recoverable'])('[round3-2] keeps pre-existing approved spec after real preflight refusal in %s', async (priorState) => {
     const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
     git('init', '-q', '-b', 'main');
     git('config', 'user.email', 'test@local');
@@ -464,7 +490,7 @@ describe('harness driver — standard fix-issue graph', () => {
     const realConfig = join(dir, '.ai/cezar/real-config.json');
     const risks = { low: 1, medium: 1, high: 1, critical: 1 };
     const worker = join(dir, '.ai/cezar/codex');
-    writeFileSync(worker, '#!/bin/sh\nexit 99\n');
+    writeFileSync(worker, '#!/bin/sh\ntouch .ai/cezar/worker-started\nexit 99\n');
     chmodSync(worker, 0o755);
     writeFileSync(realConfig, JSON.stringify({ agentHarness: {
       version: 1, delivery: { mode: 'stage-only' },
@@ -500,7 +526,7 @@ describe('harness driver — standard fix-issue graph', () => {
     const resultPath = join(harnessArtifactDir(h.host.dataDir, h.host.runId), 'packet-runtime/packets/PK-01/packet-result.json');
     const ledger = JSON.parse(readFileSync(resultPath, 'utf8'));
     expect(ledger.events.some((event: { state: string }) => event.state === 'implementing')).toBe(false);
-    writeFileSync(resultPath, JSON.stringify({ ...ledger, state: priorState }));
+    writeFileSync(resultPath, JSON.stringify({ ...ledger, state: priorState === 'recoverable' ? 'blocked' : priorState }));
     if (priorState === 'aborted') {
       const released = spawnSync(process.execPath, [script, 'packet-release', '--run-dir', dirname(dirname(dirname(resultPath))), '--packet', 'PK-01', '--reason', 'interrupted release'], { cwd: dir, encoding: 'utf8' });
       expect(released.status, released.stderr).toBe(0);
@@ -516,6 +542,35 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(existsSync(join(dir, specPath))).toBe(true);
     expect(readFileSync(join(dir, specPath), 'utf8')).toBe('# Council-approved spec\n');
     expect(next).toContain(`Packet allowed paths already contain uncommitted changes: ${specPath}`);
+    expect(h.events.some((event) => String(event.message).includes('failed-attempt diff preserved'))).toBe(false);
+    if (priorState === 'recoverable') {
+      rmSync(join(dir, specPath));
+      const recovered = await runHarnessDriver(h.host, packetInput, h.deps);
+      expect(recovered).not.toContain('failed twice');
+      const replacement = JSON.parse(readFileSync(join(dirname(dirname(resultPath)), 'PK-01-resume-3/packet-result.json'), 'utf8'));
+      expect(replacement.events.some((event: { state: string }) => event.state === 'implementing')).toBe(true);
+      expect(replacement.usage.workerInvocations).toBe(1);
+      expect(existsSync(join(dir, '.ai/cezar/worker-started'))).toBe(true);
+    }
+  });
+
+  it('guard: a refused packet still names the conflicting path without restoring it', async () => {
+    const h = makeHarness(dir);
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    const create = h.deps.createRuntime!;
+    h.deps.createRuntime = (opts) => {
+      const runtime = create(opts);
+      return { ...runtime, run: async (op, args, options) => {
+        const result = await runtime.run(op, args, options);
+        if (op !== 'packet-run') return result;
+        const runDir = args[args.indexOf('--run-dir') + 1]!;
+        const statePath = join(runDir, 'packets/PK-01/packet-result.json');
+        const state = JSON.parse(readFileSync(statePath, 'utf8'));
+        writeFileSync(statePath, JSON.stringify({ ...state, state: 'blocked', events: [], error: 'Packet allowed paths already contain uncommitted changes: src/runs/store.ts' }));
+        return { ...result, ok: false };
+      } };
+    };
+    expect(await runHarnessDriver(h.host, { ...input, profile: 'high-assurance' }, h.deps)).toContain('Packet allowed paths already contain uncommitted changes: src/runs/store.ts');
     expect(h.events.some((event) => String(event.message).includes('failed-attempt diff preserved'))).toBe(false);
   });
 
@@ -2503,6 +2558,49 @@ describe('harness driver — standard fix-issue graph', () => {
     ).toEqual(['interrupted', 'interrupted', 'interrupted', 'completed']);
   });
 
+  it.each([
+    ['[round3-7] a restore refusal names the numbered preserved artifact', true],
+    ['guard: a restore refusal without a collision names the original artifact', false],
+  ] as const)('%s', async (_name, collision) => {
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'test@local');
+    git('config', 'user.name', 'test');
+    mkdirSync(join(dir, 'src/runs'), { recursive: true });
+    mkdirSync(join(dir, 'test/unit'), { recursive: true });
+    writeFileSync(join(dir, 'src/runs/store.ts'), 'base\n');
+    writeFileSync(join(dir, 'test/unit/store.test.ts'), 'test\n');
+    git('add', 'src', 'test');
+    git('commit', '-qm', 'base');
+    pinWorktreeGitDir(dir, join(dir, '.git'));
+    const h = makeHarness(dir);
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    h.setPacketRunBehavior(() => 'implementing');
+    const packetInput = { ...input, profile: 'high-assurance' as const };
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toMatch(/packet PK-01 failed/);
+    const patch = join(harnessArtifactDir(h.host.dataDir, h.host.runId), 'packet-failed-diff-PK-01.patch');
+    if (collision) writeFileSync(patch, 'older preserved patch');
+    writeFileSync(join(dir, 'src/runs/store.ts'), 'worker bytes\n');
+    const original = childProcess.execFileSync;
+    const spy = vi.spyOn(childProcess, 'execFileSync').mockImplementation(((file: string, args: string[], options: unknown) => {
+      if (file === 'git' && args[0] === 'restore') throw new Error('injected restore refusal');
+      return Reflect.apply(original, childProcess, [file, args, options]);
+    }) as typeof original);
+    syncBuiltinESMExports();
+    try {
+      const failure = await runHarnessDriver(h.host, packetInput, h.deps);
+      const preserved = collision ? `${patch}.1` : patch;
+      expect(failure).toContain('replacement refused');
+      expect(failure).toContain('injected restore refusal');
+      expect(failure?.split('diff artifact: ').at(-1)).toBe(preserved);
+      expect(readFileSync(preserved, 'utf8')).toContain('+worker bytes');
+      if (collision) expect(readFileSync(patch, 'utf8')).toBe('older preserved patch');
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+  });
+
   // PR #925 review: a packet the runtime marked blocked dead-ended every Continue on a misleading
   // "worker invocation evidence is missing".
   it('gives a blocked packet its bounded replacement on Continue', async () => {
@@ -2564,7 +2662,7 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(h.calls.filter((call) => call.id === 'implement')).toHaveLength(1);
   });
 
-  it('stops a packet for manual recovery after its runtime fails twice', async () => {
+  it('guard: stops a packet for manual recovery after two implementing failures', async () => {
     const h = makeHarness(dir);
     h.setPacketRunBehavior(() => 'implementing');
     h.deps.loadAgentic = async () => highAssuranceAgentic();
@@ -3582,6 +3680,53 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     implement: { changedPaths: ['src/a.ts'], suggestedCommit: 'fix: x' },
   };
 
+  it.each([true, false])('%s [round3-1] macrotask Stop during council sizing prevents advisor spawn', async (cancelDuringSizing) => {
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'test@local');
+    git('config', 'user.name', 'test');
+    writeFileSync(join(dir, 'base.txt'), 'base');
+    git('add', 'base.txt');
+    git('commit', '-qm', 'base');
+    pinWorktreeGitDir(dir, join(dir, '.git'));
+    const h = makeHarness(dir);
+    let cancelled = false;
+    let scheduled = false;
+    const interrupts = new Set<() => void>();
+    const launches: string[] = [];
+    h.host.isCancelled = () => cancelled;
+    h.host.onInterrupt = (fn) => { interrupts.add(fn); return () => { interrupts.delete(fn); }; };
+    h.deps.snapshotReviewSubject = async () => {
+      if (cancelDuringSizing && !scheduled && h.steps.get('review') === 'running') {
+        scheduled = true;
+        setImmediate(() => { cancelled = true; for (const fn of interrupts) fn(); });
+      }
+      return 'stable-review-subject';
+    };
+    const create = h.deps.createRuntime!;
+    h.deps.createRuntime = (opts) => {
+      const runtime = create(opts);
+      return { run: async (op, args, options) => {
+        if (op === 'review') launches.push(`spawn review (cancelled=${cancelled})`);
+        return runtime.run(op, args, options);
+      }, kill: () => { launches.push(`kill (cancelled=${cancelled})`); runtime.kill(); } };
+    };
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    if (cancelDuringSizing) {
+      expect(scheduled).toBe(true);
+      expect(launches).toContain('kill (cancelled=true)');
+      expect(launches.filter((entry) => entry.startsWith('spawn'))).toEqual([]);
+    } else {
+      expect(launches).toContain('spawn review (cancelled=false)');
+    }
+  });
+
+  it('guard: an uncancelled advisor council still runs', async () => {
+    const h = makeHarness(dir);
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    expect(h.ops.filter((op) => op.id === 'review')).toHaveLength(1);
+  });
+
   it.each(['rows', 'op-error', 'throw'])('[round2-5] leaves advisor usage-limit windows unspent (%s)', async (mode) => {
     const h = makeHarness(dir);
     let windows = 0;
@@ -3614,7 +3759,7 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(advisor).toMatchObject({ status: 'failed', attempt: 2 });
   });
 
-  it('[round2-6] reads a real verbose multi-advisor result larger than two MB', async () => {
+  it('guard: reads a real verbose multi-advisor result larger than two MB', async () => {
     const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
     git('init', '-q', '-b', 'main');
     git('config', 'user.email', 'test@local');
@@ -4393,6 +4538,38 @@ describe('harness driver — role-based conduction (2026-07-24)', () => {
     expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toBeNull();
     expect(sessionReviews).toBe(1);
     expect(loadLedger(h.host.dataDir, h.host.runId)?.outcome.status).toBe('ready');
+  });
+
+  it('[round3-4] recorded proceed never buys a usage-limited advisor another invocation', async () => {
+    const h = makeHarness(dir);
+    const calls: string[][] = [];
+    h.setCouncilBehavior((ids) => {
+      calls.push(ids);
+      return { ok: true, result: { reviewers: ids.map((id) => ({ id, status: 'failed', error: 'provider usage limit reached' })) } };
+    });
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toMatch(/quorum/);
+    const ledger = loadLedger(h.host.dataDir, h.host.runId)!;
+    expect(ledger.invocations.filter((row) => row.id.startsWith('advisor:')).every((row) => row.status === 'interrupted' && row.attempt === 1)).toBe(true);
+    ledger.decisions.push({ at: new Date().toISOString(), kind: 'council.proceed', by: 'user', detail: recordedDecisionDetail(ledger) });
+    saveLedger(h.host.dataDir, h.host.runId, ledger);
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toBeNull();
+    expect(calls).toHaveLength(1);
+  });
+
+  it('guard: without proceed an interrupted advisor can run on Continue', async () => {
+    const h = makeHarness(dir);
+    let calls = 0;
+    let limited = true;
+    h.setCouncilBehavior((ids) => {
+      calls += 1;
+      return limited
+        ? { ok: true, result: { reviewers: ids.map((id) => ({ id, status: 'failed', error: 'provider usage limit reached' })) } }
+        : undefined;
+    });
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toMatch(/quorum/);
+    limited = false;
+    expect(await runHarnessDriver(h.host, threeReviewerInput, h.deps)).toBeNull();
+    expect(calls).toBe(2);
   });
 
   it('a recorded retry decision buys the failed reviewers one more attempt', async () => {

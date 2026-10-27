@@ -419,6 +419,9 @@ export class HarnessRuntime {
       onSpawn?: (identity: HarnessProcessIdentity) => void;
     } = {},
   ): Promise<HarnessOpResult> {
+    if (this.killed) {
+      return Promise.resolve({ ok: false, exitCode: null, stdout: '', stderr: '', error: `op "${op}" cancelled`, durationMs: 0 });
+    }
     const timeoutMs = opts.timeoutMs ?? DEFAULT_OP_TIMEOUT_MS;
     const startedAt = Date.now();
     return new Promise((resolve) => {

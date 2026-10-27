@@ -28,16 +28,24 @@ export function advisorCouncilTimeoutMs(
   fixedBytes: number,
 ): number {
   return Math.max(600_000, ...models.map((model) => {
-    const subjectBudget = Math.max(1_024, (Number(model.maxInputBytes) || 180_000) - fixedBytes - 16_384);
-    const parts = subjectBytes <= subjectBudget ? 1 : 2 * Math.ceil(subjectBytes / (subjectBudget - 4)) + 1;
+    const parts = advisorSubjectParts(model, subjectBytes, fixedBytes);
     return Math.ceil(parts / 2) * (Number(model.timeoutMs) || 600_000);
   })) + 120_000;
 }
 
-/** Sealed runtime output repeats findings; the smallest legal subject part is 1 KiB (PR #925 review). */
-export function advisorCouncilResultMaxBytes(members: number, subjectBytes: number): number {
-  const parts = subjectBytes <= 1_024 ? 1 : 2 * Math.ceil(subjectBytes / (1_024 - 4)) + 1;
-  return 1_000_000 + Math.max(1, members) * parts * 2_000_000 * 4;
+function advisorSubjectParts(model: { maxInputBytes?: unknown }, subjectBytes: number, fixedBytes: number): number {
+  const subjectBudget = Math.max(1_024, (Number(model.maxInputBytes) || 180_000) - fixedBytes - 16_384);
+  return subjectBytes <= subjectBudget ? 1 : 2 * Math.ceil(subjectBytes / (subjectBudget - 4)) + 1;
+}
+
+/** Repeated findings need headroom, but cannot authorize an unbounded read (PR #925 review). */
+export function advisorCouncilResultMaxBytes(
+  models: readonly { maxInputBytes?: unknown }[],
+  subjectBytes: number,
+  fixedBytes: number,
+): number {
+  const parts = models.reduce((total, model) => total + advisorSubjectParts(model, subjectBytes, fixedBytes), 0);
+  return Math.min(256 * 1024 * 1024, 1_000_000 + Math.max(1, parts) * 2_000_000 * 4);
 }
 
 export interface PromptFinding {
