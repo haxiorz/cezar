@@ -4,7 +4,7 @@
     "ref": "feat/omdyo-harness",
     "commit": "a018dc97b15213106e2d283be3c4fce80fa0811e"
   },
-  "generatedAt": "2026-10-27T18:38:46.163Z",
+  "generatedAt": "2026-10-27T23:18:38.439Z",
   "generatedBy": "scripts/vendor-skills.mjs",
   "nameMap": {
     "om-setup-agent-harness": "cez-setup-harness",

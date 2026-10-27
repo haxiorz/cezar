@@ -4,8 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { pinWorktreeGitDir } from '../git-pin.js';
-import { preserveAndRestorePacket, resetIndexToHead, snapshotHarnessReviewSubject, snapshotHarnessStageSubject } from './driver.js';
-import { packetLedgerResultMaxBytes } from './prompt-budget.js';
+import { resetIndexToHead, snapshotHarnessReviewSubject, snapshotHarnessStageSubject } from './driver.js';
 
 const script = new URL('../../vendor/skills/cez-harness/scripts/harness.mjs', import.meta.url).pathname;
 
@@ -99,25 +98,6 @@ describe('PR #925 review: round 4 Git boundaries', () => {
     expect(git('diff', '--cached', '--name-only').trim().split('\n')).toHaveLength(200);
   });
 
-  it('[r4-2] refuses an out-of-scope non-directory ancestor before losing its bytes', async () => {
-    rmSync(join(cwd, 'src'), { recursive: true });
-    writeFileSync(join(cwd, 'src'), 'out-of-scope replacement\n');
-    const patch = join(root, 'failed.patch');
-    await expect(preserveAndRestorePacket(cwd, ['src/nested/a.txt'], patch)).rejects.toThrow('out-of-scope non-directory parent');
-    expect(readFileSync(join(cwd, 'src'), 'utf8')).toBe('out-of-scope replacement\n');
-    expect(existsSync(patch)).toBe(false);
-  });
-
-  it('guard: [r4-2] preserves an in-scope non-directory ancestor and restores its directory', async () => {
-    rmSync(join(cwd, 'src/nested'), { recursive: true });
-    writeFileSync(join(cwd, 'src/nested'), 'in-scope replacement\n');
-    const patch = join(root, 'failed.patch');
-    expect(await preserveAndRestorePacket(cwd, ['src'], patch)).toBe(patch);
-    expect(readFileSync(patch, 'utf8')).toContain('+in-scope replacement');
-    expect(readFileSync(join(cwd, 'src/nested/a.txt'), 'utf8')).toBe('base\n');
-    expect(readFileSync(join(cwd, 'src/x'), 'utf8')).toBe('sibling\n');
-  });
-
   it.each(['--assume-unchanged', '--skip-worktree'])('[r4-5] both subjects include a %s edit before reset', async (flag) => {
     const start = join(root, 'start.json');
     runtime('capture', '--output', start);
@@ -156,30 +136,5 @@ describe('PR #925 review: round 4 Git boundaries', () => {
     git('add', 'src/new.txt');
     expect(await snapshotHarnessReviewSubject(cwd)).toBe(changedReview);
     expect(await snapshotHarnessStageSubject(cwd)).toBe(changedStage);
-  });
-});
-
-describe('PR #925 review: packet ledger bounds and documentation', () => {
-  it('[r4-4] derives packet headroom from invocation budgets with a hard ceiling', () => {
-    expect(packetLedgerResultMaxBytes({ maxReviewerInvocations: 2, maxWorkerInvocations: 1, maxFixerInvocations: 1 })).toBe(65_240_000);
-    expect(packetLedgerResultMaxBytes({ maxReviewerInvocations: 100_000 })).toBe(256 * 1024 * 1024);
-  });
-
-  it('guard: [r4-4] absent or invalid budgets remain bounded and permit small ledgers', () => {
-    for (const budgets of [undefined, {}, { maxReviewerInvocations: Infinity }, { maxReviewerInvocations: -1 }]) {
-      const cap = packetLedgerResultMaxBytes(budgets);
-      expect(cap).toBeGreaterThan(0);
-      expect(cap).toBeLessThanOrEqual(256 * 1024 * 1024);
-    }
-  });
-
-  it('[r4-8] documents that the failure cap starts with worker execution', () => {
-    const doc = readFileSync(new URL('../../../../docs/multi-model-harness.md', import.meta.url), 'utf8');
-    expect(doc.replace(/\s+/g, ' ')).toContain('fails twice after its worker started');
-  });
-
-  it('guard: [r4-8] documentation keeps Stop and restart outside the failure budget', () => {
-    const doc = readFileSync(new URL('../../../../docs/multi-model-harness.md', import.meta.url), 'utf8');
-    expect(doc.replace(/\s+/g, ' ')).toContain('a Stop or a cezar restart mid-packet releases the lease and resumes without spending that budget');
   });
 });

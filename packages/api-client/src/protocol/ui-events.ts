@@ -283,7 +283,7 @@ export interface UiImageEvent {
  * Harness driver events (spec 2026-07-23-harness-orchestration) — run-level
  * snapshots emitted by the harness phase driver, not by backend mappers. The
  * ledger schema on the server is authoritative; the UI treats these as
- * replaceable snapshots keyed by phase/round/packet identity.
+ * replaceable snapshots keyed by phase/round identity.
  */
 export interface UiHarnessPhaseUpdatedEvent {
   type: 'harness.phase.updated'
@@ -299,11 +299,6 @@ export interface UiHarnessReadinessUpdatedEvent {
 export interface UiHarnessCouncilUpdatedEvent {
   type: 'harness.council.updated'
   council: Record<string, unknown>
-}
-
-export interface UiHarnessPacketUpdatedEvent {
-  type: 'harness.packet.updated'
-  packet: Record<string, unknown>
 }
 
 export interface UiHarnessStageUpdatedEvent {
@@ -337,7 +332,6 @@ export type UiEvent =
   | UiHarnessPhaseUpdatedEvent
   | UiHarnessReadinessUpdatedEvent
   | UiHarnessCouncilUpdatedEvent
-  | UiHarnessPacketUpdatedEvent
   | UiHarnessStageUpdatedEvent
   | UiHarnessFeedbackAppliedEvent
 

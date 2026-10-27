@@ -24,7 +24,6 @@ import type {
   HarnessFindingRecord,
   HarnessInvocationRecord,
   HarnessLedgerResponse,
-  HarnessPacketRecord,
 } from '@open-mercato/cezar-api-client'
 import { CenteredState } from '@/components/centered-state'
 import { Pill } from '@/components/pill'
@@ -110,7 +109,7 @@ function HarnessPage({
 }: {
   run: ApiRun
   ledger: HarnessLedgerResponse
-  tab: 'review' | 'packets'
+  tab: 'review'
   children: ReactNode
 }) {
   const [timelineOpen, setTimelineOpen] = useState(false)
@@ -605,123 +604,6 @@ export function TaskHarnessReviewRoute() {
       <Findings ledger={ledger} />
       <CouncilProgress ledger={ledger} />
       <CouncilTable ledger={ledger} />
-    </HarnessPage>
-  )
-}
-
-function packetManifest(packet: HarnessPacketRecord): Record<string, unknown> {
-  return packet.manifest && typeof packet.manifest === 'object' && !Array.isArray(packet.manifest)
-    ? (packet.manifest as Record<string, unknown>)
-    : {}
-}
-
-function packetPaths(packet: HarnessPacketRecord): string[] {
-  const manifest = packetManifest(packet)
-  const paths = packet.paths ?? manifest.allowedPaths
-  return Array.isArray(paths) ? paths.filter((path): path is string => typeof path === 'string') : []
-}
-
-function packetTitle(packet: HarnessPacketRecord): string {
-  const manifest = packetManifest(packet)
-  return packet.title ?? (typeof manifest.title === 'string' ? manifest.title : packet.originalId ?? packet.id)
-}
-
-export function TaskHarnessPacketsRoute() {
-  const { run, harness, ledger } = useHarnessRouteState()
-  if (run.isPending || (run.data?.harness && harness.isPending)) return <HarnessLoadState pending />
-  if (run.isError || harness.isError || !run.data || !ledger) {
-    return <HarnessLoadState pending={false} error={(run.error ?? harness.error) as Error | undefined} />
-  }
-  const counts = ledger.packets.reduce(
-    (result, packet) => {
-      const state = packet.state ?? packet.status ?? 'planned'
-      if (state === 'gated') result.gated += 1
-      else if (state === 'blocked' || state === 'aborted') result.blocked += 1
-      else result.active += 1
-      return result
-    },
-    { gated: 0, active: 0, blocked: 0 },
-  )
-  const packetInvocations = ledger.invocations.filter((invocation) => invocation.id.startsWith('packet-'))
-  return (
-    <HarnessPage run={run.data} ledger={ledger} tab="packets">
-      <section className="flex flex-wrap items-center gap-4 rounded-xl border border-border bg-card px-4 py-3 shadow-xs">
-        <Layers3Icon aria-hidden="true" className="size-4 text-soft-foreground" />
-        <span className="text-sm font-semibold">{ledger.packets.length} packets</span>
-        <span className="text-xs text-success">{counts.gated} gated</span>
-        <span className="text-xs text-soft-foreground">{counts.active} active</span>
-        <span className="text-xs text-danger">{counts.blocked} blocked</span>
-        <span className="ml-auto text-xs text-soft-foreground tabular-nums">
-          {packetInvocations.length} worker invocations
-        </span>
-      </section>
-
-      {ledger.packets.length === 0 ? (
-        <CenteredState
-          icon={<Layers3Icon />}
-          tone="neutral"
-          heading="h2"
-          title={ledger.effectiveProfile === 'high-assurance' ? 'Packet plan has not started' : 'This profile does not use packets'}
-          subtitle={
-            ledger.effectiveProfile === 'high-assurance'
-              ? 'The conductor will publish bounded, file-disjoint packets here before implementation.'
-              : 'Choose high assurance for leased paths, bounded replacement attempts, and per-packet evidence gates.'
-          }
-        />
-      ) : (
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {ledger.packets.map((packet) => {
-            const state = packet.state ?? packet.status ?? 'planned'
-            const manifest = packetManifest(packet)
-            const risk = packet.risk ?? (typeof manifest.risk === 'string' ? manifest.risk : undefined)
-            const paths = packetPaths(packet)
-            return (
-              <article
-                key={packet.originalId ?? packet.id}
-                className={cn(
-                  'flex min-h-52 flex-col rounded-xl border bg-card shadow-xs',
-                  state === 'blocked' || state === 'aborted' ? 'border-danger/60' : 'border-border',
-                )}
-              >
-                <div className="flex items-start gap-2 border-b border-border px-4 py-3">
-                  {state === 'gated'
-                    ? <CheckCircle2Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />
-                    : <StatusDot tone={toneOf(state)} pulse={['implementing', 'reviewing', 'fixing'].includes(state)} />}
-                  <div className="min-w-0 flex-1">
-                    <h2 className="truncate text-sm font-semibold">{packetTitle(packet)}</h2>
-                    <p className="mt-0.5 font-mono text-[10.5px] text-soft-foreground">
-                      {packet.originalId ?? packet.id}
-                      {packet.attempt && packet.attempt > 1 ? ` · recovery attempt ${packet.attempt}` : ''}
-                    </p>
-                  </div>
-                  {risk ? <Pill>{risk}</Pill> : null}
-                </div>
-                <dl className="grid grid-cols-[4.5rem_1fr] gap-x-2 gap-y-2 px-4 py-3 text-xs">
-                  <dt className="text-[10px] font-semibold tracking-wide text-soft-foreground uppercase">State</dt>
-                  <dd className="font-semibold text-foreground">{state}</dd>
-                  <dt className="text-[10px] font-semibold tracking-wide text-soft-foreground uppercase">Paths</dt>
-                  <dd className="min-w-0 space-y-1">
-                    {paths.map((path) => (
-                      <code key={path} className="block truncate rounded bg-muted px-1.5 py-0.5 text-[10.5px]">{path}</code>
-                    ))}
-                  </dd>
-                  {packet.error ? (
-                    <>
-                      <dt className="text-[10px] font-semibold tracking-wide text-danger uppercase">Recovery</dt>
-                      <dd className="text-danger">{packet.error}</dd>
-                    </>
-                  ) : null}
-                </dl>
-                <div className="mt-auto border-t border-border px-4 py-2 text-[10.5px] text-soft-foreground">
-                  {state === 'gated' ? 'Leases released · evidence bound to diff'
-                  : state === 'blocked' || state === 'aborted' ? 'Lease held for explicit recovery'
-                  : 'Bounded worker execution in progress'}
-                </div>
-              </article>
-            )
-          })}
-        </div>
-      )}
     </HarnessPage>
   )
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from 'node:child_process'
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { copyFileSync, utimesSync, closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, statSync, writeFileSync, mkdirSync, rmSync, unlinkSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -1503,45 +1503,20 @@ function nullSeparated(value) {
 
 function dirtyPaths(worktree) {
   return [...new Set([
-    ...nullSeparated(git(['diff', '--no-renames', '--name-only', '-z'], worktree)),
-    ...nullSeparated(git(['diff', '--cached', '--no-renames', '--name-only', '-z'], worktree)),
+    ...nullSeparated(git(['diff', '--name-only', '-z'], worktree)),
+    ...nullSeparated(git(['diff', '--cached', '--name-only', '-z'], worktree)),
     ...nullSeparated(git(['ls-files', '--others', '--exclude-standard', '-z'], worktree))
-  ].map((path) => path.replace(/\/$/, '')))].sort()
-}
-
-// Match staging's gitlink commit without entering the nested repository (PR #925 review).
-function dirtyGitlinks(worktree, paths) {
-  const directories = paths.filter((path) => {
-    try { return lstatSync(join(worktree, path)).isDirectory() } catch { return false }
-  })
-  const commits = new Map()
-  if (!directories.length) return commits
-  const temporary = mkdtempSync(join(git(['rev-parse', '--absolute-git-dir'], worktree).trim(), 'cez-packet-index-'))
-  const env = { GIT_INDEX_FILE: join(temporary, 'index') }
-  try {
-    git(['read-tree', 'HEAD'], worktree, { env })
-    gitAddPaths(['add', '--sparse'], directories, worktree, { env })
-    for (const entry of nullSeparated(git(['ls-files', '--stage', '-z'], worktree, { env }))) {
-      const match = /^160000 ([a-f0-9]+) 0\t(.*)$/s.exec(entry)
-      if (match) commits.set(match[2], match[1])
-    }
-  } finally { rmSync(temporary, { recursive: true, force: true }) }
-  return commits
+  ])].sort()
 }
 
 function captureDirtyState(worktree) {
   const state = {}
-  const paths = dirtyPaths(worktree)
-  const gitlinks = dirtyGitlinks(worktree, paths)
-  for (const path of paths) {
-    if (gitlinks.has(path)) { state[path] = `gitlink:${gitlinks.get(path)}`; continue }
+  for (const path of dirtyPaths(worktree)) {
     const absolute = join(worktree, path)
     try {
-      const entry = readEntryNoFollow(absolute)
-      // Same digest as before; a directory or special file still reads as absent.
-      if (entry.kind === 'other') throw new Error('not a file')
-      const content = entry.kind === 'symlink' ? Buffer.from(`symlink:${entry.target}`) : entry.content
-      state[path] = sha256(Buffer.concat([Buffer.from(`${entry.mode}\0`), content]))
+      const stat = lstatSync(absolute)
+      const content = stat.isSymbolicLink() ? Buffer.from(`symlink:${readlinkSync(absolute)}`) : readFileSync(absolute)
+      state[path] = sha256(Buffer.concat([Buffer.from(`${stat.mode}\0`), content]))
     } catch {
       state[path] = 'absent'
     }
@@ -1574,9 +1549,7 @@ function setPacketState(ledger, state, details = {}) {
 
 function savePacketLedger(ledgerPath, ledger) {
   mkdirSync(dirname(ledgerPath), { recursive: true })
-  const temp = `${ledgerPath}.${process.pid}.${randomUUID()}.tmp`
-  writeFileSync(temp, `${JSON.stringify(ledger, null, 2)}\n`)
-  renameSync(temp, ledgerPath)
+  writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`)
 }
 
 function selectPacketModels(profile, config, risk) {

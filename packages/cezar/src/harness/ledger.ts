@@ -38,17 +38,6 @@ export function createLedger(init: {
   });
 }
 
-/** Why this run can take no more operator feedback, or null. High-assurance packet work cannot
- *  reopen its packet leases once implemented, and a message queued after that point would block
- *  staging on every resume (PR #925 review); both the Continue and `POST /messages` paths ask here. */
-export function harnessFeedbackClosedReason(
-  ledger: Pick<HarnessLedger, 'effectiveProfile' | 'phases'>,
-): string | null {
-  if (ledger.effectiveProfile !== 'high-assurance') return null;
-  if (!ledger.phases.some((phase) => phase.id === 'implement' && phase.status === 'done')) return null;
-  return 'High-assurance packet work is already implemented; send further changes as a new task — packet leases cannot be reopened safely.';
-}
-
 /** A `council.retry`/`council.proceed` decision's detail, keyed to the subject its round
  *  reviewed so it never applies to another diff of that round (PR #925 review). */
 export function councilDecisionDetail(target: {

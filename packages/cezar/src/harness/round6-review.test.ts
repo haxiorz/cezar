@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { pinWorktreeGitDir } from '../git-pin.js';
-import { preserveAndRestorePacket, resetIndexToHead, snapshotHarnessReviewSubject, snapshotHarnessStageSubject } from './driver.js';
+import { resetIndexToHead, snapshotHarnessReviewSubject, snapshotHarnessStageSubject } from './driver.js';
 
 const script = new URL('../../vendor/skills/cez-harness/scripts/harness.mjs', import.meta.url).pathname;
 
@@ -229,30 +229,6 @@ describe('PR #925 review: round 6 index normalization', () => {
     expect(git('config', 'core.hooksPath').trim()).toBe('.husky');
   });
 
-  it('[r6-reservation] removes only its reserved placeholder after a failed artifact rename', async () => {
-    write('src/a.txt', 'unsaved bytes\n');
-    const artifact = join(root, 'failed.patch');
-    fs.writeFileSync(artifact, 'earlier recovery');
-    const rename = vi.spyOn(fs, 'renameSync').mockImplementation(() => { throw new Error('rename refused'); });
-    syncBuiltinESMExports();
-    await expect(preserveAndRestorePacket(cwd, ['src'], artifact)).rejects.toThrow('rename refused');
-    expect(rename).toHaveBeenCalledOnce();
-    expect(fs.existsSync(`${artifact}.1`)).toBe(false);
-    expect(fs.readFileSync(artifact, 'utf8')).toBe('earlier recovery');
-    expect(fs.readdirSync(root).filter((name) => name.includes('.tmp-'))).toEqual([]);
-    expect(fs.readFileSync(join(cwd, 'src/a.txt'), 'utf8')).toBe('unsaved bytes\n');
-  });
-
-  it('guard: successful artifact reservation keeps older recovery bytes and restores the packet', async () => {
-    write('src/a.txt', 'new recovery bytes\n');
-    const artifact = join(root, 'failed.patch');
-    fs.writeFileSync(artifact, 'earlier recovery');
-    expect(await preserveAndRestorePacket(cwd, ['src'], artifact)).toBe(`${artifact}.1`);
-    expect(fs.readFileSync(artifact, 'utf8')).toBe('earlier recovery');
-    expect(fs.readFileSync(`${artifact}.1`, 'utf8')).toContain('+new recovery bytes');
-    expect(git('diff', 'HEAD')).toBe('');
-  });
-
   // Report-only; building the 10k-file repo dominates under full-suite load.
   it('subject snapshot timing on at least 10000 tracked files', async () => {
     fs.mkdirSync(join(cwd, 'src/bulk'));
@@ -272,11 +248,6 @@ describe('PR #925 review: round 6 index normalization', () => {
     }
     process.stdout.write(`subject snapshot benchmark ${JSON.stringify({ count, timings })}\n`);
   }, 120_000);
-
-  it('[r6-docs] distinguishes runner temp isolation from packet codex exec', () => {
-    const doc = fs.readFileSync(new URL('../../../../docs/multi-model-harness.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
-    expect(doc).toContain('packet workers use `codex exec --sandbox workspace-write`, which keeps the host `TMPDIR` writable');
-  });
 
   it('guard: Sandbox documentation retains the Codex runner temp exclusions', () => {
     const doc = fs.readFileSync(new URL('../../../../docs/multi-model-harness.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');

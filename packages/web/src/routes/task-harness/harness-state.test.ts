@@ -16,8 +16,8 @@ function ledger(): HarnessLedgerResponse {
   return {
     version: 2,
     workflow: 'cez-harness-fix-issue',
-    requestedProfile: 'high-assurance',
-    effectiveProfile: 'high-assurance',
+    requestedProfile: 'multi',
+    effectiveProfile: 'multi',
     phases: [
       {
         id: 'implement',
@@ -43,14 +43,6 @@ function ledger(): HarnessLedgerResponse {
         round: 1,
         kind: 'implementation',
         reviewers: [{ id: 'claude', status: 'running' }],
-      },
-    ],
-    packets: [
-      {
-        id: 'pk-1',
-        originalId: 'pk-1',
-        state: 'implementing',
-        paths: ['src/one.ts'],
       },
     ],
     invocations: [
@@ -124,7 +116,7 @@ describe('mergeHarnessLedger', () => {
         },
       }),
       event(2, 'harness.readiness.updated', {
-        profile: 'high-assurance',
+        profile: 'multi',
         models: [
           {
             ...snapshot.models[0],
@@ -148,16 +140,6 @@ describe('mergeHarnessLedger', () => {
           reviewers: [{ id: 'claude', status: 'completed', verdict: 'approve' }],
           verdict: 'approve',
           findings: [],
-        },
-      }),
-      event(4, 'harness.packet.updated', {
-        packet: {
-          id: 'pk-1-resume-2',
-          originalId: 'pk-1',
-          effectiveId: 'pk-1-resume-2',
-          state: 'gated',
-          attempt: 2,
-          paths: ['src/one.ts'],
         },
       }),
       event(5, 'harness.invocation.updated', {
@@ -189,14 +171,6 @@ describe('mergeHarnessLedger', () => {
         { id: 'codex', invocations: 1 },
       ],
       councils: [{ round: 1, kind: 'implementation', verdict: 'approve' }],
-      packets: [
-        {
-          id: 'pk-1-resume-2',
-          originalId: 'pk-1',
-          state: 'gated',
-          attempt: 2,
-        },
-      ],
       invocations: [{ id: 'review-1-claude', status: 'completed' }],
       stage: { status: 'staged', stagedPaths: ['src/one.ts'] },
       outcome: {
@@ -212,7 +186,6 @@ describe('mergeHarnessLedger', () => {
     })
     expect(snapshot).toMatchObject({
       phases: [{ status: 'running' }],
-      packets: [{ id: 'pk-1', state: 'implementing' }],
       invocations: [{ status: 'running' }],
       stage: { status: 'pending' },
       outcome: { status: 'pending' },
@@ -224,23 +197,21 @@ describe('mergeHarnessLedger', () => {
   it('is idempotent across replay and ignores malformed harness payloads', () => {
     const snapshot = ledger()
     const updates = [
-      event(1, 'harness.packet.updated', {
-        packet: { id: 'pk-1', originalId: 'pk-1', state: 'gated' },
+      event(1, 'harness.council.updated', {
+        council: { round: 1, kind: 'implementation', verdict: 'approve', findings: [] },
       }),
-      event(2, 'harness.packet.updated', { packet: { state: 'blocked' } }),
-      event(3, 'harness.phase.updated', { phase: { id: 7, status: 'failed' } }),
-      event(4, 'harness.council.updated', { council: { round: 'one', kind: 'implementation' } }),
+      event(2, 'harness.phase.updated', { phase: { id: 7, status: 'failed' } }),
+      event(3, 'harness.council.updated', { council: { round: 'one', kind: 'implementation' } }),
     ]
 
     const once = mergeHarnessLedger(snapshot, updates)
     const twice = mergeHarnessLedger(once, updates)
 
     expect(twice).toEqual(once)
-    expect(twice?.packets).toEqual([
-      { id: 'pk-1', originalId: 'pk-1', state: 'gated' },
+    expect(twice?.councils).toEqual([
+      { round: 1, kind: 'implementation', verdict: 'approve', findings: [] },
     ])
     expect(twice?.phases).toEqual(snapshot.phases)
-    expect(twice?.councils).toEqual(snapshot.councils)
   })
 
   it('keeps the authoritative snapshot when SSE replays events at or below its watermark', () => {

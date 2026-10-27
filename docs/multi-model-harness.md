@@ -58,8 +58,8 @@ Three roles, each bound to a concrete `runner/model` pair at run submission
 - **Reviewers** — 2–5 per council. Each gets its own fresh, read-only pass.
 
 The lineup is submitted per run — since the 2026-07-27 UX pass there is no profile
-picker; profile names (`standard`, `multi`, `multi-optimized`, `high-assurance`)
-survive as display labels and for scripted callers. A typical lineup, and the one
+picker; profile names (`standard`, `multi`, `multi-optimized`) survive as display
+labels and for scripted callers. A typical lineup, and the one
 the eval used:
 
 ```
@@ -209,9 +209,7 @@ prompt instructions are how you get 8/10 worktree escapes. It's enforced in laye
    environment hardening below is what removes them. Each phase session has its
    own phase-output directory. Codex runner phases get the workspace-write sandbox with
    that directory and the run's own temp directory as their only extra writable
-   roots; the shared `/tmp` and host `TMPDIR` are excluded by the runner, while
-   packet workers use `codex exec --sandbox workspace-write`, which keeps the
-   host `TMPDIR` writable. Codex has no
+   roots; the shared `/tmp` and host `TMPDIR` are excluded by the runner. Codex has no
    read-deny setting, so a Codex phase **can** read those credential stores;
    with no network, the only way out is the staged diff, which you review before
    publishing. Environment is hardened for every phase:
@@ -231,7 +229,7 @@ prompt instructions are how you get 8/10 worktree escapes. It's enforced in laye
    deletions in the handoff. Restore sparse entries with
    `git sparse-checkout add <directory>` before deleting.
    Renames stage as a delete plus an add. Untracked nested repositories stage as
-   gitlinks, whose commit ids are included in review and packet snapshots.
+   gitlinks, whose commit ids are included in review snapshots.
 4. **The validation gate is not sandboxed.** It runs the base ref's commands the
    way CI would, in the worktree the implementer wrote — so the scripts behind
    `npm test` are model-authored code. It gets no provider credentials
@@ -293,19 +291,6 @@ fixes, and a finished spec loop is never audited again. A council decision (retr
 or proceed) is keyed to the subject its round reviewed, so it never carries over to
 an edited diff. Operator feedback clears the implementation cursor, restarting the
 loop at round 1.
-
-## Work packages (high-assurance)
-
-Default profiles hand the implementer one phase brief — no decomposition. The
-`high-assurance` profile adds bounded **packets**: an orchestrator-routed planning
-phase emits up to 12 packet manifests (`objective`, `risk`, `allowedPaths`,
-`invariants`, `acceptanceCriteria`, `dependencies`), and the driver validates the
-plan mechanically — no overlapping path leases, no dependency cycles. Each packet
-runs its own implement → driver-run gate → `packet-gate` promotion cycle, and only
-gated packets' paths feed the final stage allowlist. A packet whose runtime fails
-twice after its worker started stops for manual recovery rather than looping
-forever; a Stop or a cezar restart mid-packet releases the lease and resumes
-without spending that budget.
 
 ## The numbers
 
@@ -380,6 +365,5 @@ tasks cannot start a writing harness workflow.
 `CEZ_DRY_RUN=1` leaves live harness probes and execution unavailable, including
 recovery, so offline testing cannot invoke a real reviewer or writing agent.
 Stored review evidence remains readable. Ordinary harness feedback restarts
-implementation and its validation/review gates. A completed, staged
-`high-assurance` packet run requires a new task for further changes; interrupted
-packet runs and no-action decisions can still resume.
+implementation and its validation/review gates; no-action decisions can still
+resume.

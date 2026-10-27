@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { pinWorktreeGitDir, pinnedGitEnv } from '../git-pin.js';
 import { readHarnessFsEntry } from './fs-read.js';
-import { harnessDiff, normalizeHarnessIndex, preserveAndRestorePacket, resetIndexToHead, snapshotHarnessReviewSubject, snapshotHarnessStageSubject } from './driver.js';
+import { harnessDiff, normalizeHarnessIndex, resetIndexToHead, snapshotHarnessReviewSubject, snapshotHarnessStageSubject } from './driver.js';
 
 const script = new URL('../../vendor/skills/cez-harness/scripts/harness.mjs', import.meta.url).pathname;
 
@@ -48,43 +48,6 @@ describe('PR #925 review: round 9 path sets', { timeout: 60_000 }, () => {
     return { subgit, commit, first };
   };
 
-  const packet = (body: string, allowedPaths = ['src']) => {
-    const worker = join(root, 'codex');
-    fs.writeFileSync(worker, `#!${process.execPath}\nconst fs = require('node:fs'); const cp = require('node:child_process');\n${body}\n`, { mode: 0o755 });
-    const risks = { low: 1, medium: 1, high: 1, critical: 1 };
-    const config = join(root, 'config.json');
-    fs.writeFileSync(config, JSON.stringify({ agentHarness: {
-      version: 1, delivery: { mode: 'stage-only' }, models: {
-        worker: { family: 'openai', model: 'test', adapter: 'command', reasoningEffort: 'high', roles: ['worker'],
-          workerSecurity: { network: 'disabled', remoteWrites: 'disabled', refWrites: 'disabled', enforcedBy: 'codex-workspace-write-sandbox' },
-          commands: { worker: [worker, 'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral', '--config', 'model_reasoning_effort={reasoningEffort}', '--sandbox', 'workspace-write', '--cd', '{worktree}', '--model', '{model}', '-'] } },
-        reviewer: { family: 'deepseek', model: 'test', adapter: 'command', roles: ['reviewer'],
-          commands: { review: [process.execPath, '-e', 'process.stdout.write(JSON.stringify({verdict:"approve",findings:[],notes:[]}))'] } },
-      }, profiles: { test: { workers: ['worker'], reviewers: ['reviewer'], reviewPolicy: { mode: 'all-required' }, packetPolicy: {
-        mode: 'adversarial', reviewersByRisk: risks, minimumFamiliesByRisk: risks, verificationReviewers: 1,
-        lenses: ['correctness'], separateFixer: true, maxFixCycles: 1, blockingSeverities: ['blocker', 'major'],
-        budgets: { maxWorkerInvocations: 1, maxReviewerInvocations: 2, maxFixerInvocations: 1, maxReviewInputBytes: 1_000_000 },
-      } } },
-    } }));
-    const manifest = join(root, 'manifest.json');
-    fs.writeFileSync(manifest, JSON.stringify({ version: 1, id: 'scope', title: 'scope', objective: 'edit src only', risk: 'low', allowedPaths,
-      invariants: ['preserve other paths'], acceptanceCriteria: ['scope respected'] }));
-    const result = runtime('packet-run', '--config', config, '--profile', 'test', '--manifest', manifest, '--run-dir', join(cwd, '.ai/packet'));
-    expect(result.stdout, result.stderr).not.toBe('');
-    return JSON.parse(result.stdout) as { status: string; error?: string };
-  };
-
-  it.each(['staged', 'intent-to-add'] as const)('[r9-scope] packet detects a %s move from outside into its allowed directory', (kind) => {
-    const result = packet(`cp.execFileSync('git', ['mv', 'outside/a', 'src/moved']);
-${kind === 'intent-to-add' ? "cp.execFileSync('git', ['reset', '-q', 'HEAD', '--', 'outside/a', 'src/moved']); cp.execFileSync('git', ['add', '-N', 'src/moved']);" : ''}`);
-    expect(result.status).toBe('blocked');
-    expect(result.error).toContain('changed paths outside its lease: outside/a');
-  });
-
-  it('guard: [r9-scope] an in-scope move still reaches validation', () => {
-    expect(packet("cp.execFileSync('git', ['mv', 'src/x', 'src/moved']);")).toMatchObject({ status: 'awaiting_validation' });
-  });
-
   it('[r9-stage-scope] the real runtime refuses a rename whose source is outside the stage allowlist', () => {
     const start = join(root, 'start.json'); expect(runtime('capture', '--output', start).status).toBe(0);
     git('mv', 'outside/a', 'src/moved');
@@ -106,49 +69,6 @@ ${kind === 'intent-to-add' ? "cp.execFileSync('git', ['reset', '-q', 'HEAD', '--
     expect(JSON.parse(prepared.stdout).subjectSha256).toBe(createHash('sha256').update(reviewed).digest('hex'));
     expect(runtime('stage', '--start-state', start, '--paths-file', paths).status).toBe(0);
     expect(Buffer.from(git('diff', '--cached', '--no-ext-diff', '--binary', 'HEAD', '--'))).toEqual(reviewed);
-  });
-
-  it.each([false, true])('[r9-packet-gitlink] packet detects commit movement in an outside gitlink (tracked=%s)', (tracked) => {
-    const sub = nested(tracked); const before = tracked ? sub.commit('second\n') : sub.first;
-    const after = sub.commit('third\n'); sub.subgit('reset', '--hard', before);
-    const result = packet(`cp.execFileSync('git', ['-C', 'sub', 'reset', '--hard', ${JSON.stringify(after)}]); fs.writeFileSync('src/x', 'edit\\n');`);
-    expect(result.status).toBe('blocked'); expect(result.error).toContain('changed paths outside its lease: sub');
-  });
-
-  it.each([false, true])('guard: [r9-packet-gitlink] an unchanged outside gitlink permits an in-scope edit (tracked=%s)', (tracked) => {
-    const sub = nested(tracked); if (tracked) sub.commit('second\n');
-    expect(packet("fs.writeFileSync('src/x', 'edit\\n');")).toMatchObject({ status: 'awaiting_validation' });
-  });
-
-  it.each(['spanning', 'only outside', 'sparse-index'])('[r9-restore] restores a packet with absent skip-worktree entries: %s', async (kind) => {
-    git('sparse-checkout', 'set', '--cone', ...(kind === 'sparse-index' ? ['--sparse-index'] : []), 'src');
-    const paths = kind === 'only outside' ? ['outside'] : ['src', 'outside'];
-    if (kind !== 'only outside') write('src/a.txt', 'inside edit\n');
-    write('outside/new', 'packet addition\n');
-    const artifact = join(root, 'packet.patch');
-    expect(await preserveAndRestorePacket(cwd, paths, artifact)).toBe(artifact);
-    expect(fs.readFileSync(artifact, 'utf8')).toContain('packet addition');
-    expect(fs.readFileSync(join(cwd, 'src/a.txt'), 'utf8')).toBe('base\n');
-    expect(fs.existsSync(join(cwd, 'outside/new'))).toBe(false);
-    for (const path of ['outside/a', 'outside/b']) expect(fs.existsSync(join(cwd, path))).toBe(false);
-    expect(git('status', '--porcelain')).toBe('');
-  });
-
-  it.each(['full', 'sparse materialized'])('guard: [r9-restore] restores existing entries and removes packet additions: %s', async (kind) => {
-    if (kind === 'sparse materialized') git('sparse-checkout', 'set', '--cone', 'src');
-    write('outside/a', 'edit\n'); write('outside/new', 'packet addition\n');
-    if (kind === 'sparse materialized') write('outside/b', 'base\n');
-    expect(await preserveAndRestorePacket(cwd, ['outside'], join(root, 'packet.patch'))).toBe(join(root, 'packet.patch'));
-    expect(fs.readFileSync(join(cwd, 'outside/a'), 'utf8')).toBe('base\n');
-    expect(fs.existsSync(join(cwd, 'outside/new'))).toBe(false);
-  });
-
-  it('guard: [r9-restore] an in-cone packet leaves out-of-cone files absent', async () => {
-    git('sparse-checkout', 'set', '--cone', 'src'); write('src/a.txt', 'edit\n'); write('src/new', 'addition\n');
-    await preserveAndRestorePacket(cwd, ['src'], join(root, 'packet.patch'));
-    expect(fs.readFileSync(join(cwd, 'src/a.txt'), 'utf8')).toBe('base\n');
-    expect(fs.existsSync(join(cwd, 'src/new'))).toBe(false);
-    for (const path of ['outside/a', 'outside/b']) expect(fs.existsSync(join(cwd, path))).toBe(false);
   });
 
   it.each([false, true])('[r9-gitlink] snapshots change when the nested commit moves (tracked=%s)', async (tracked) => {

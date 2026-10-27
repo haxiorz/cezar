@@ -208,7 +208,6 @@ import { toPastedContent, type PastedContent, type RunManager, type StartRunInpu
 import {
   councilDecisionDetail,
   createLedger,
-  harnessFeedbackClosedReason,
   readLedger,
   saveLedger,
 } from '../harness/ledger.ts';
@@ -4955,7 +4954,6 @@ export function createApp(deps: ServerDeps) {
               implementer: body.roles.implementer,
               reviewers: body.roles.reviewers,
               reviewPolicy: 'quorum' as const,
-              packetized: false,
             },
           }
         : resolveHarnessPlan(profile, agentic.agentHarness);
@@ -5832,8 +5830,6 @@ export function createApp(deps: ServerDeps) {
               409,
             );
           }
-          const feedbackClosed = harnessFeedbackClosedReason(read.ledger);
-          if (feedbackClosed) return c.json({ error: feedbackClosed }, 409);
           const pending = read.ledger.pendingMessages.filter((message) => !message.consumedAt);
           if (pending.length >= MAX_QUEUED_MESSAGES) {
             return c.json(

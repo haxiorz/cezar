@@ -26,11 +26,6 @@ const config = {
       reviewers: ['codex', 'deepseek'],
       reviewPolicy: { mode: 'all-required' },
     },
-    'high-assurance': {
-      workers: ['codex'],
-      reviewers: ['codex', 'deepseek'],
-      reviewPolicy: { mode: 'all-required' },
-    },
   },
 };
 
@@ -39,22 +34,20 @@ describe('resolveHarnessPlan', () => {
     const result = resolveHarnessPlan('standard', undefined);
     expect(result).toMatchObject({
       ok: true,
-      plan: { implementer: { runner: 'claude' }, reviewers: [], packetized: false },
+      plan: { implementer: { runner: 'claude' }, reviewers: [] },
     });
   });
 
   it.each([
-    ['optimized', 0, false],
-    ['multi', 2, false],
-    ['multi-optimized', 2, false],
-    ['high-assurance', 2, true],
-  ] as const)('resolves %s as a driven plan', (profile, reviewers, packetized) => {
+    ['optimized', 0],
+    ['multi', 2],
+    ['multi-optimized', 2],
+  ] as const)('resolves %s as a driven plan', (profile, reviewers) => {
     const result = resolveHarnessPlan(profile, config);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.plan.reviewers).toHaveLength(reviewers);
-    expect(result.plan.packetized).toBe(packetized);
-    if (profile.includes('optimized') || profile === 'high-assurance') {
+    if (profile.includes('optimized')) {
       expect(result.plan.implementer).toMatchObject({
         runner: 'codex',
         model: 'gpt-5.6-sol',

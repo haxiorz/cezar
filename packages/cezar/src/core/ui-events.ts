@@ -395,7 +395,7 @@ export interface UiImageEvent {
  * Driver-level events for cez-harness runs. Unlike the item events these are
  * NOT emitted by backend mappers — the harness phase driver (RunManager
  * side) emits them, like `ask.requested` — so they carry run-level state:
- * phase transitions, model readiness, council rounds, packet lifecycle, and
+ * phase transitions, model readiness, council rounds, and
  * the staged handoff. Payloads mirror the harness ledger's own shapes and
  * are deliberately loose here: the ledger schema (`src/harness/types.ts`) is
  * authoritative, and the UI treats these as replaceable snapshots.
@@ -414,11 +414,6 @@ export interface UiHarnessReadinessUpdatedEvent {
 export interface UiHarnessCouncilUpdatedEvent {
   type: 'harness.council.updated';
   council: Record<string, unknown>;
-}
-
-export interface UiHarnessPacketUpdatedEvent {
-  type: 'harness.packet.updated';
-  packet: Record<string, unknown>;
 }
 
 export interface UiHarnessStageUpdatedEvent {
@@ -452,7 +447,6 @@ export type UiEvent =
   | UiHarnessPhaseUpdatedEvent
   | UiHarnessReadinessUpdatedEvent
   | UiHarnessCouncilUpdatedEvent
-  | UiHarnessPacketUpdatedEvent
   | UiHarnessStageUpdatedEvent
   | UiHarnessFeedbackAppliedEvent;
 

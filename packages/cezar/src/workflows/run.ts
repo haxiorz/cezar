@@ -162,7 +162,7 @@ import {
   type HarnessDriverHost,
   type HarnessRolesInput,
 } from '../harness/driver.ts';
-import { createLedger, harnessFeedbackClosedReason, readLedger, saveLedger } from '../harness/ledger.ts';
+import { createLedger, readLedger, saveLedger } from '../harness/ledger.ts';
 import { releaseLedgerIssueClaim, releaseLedgerIssueClaimUnlessParked } from '../harness/issue-claim.ts';
 import { HARNESS_FIX_ISSUE, HARNESS_TEXT_ONLY_ERROR, isHarnessWorkflow } from '../harness/workflows.ts';
 import {
@@ -3586,7 +3586,7 @@ export class RunManager {
       resumed = { ok: true };
     } else if (run.harness) {
       // The driver resumes from its ledger; prompt text would arrive as operator feedback and
-      // restart implementation — or be refused outright for implemented packet work (PR #925 review).
+      // restart implementation (PR #925 review).
       resumed = this.continueRun(runId, {}, true);
     } else {
       // Legacy records without a recoverable definition and standalone continuations retain
@@ -4884,16 +4884,7 @@ export class RunManager {
                 ? { kind: 'issue', id: run.harness.issueId, text: run.task }
                 : { kind: 'brief', text: run.task },
             });
-      if (ledger.effectiveProfile === 'high-assurance' && ledger.stage.status === 'staged') {
-        return {
-          ok: false,
-          error: 'Completed high-assurance harness runs require a new task for feedback; packet leases cannot be reopened safely.',
-        };
-      }
       const continuationText = opts.text?.trim();
-      // A plain Continue still resumes an implemented high-assurance run; text cannot reach it.
-      const feedbackClosed = continuationText ? harnessFeedbackClosedReason(ledger) : null;
-      if (feedbackClosed) return { ok: false, error: feedbackClosed };
       let queuedBoundaryMessage:
         | { id: string; text: string; createdAt: string }
         | undefined;

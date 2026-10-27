@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { pinWorktreeGitDir } from '../git-pin.js';
-import { harnessDiff, normalizeHarnessIndex, preserveAndRestorePacket, resetIndexToHead, snapshotHarnessReviewSubject, snapshotHarnessStageSubject } from './driver.js';
+import { harnessDiff, normalizeHarnessIndex, resetIndexToHead, snapshotHarnessReviewSubject, snapshotHarnessStageSubject } from './driver.js';
 
 const script = new URL('../../vendor/skills/cez-harness/scripts/harness.mjs', import.meta.url).pathname;
 
@@ -172,19 +172,7 @@ describe('PR #925 review: round 7 runtime and index guards', () => {
     expect(packet.subject.bytes).toBe(Buffer.byteLength(git('diff', '--binary', 'HEAD', '--', 'src/a.txt')));
   });
 
-  it('[r7-path-batches] driver packet diff and restore bound every path argv', async () => {
-    const paths = Array.from({ length: 400 }, (_, i) => `src/${String(i).padStart(5, '0')}-${'x'.repeat(100)}.txt`);
-    for (const path of paths) write(path, 'base\n');
-    git('add', 'src'); git('commit', '-qm', 'many tracked paths');
-    for (const path of paths) write(path, 'edited\n');
-    const calls = traceGit();
-    const patch = await preserveAndRestorePacket(cwd, paths, join(root, 'packet.patch'));
-    expect(fs.readFileSync(patch!, 'utf8').match(/^diff --git /gm)).toHaveLength(paths.length);
-    expect(git('diff', 'HEAD')).toBe('');
-    for (const line of calls()) expect(Buffer.byteLength(line), 'path arguments stay bounded').toBeLessThan(34_000);
-  }, 30_000);
-
-  it('guard: [r7-path-batches] packet diff keeps literal scope and excludes unrelated edits', async () => {
+  it('guard: [r7-path-batches] harnessDiff keeps literal scope and excludes unrelated edits', async () => {
     write('src/a.txt', 'allowed\n'); write('outside/edit', 'unrelated\n');
     const diff = await harnessDiff(cwd, ['src/a.txt'], join(root, 'private-index'));
     expect(diff.toString()).toContain('+allowed'); expect(diff.toString()).not.toContain('unrelated');

@@ -7,7 +7,7 @@ import { createQueryClient } from '@/api/query-client'
 import type { ApiRun, HarnessLedgerResponse } from '@open-mercato/cezar-api-client'
 import { Toaster, resetToasts } from '@/components/ui/toaster'
 
-import { TaskHarnessPacketsRoute, TaskHarnessReviewRoute } from './task-harness'
+import { TaskHarnessReviewRoute } from './task-harness'
 
 class FakeEventSource {
   static instances: FakeEventSource[] = []
@@ -51,7 +51,7 @@ const run: ApiRun = {
   archived: false,
   steps: [],
   harness: {
-    profile: 'high-assurance',
+    profile: 'multi',
     workflow: 'cez-harness-implement-feature',
   },
 }
@@ -60,8 +60,8 @@ function ledger(): HarnessLedgerResponse {
   return {
     version: 2,
     workflow: 'cez-harness-implement-feature',
-    requestedProfile: 'high-assurance',
-    effectiveProfile: 'high-assurance',
+    requestedProfile: 'multi',
+    effectiveProfile: 'multi',
     snapshotSeq: 10,
     phases: [
       {
@@ -138,20 +138,10 @@ function ledger(): HarnessLedgerResponse {
         ],
       },
     ],
-    packets: [
-      {
-        id: 'pk-1',
-        originalId: 'pk-1',
-        title: 'Replay guard',
-        state: 'implementing',
-        risk: 'high',
-        paths: ['src/runs/store.ts'],
-      },
-    ],
     invocations: [
       {
-        id: 'packet-pk-1',
-        phaseId: 'packet-pk-1',
+        id: 'implement',
+        phaseId: 'implement',
         role: 'implementer',
         binding: { runner: 'codex', model: 'gpt-5.6-sol' },
         status: 'completed',
@@ -225,18 +215,14 @@ function stubApi(snapshot: () => HarnessLedgerResponse = ledger, record: ApiRun 
   return sent
 }
 
-function renderRoute(kind: 'review' | 'packets') {
+function renderRoute() {
   return render(
     <QueryClientProvider client={createQueryClient()}>
-      <MemoryRouter initialEntries={[`/tasks/r1/${kind}`]}>
+      <MemoryRouter initialEntries={['/tasks/r1/review']}>
         <Routes>
           <Route
             path="/tasks/:id/review"
             element={<TaskHarnessReviewRoute />}
-          />
-          <Route
-            path="/tasks/:id/packets"
-            element={<TaskHarnessPacketsRoute />}
           />
         </Routes>
         <Toaster />
@@ -257,11 +243,11 @@ afterEach(() => {
 })
 
 describe('harness review route', () => {
-  it.each(['review', 'packets'] as const)('shows only harness progress on the %s tab', async (tab) => {
+  it('shows only harness progress on the review tab', async () => {
     stubApi(ledger, {
       ...run, steps: [{ id: 'stage', name: 'Stage', kind: 'check', status: 'done', iterations: 1, tokensUsed: 0 }],
     })
-    const { container } = renderRoute(tab)
+    const { container } = renderRoute()
     await screen.findByRole('heading', { name: 'Build billing' })
     expect(container.querySelector('[data-slot="harness-status-bar"]')).not.toBeNull()
     expect(container.querySelector('[data-slot="workflow-steps"]')).toBeNull()
@@ -274,7 +260,7 @@ describe('harness review route', () => {
       ...ledger(),
       outcome: { status: 'blocked', blockingReasons: ['implementation council did not reach quorum'] },
     }))
-    renderRoute('review')
+    renderRoute()
     await screen.findByText('This run is blocked')
     expect(screen.queryByRole('button', { name: 'Accept risk' })).toBeNull()
     expect(screen.queryByLabelText('Reason for accepting contested result')).toBeNull()
@@ -284,7 +270,7 @@ describe('harness review route', () => {
     let snapshot = ledger()
     snapshot.councils[0]!.round = 3
     const sent = stubApi(() => snapshot)
-    renderRoute('review')
+    renderRoute()
     await screen.findAllByText('Compatibility alias is not replay-safe')
     snapshot = {
       ...ledger(), snapshotSeq: 11, councils: [],
@@ -312,7 +298,7 @@ describe('harness review route', () => {
 
   it('renders the durable council matrix and preserves findings after explicit risk acceptance', async () => {
     const sent = stubApi()
-    renderRoute('review')
+    renderRoute()
 
     expect(await screen.findByRole('heading', { name: 'Council review' })).not.toBeNull()
     expect(screen.getByText('Compatibility alias is not replay-safe')).not.toBeNull()
@@ -350,43 +336,6 @@ describe('harness review route', () => {
     })
     expect(await screen.findByText('Contested result accepted')).not.toBeNull()
     expect(screen.getByText('Compatibility alias is not replay-safe')).not.toBeNull()
-  })
-})
-
-describe('high-assurance packet route', () => {
-  it('reconstructs from the ledger and applies a newer recovery packet event in place', async () => {
-    stubApi()
-    renderRoute('packets')
-
-    expect(await screen.findByRole('heading', { name: 'Replay guard' })).not.toBeNull()
-    expect(screen.getByText('implementing')).not.toBeNull()
-    expect(screen.getByText('src/runs/store.ts')).not.toBeNull()
-    expect(screen.getByRole('link', { name: 'Packets' }).getAttribute('aria-current')).toBe('page')
-    expect(FakeEventSource.instances).toHaveLength(1)
-    expect(FakeEventSource.instances[0]?.url).toBe('/api/v1/runs/r1/events')
-
-    act(() => {
-      FakeEventSource.instances[0]?.emit('ui-event', {
-        seq: 11,
-        ts: '2026-07-26T10:00:11.000Z',
-        type: 'harness.packet.updated',
-        packet: {
-          id: 'pk-1-resume-2',
-          originalId: 'pk-1',
-          effectiveId: 'pk-1-resume-2',
-          title: 'Replay guard',
-          state: 'gated',
-          risk: 'high',
-          attempt: 2,
-          paths: ['src/runs/store.ts'],
-        },
-      })
-    })
-
-    await waitFor(() => expect(screen.getByText('gated')).not.toBeNull())
-    expect(screen.getByText(/recovery attempt 2/i)).not.toBeNull()
-    expect(screen.getAllByRole('heading', { name: 'Replay guard' })).toHaveLength(1)
-    expect(screen.getByText(/Leases released · evidence bound to diff/i)).not.toBeNull()
   })
 })
 

@@ -95,7 +95,7 @@ describe('harness lifecycle boundaries', () => {
   });
 
   // PR #925 review (fourth round): the usage-limit auto-resume sent its prompt as a Continue
-  // message, which a harness run treats as operator feedback — refused for implemented packets.
+  // message, which a harness run treats as operator feedback.
   it('auto-resumes a usage-limited harness run from its ledger, sending no feedback', async () => {
     const run = store.createRun({ title: 't', workflow: workflow.name, task: 'Fix issue #642', steps: [] });
     store.updateRun(run.id, {
@@ -103,7 +103,7 @@ describe('harness lifecycle boundaries', () => {
       error: 'phase "fix-2" failed: rate limit exceeded — try again in 42 minutes',
       workflowDef: workflow,
       autoResumeAt: new Date(Date.now() - 1_000).toISOString(),
-      harness: { profile: 'high-assurance', workflow: workflow.name },
+      harness: { profile: 'multi', workflow: workflow.name },
       steps: [{
         id: 'fix-2',
         name: 'Fix',
@@ -113,7 +113,7 @@ describe('harness lifecycle boundaries', () => {
         error: 'rate limit exceeded — try again in 42 minutes',
       }],
     } as never);
-    const ledger = createLedger({ workflow: workflow.name, requestedProfile: 'high-assurance', subject: { kind: 'issue', id: '642', text: 'Fix issue #642' } });
+    const ledger = createLedger({ workflow: workflow.name, requestedProfile: 'multi', subject: { kind: 'issue', id: '642', text: 'Fix issue #642' } });
     ledger.phases.push({ id: 'implement', name: 'Implement', kind: 'agent', status: 'done', attempts: 1, artifacts: {} });
     saveLedger(join(root, '.ai/cezar'), run.id, ledger);
 
@@ -218,39 +218,12 @@ describe('harness lifecycle boundaries', () => {
     expect(runHarnessDriver).toHaveBeenCalledOnce();
   }, 15_000);
 
-  it('refuses to reopen completed packet leases as an unrestricted model session', () => {
-    const run = store.createRun({ title: 't', workflow: workflow.name, task: 'Fix issue #642', steps: [] });
-    store.updateRun(run.id, { status: 'review', workflowDef: workflow, harness: { profile: 'high-assurance', workflow: workflow.name } });
-    const ledger = createLedger({ workflow: workflow.name, requestedProfile: 'high-assurance', subject: { kind: 'issue', id: '642', text: 'Fix issue #642' } });
-    ledger.stage.status = 'staged';
-    ledger.outcome = { status: 'ready', blockingReasons: [] };
-    saveLedger(join(root, '.ai/cezar'), run.id, ledger);
-    expect(manager.continueRun(run.id, { text: 'Change the accepted work.' })).toMatchObject({ ok: false, error: expect.stringContaining('new task') });
-    expect(store.getRun(run.id)?.status).toBe('review');
-    expect(store.getRun(run.id)?.steps).toEqual([]);
-  });
-
-  // PR #925 review: text after an HA run's implement phase could never be consumed.
-  it('refuses Continue text once high-assurance packet work is implemented, but still resumes', () => {
+  it('reconsiders a no-action outcome when Continue brings new evidence', () => {
     manager.dispose();
     manager = new RunManager(store, root, { semaphore: new WorkspaceSemaphore({ initial: { maxParallel: 0 } }) });
     const run = store.createRun({ title: 't', workflow: workflow.name, task: 'Fix issue #642', steps: [] });
-    store.updateRun(run.id, { status: 'failed', workflowDef: workflow, harness: { profile: 'high-assurance', workflow: workflow.name } });
-    const ledger = createLedger({ workflow: workflow.name, requestedProfile: 'high-assurance', subject: { kind: 'issue', id: '642', text: 'Fix issue #642' } });
-    ledger.phases.push({ id: 'implement', name: 'Implement', kind: 'agent', status: 'done', attempts: 1, artifacts: {} });
-    saveLedger(join(root, '.ai/cezar'), run.id, ledger);
-
-    expect(manager.continueRun(run.id, { text: 'Also rename the helper.' })).toMatchObject({ ok: false, error: expect.stringContaining('new task') });
-    expect(loadLedger(join(root, '.ai/cezar'), run.id)?.pendingMessages).toEqual([]);
-    expect(manager.continueRun(run.id)).toEqual({ ok: true });
-  });
-
-  it('reconsiders high-assurance no-action outcomes before packet leases exist', () => {
-    manager.dispose();
-    manager = new RunManager(store, root, { semaphore: new WorkspaceSemaphore({ initial: { maxParallel: 0 } }) });
-    const run = store.createRun({ title: 't', workflow: workflow.name, task: 'Fix issue #642', steps: [] });
-    store.updateRun(run.id, { status: 'done', workflowDef: workflow, harness: { profile: 'high-assurance', workflow: workflow.name } });
-    const ledger = createLedger({ workflow: workflow.name, requestedProfile: 'high-assurance', subject: { kind: 'issue', id: '642', text: 'Fix issue #642' } });
+    store.updateRun(run.id, { status: 'done', workflowDef: workflow, harness: { profile: 'multi', workflow: workflow.name } });
+    const ledger = createLedger({ workflow: workflow.name, requestedProfile: 'multi', subject: { kind: 'issue', id: '642', text: 'Fix issue #642' } });
     ledger.outcome = { status: 'no-action', blockingReasons: [] };
     saveLedger(join(root, '.ai/cezar'), run.id, ledger);
 

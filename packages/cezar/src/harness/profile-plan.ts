@@ -22,7 +22,6 @@ export interface ResolvedHarnessPlan {
   implementer: ResolvedRunnerRef;
   reviewers: ResolvedReviewerRef[];
   reviewPolicy: 'advisory' | 'all-required' | 'quorum';
-  packetized: boolean;
 }
 
 export type ResolveHarnessPlanResult =
@@ -60,7 +59,7 @@ function runnerRef(id: string, entry: Record<string, unknown>): ResolvedRunnerRe
 }
 
 /**
- * Resolve one of the five public profiles against the trusted agentHarness
+ * Resolve one of the four public profiles against the trusted agentHarness
  * config. No fallback is implicit: a missing profile/model or unusable worker
  * is a preflight error with the exact binding named.
  */
@@ -78,7 +77,6 @@ export function resolveHarnessPlan(
         implementer: host,
         reviewers: [],
         reviewPolicy: 'advisory',
-        packetized: false,
       },
     };
   }
@@ -107,14 +105,8 @@ export function resolveHarnessPlan(
     ? configured.reviewers.filter((id): id is string => typeof id === 'string')
     : [];
 
-  const needsWorker =
-    profile === 'optimized' ||
-    profile === 'multi-optimized' ||
-    profile === 'high-assurance';
-  const needsCouncil =
-    profile === 'multi' ||
-    profile === 'multi-optimized' ||
-    profile === 'high-assurance';
+  const needsWorker = profile === 'optimized' || profile === 'multi-optimized';
+  const needsCouncil = profile === 'multi' || profile === 'multi-optimized';
   if (needsWorker && workers.length === 0) {
     return { ok: false, error: `profile "${profile}" requires a configured worker` };
   }
@@ -184,7 +176,6 @@ export function resolveHarnessPlan(
       implementer,
       reviewers,
       reviewPolicy,
-      packetized: profile === 'high-assurance',
     },
   };
 }

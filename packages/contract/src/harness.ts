@@ -11,7 +11,6 @@ export const harnessProfileSchema = z.enum([
   'optimized',
   'multi',
   'multi-optimized',
-  'high-assurance',
 ]);
 export type HarnessProfile = z.infer<typeof harnessProfileSchema>;
 
@@ -289,22 +288,6 @@ export const harnessCouncilRecordSchema = z.looseObject({
 });
 export type HarnessCouncilRecord = z.infer<typeof harnessCouncilRecordSchema>;
 
-export const harnessPacketRecordSchema = z.looseObject({
-  id: z.string(),
-  originalId: z.string().optional(),
-  effectiveId: z.string().optional(),
-  title: z.string().optional(),
-  risk: z.string().optional(),
-  state: z.string().optional(),
-  status: z.string().optional(),
-  paths: z.array(z.string()).optional(),
-  dependsOn: z.array(z.string()).optional(),
-  attempt: z.number().optional(),
-  error: z.string().optional(),
-  result: z.record(z.string(), z.unknown()).optional(),
-});
-export type HarnessPacketRecord = z.infer<typeof harnessPacketRecordSchema>;
-
 export const harnessInvocationRecordSchema = z.looseObject({
   id: z.string(),
   phaseId: z.string(),
@@ -449,7 +432,6 @@ export const harnessLedgerResponseSchema = z.looseObject({
   phases: z.array(harnessPhaseRecordSchema),
   models: z.array(harnessModelRecordSchema),
   councils: z.array(harnessCouncilRecordSchema),
-  packets: z.array(harnessPacketRecordSchema),
   invocations: z.array(harnessInvocationRecordSchema),
   pendingMessages: z.array(harnessPendingMessageRecordSchema),
   decisions: z.array(harnessDecisionRecordSchema).optional(),

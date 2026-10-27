@@ -48,19 +48,6 @@ export function advisorCouncilResultMaxBytes(
   return Math.min(256 * 1024 * 1024, 1_000_000 + Math.max(1, parts) * 2_000_000 * 4);
 }
 
-/** Allow for normalized findings, formatted review/aggregate copies and transcripts (PR #925 review). */
-export function packetLedgerResultMaxBytes(budgets?: {
-  maxReviewerInvocations?: unknown;
-  maxWorkerInvocations?: unknown;
-  maxFixerInvocations?: unknown;
-}): number {
-  const count = (value: unknown, fallback: number) =>
-    typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : fallback;
-  const reviews = count(budgets?.maxReviewerInvocations, 32);
-  const workers = count(budgets?.maxWorkerInvocations, 1) + count(budgets?.maxFixerInvocations, 2);
-  return Math.min(256 * 1024 * 1024, 1_000_000 + reviews * 2_000_000 * 16 + workers * 20_000 * 6);
-}
-
 export interface PromptFinding {
   severity: 'blocker' | 'major' | 'minor' | 'nit';
   title: string;

@@ -512,26 +512,6 @@ function sanitizedCliEnvironment(additions, trustedNames = []) {
   );
   text = replaceRequired(
     text,
-    `import { createHash } from 'node:crypto'`,
-    `import { createHash, randomUUID } from 'node:crypto'`,
-    'atomic packet ledger nonce',
-  );
-  text = replaceRequired(
-    text,
-    `function savePacketLedger(ledgerPath, ledger) {
-  mkdirSync(dirname(ledgerPath), { recursive: true })
-  writeFileSync(ledgerPath, \`\${JSON.stringify(ledger, null, 2)}\\n\`)
-}`,
-    `function savePacketLedger(ledgerPath, ledger) {
-  mkdirSync(dirname(ledgerPath), { recursive: true })
-  const temp = \`\${ledgerPath}.\${process.pid}.\${randomUUID()}.tmp\`
-  writeFileSync(temp, \`\${JSON.stringify(ledger, null, 2)}\\n\`)
-  renameSync(temp, ledgerPath)
-}`,
-    'atomic packet ledger write',
-  );
-  text = replaceRequired(
-    text,
     `async function runCommandReviewer(id, model, prompt, worktree, timeoutMs = null) {
   const before = captureGitState(worktree)
   const { result, provenance } = await runCommandAdapter(model, 'review', { worktree, prompt, timeoutMs: timeoutMs ?? undefined })
@@ -782,76 +762,11 @@ function buildWorktreeDiff(worktree, paths = []) {`,
   );
   text = replaceRequired(
     text,
-    `    try {
-      const stat = lstatSync(absolute)
-      const content = stat.isSymbolicLink() ? Buffer.from(\`symlink:\${readlinkSync(absolute)}\`) : readFileSync(absolute)
-      state[path] = sha256(Buffer.concat([Buffer.from(\`\${stat.mode}\\0\`), content]))
-    } catch {`,
-    `    try {
-      const entry = readEntryNoFollow(absolute)
-      // Same digest as before; a directory or special file still reads as absent.
-      if (entry.kind === 'other') throw new Error('not a file')
-      const content = entry.kind === 'symlink' ? Buffer.from(\`symlink:\${entry.target}\`) : entry.content
-      state[path] = sha256(Buffer.concat([Buffer.from(\`\${entry.mode}\\0\`), content]))
-    } catch {`,
-    'dirty-state descriptor read',
-  );
-  text = replaceRequired(
-    text,
     `function workerEnvironment(additions) {
   return sanitizedCliEnvironment({`,
     `function workerEnvironment(additions, trustedNames = []) {
   return sanitizedCliEnvironment({`,
     'worker trusted environment signature',
-  );
-  text = replaceRequired(
-    text,
-    `function dirtyPaths(worktree) {
-  return [...new Set([
-    ...nullSeparated(git(['diff', '--name-only', '-z'], worktree)),
-    ...nullSeparated(git(['diff', '--cached', '--name-only', '-z'], worktree)),
-    ...nullSeparated(git(['ls-files', '--others', '--exclude-standard', '-z'], worktree))
-  ])].sort()
-}`,
-    `function dirtyPaths(worktree) {
-  return [...new Set([
-    ...nullSeparated(git(['diff', '--no-renames', '--name-only', '-z'], worktree)),
-    ...nullSeparated(git(['diff', '--cached', '--no-renames', '--name-only', '-z'], worktree)),
-    ...nullSeparated(git(['ls-files', '--others', '--exclude-standard', '-z'], worktree))
-  ].map((path) => path.replace(/\\/$/, '')))].sort()
-}
-
-// Match staging's gitlink commit without entering the nested repository (PR #925 review).
-function dirtyGitlinks(worktree, paths) {
-  const directories = paths.filter((path) => {
-    try { return lstatSync(join(worktree, path)).isDirectory() } catch { return false }
-  })
-  const commits = new Map()
-  if (!directories.length) return commits
-  const temporary = mkdtempSync(join(git(['rev-parse', '--absolute-git-dir'], worktree).trim(), 'cez-packet-index-'))
-  const env = { GIT_INDEX_FILE: join(temporary, 'index') }
-  try {
-    git(['read-tree', 'HEAD'], worktree, { env })
-    gitAddPaths(['add', '--sparse'], directories, worktree, { env })
-    for (const entry of nullSeparated(git(['ls-files', '--stage', '-z'], worktree, { env }))) {
-      const match = /^160000 ([a-f0-9]+) 0\\t(.*)$/s.exec(entry)
-      if (match) commits.set(match[2], match[1])
-    }
-  } finally { rmSync(temporary, { recursive: true, force: true }) }
-  return commits
-}`,
-    'complete dirty paths and gitlink commits',
-  );
-  text = replaceRequired(
-    text,
-    `  const state = {}
-  for (const path of dirtyPaths(worktree)) {`,
-    `  const state = {}
-  const paths = dirtyPaths(worktree)
-  const gitlinks = dirtyGitlinks(worktree, paths)
-  for (const path of paths) {
-    if (gitlinks.has(path)) { state[path] = \`gitlink:\${gitlinks.get(path)}\`; continue }`,
-    'packet gitlink snapshot',
   );
   text = replaceRequired(
     text,

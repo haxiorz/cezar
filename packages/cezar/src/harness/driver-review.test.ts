@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { pinWorktreeGitDir } from '../git-pin.js';
-import { harnessDiff, preserveAndRestorePacket, resetIndexToHead } from './driver.js';
+import { harnessDiff, resetIndexToHead } from './driver.js';
 
 const script = new URL('../../vendor/skills/cez-harness/scripts/harness.mjs', import.meta.url).pathname;
 
@@ -33,53 +33,6 @@ describe('PR #925 review: Git recovery boundaries', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
   const pin = () => pinWorktreeGitDir(cwd, join(cwd, '.git'));
-
-  it('[round2-4] preserves new bytes in a numbered artifact when a partial patch already exists', async () => {
-    pin();
-    const patch = join(root, 'failed.patch');
-    fs.writeFileSync(patch, 'partial old patch');
-    fs.writeFileSync(`${patch}.1`, 'another prior recovery');
-    fs.writeFileSync(join(cwd, 'src/a.txt'), 'bytes never saved before\n');
-    const saved = await preserveAndRestorePacket(cwd, ['src'], patch);
-    expect(saved).toBe(`${patch}.2`);
-    expect(fs.readFileSync(saved ?? patch, 'utf8')).toContain('+bytes never saved before');
-    expect(fs.readFileSync(patch, 'utf8')).toBe('partial old patch');
-    expect(fs.readFileSync(`${patch}.1`, 'utf8')).toBe('another prior recovery');
-    expect(git('diff', 'HEAD')).toBe('');
-  });
-
-  it('[round2-4] publishes a complete temporary patch by rename before restoring', async () => {
-    pin();
-    fs.writeFileSync(join(cwd, 'src/a.txt'), 'complete snapshot\n');
-    const patch = join(root, 'failed.patch');
-    const rename = fs.renameSync;
-    const publish = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
-      expect(fs.readFileSync(from, 'utf8')).toContain('+complete snapshot');
-      expect(fs.readFileSync(join(cwd, 'src/a.txt'), 'utf8')).toBe('complete snapshot\n');
-      rename(from, to);
-    });
-    syncBuiltinESMExports();
-    await preserveAndRestorePacket(cwd, ['src'], patch);
-    expect(publish).toHaveBeenCalledOnce();
-    expect(fs.readdirSync(root).filter((name) => name.includes('.tmp-'))).toEqual([]);
-  });
-
-  it('guard: recovery preserves binary and new files, and leaves unrelated edits', async () => {
-    pin();
-    fs.writeFileSync(join(cwd, 'src/a.txt'), Buffer.from([0, 1, 2, 3]));
-    fs.writeFileSync(join(cwd, 'src/new.txt'), 'new worker file\n');
-    fs.writeFileSync(join(cwd, 'untouched.txt'), 'operator edit\n');
-    const outside = join(root, 'outside');
-    const patch = join(root, 'failed.patch');
-    fs.writeFileSync(outside, 'keep');
-    const saved = await preserveAndRestorePacket(cwd, ['src'], patch);
-    expect(fs.readFileSync(saved ?? patch, 'utf8')).toContain('GIT binary patch');
-    expect(fs.readFileSync(saved ?? patch, 'utf8')).toContain('+new worker file');
-    expect(fs.readFileSync(outside, 'utf8')).toBe('keep');
-    expect(fs.readFileSync(join(cwd, 'src/a.txt'), 'utf8')).toBe('base\n');
-    expect(fs.existsSync(join(cwd, 'src/new.txt'))).toBe(false);
-    expect(fs.readFileSync(join(cwd, 'untouched.txt'), 'utf8')).toBe('operator edit\n');
-  });
 
   it('[round2-8] sizes the subject asynchronously from the real index stat cache', async () => {
     pin();
@@ -140,16 +93,6 @@ describe('PR #925 review: Git recovery boundaries', () => {
     await expect(harnessDiff(cwd, [], join(root, 'scratch-index'))).rejects.toThrow('no pinned Git directory');
     expect(fs.readFileSync(join(cwd, '.git/index'))).toEqual(index);
     expect(fs.existsSync(join(root, 'scratch-index'))).toBe(false);
-  });
-
-  it('[round2-11] rejects a dangling symlink parent before preservation or restoration', async () => {
-    pin();
-    fs.rmSync(join(cwd, 'src'), { recursive: true });
-    fs.symlinkSync(join(root, 'not-created'), join(cwd, 'src'));
-    const patch = join(root, 'failed.patch');
-    await expect(preserveAndRestorePacket(cwd, ['src/a.txt'], patch)).rejects.toThrow('symlink parent');
-    expect(fs.lstatSync(join(cwd, 'src')).isSymbolicLink()).toBe(true);
-    expect(fs.existsSync(patch)).toBe(false);
   });
 
   it('guard: an unpinned index reset leaves ordinary repository staging untouched', () => {

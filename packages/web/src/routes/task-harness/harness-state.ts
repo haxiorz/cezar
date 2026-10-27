@@ -2,7 +2,6 @@ import type {
   HarnessCouncilRecord,
   HarnessInvocationRecord,
   HarnessLedgerResponse,
-  HarnessPacketRecord,
   HarnessPhaseRecord,
   RunEvent,
 } from '@open-mercato/cezar-api-client'
@@ -39,11 +38,6 @@ function councilFrom(value: unknown): HarnessCouncilRecord | null {
     : null
 }
 
-function packetFrom(value: unknown): HarnessPacketRecord | null {
-  const row = record(value)
-  return row && typeof row.id === 'string' ? (row as HarnessPacketRecord) : null
-}
-
 function invocationFrom(value: unknown): HarnessInvocationRecord | null {
   const row = record(value)
   return row && typeof row.id === 'string' && typeof row.phaseId === 'string'
@@ -66,7 +60,6 @@ export function mergeHarnessLedger(
     phases: [...(snapshot.phases ?? [])],
     models: [...(snapshot.models ?? [])],
     councils: [...(snapshot.councils ?? [])],
-    packets: [...(snapshot.packets ?? [])],
     invocations: [...(snapshot.invocations ?? [])],
     pendingMessages: [...(snapshot.pendingMessages ?? [])],
     stage: { ...snapshot.stage },
@@ -108,21 +101,6 @@ export function mergeHarnessLedger(
             ledger.councils,
             council,
             (a, b) => a.round === b.round && a.kind === b.kind,
-          ),
-        }
-      }
-      continue
-    }
-    if (event.type === 'harness.packet.updated') {
-      const packet = packetFrom(event.packet)
-      if (packet) {
-        ledger = {
-          ...ledger,
-          packets: replaceBy(
-            ledger.packets,
-            packet,
-            (a, b) =>
-              (a.originalId ?? a.id) === (b.originalId ?? b.id),
           ),
         }
       }

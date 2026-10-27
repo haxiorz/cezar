@@ -33,7 +33,6 @@ export const HARNESS_PROFILE_OPTIONS: readonly HarnessProfileOption[] = [
   { id: 'optimized', label: 'Worker offload', desc: 'A sandboxed worker model (e.g. Codex) writes the code; Claude directs and reviews.' },
   { id: 'multi', label: 'Review council', desc: 'Several independent models (DeepSeek, Kimi, GLM…) each review the diff; findings are merged.' },
   { id: 'multi-optimized', label: 'Council + worker', desc: 'The worker writes the code and the full multi-model council reviews it.' },
-  { id: 'high-assurance', label: 'High assurance', desc: 'Bounded work packets, blind risk-scaled reviews, and evidence gates — maximum rigor.' },
 ]
 
 export interface HarnessMode {

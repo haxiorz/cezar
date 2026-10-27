@@ -58,13 +58,10 @@ const TaskNotesRoute = lazy(() =>
 const TaskWorkspaceRoute = lazyRoute('task-workspace', () =>
   import('./routes/task-workspace/task-workspace').then((m) => ({ default: m.TaskWorkspaceRoute })),
 )
-/** The harness ledger pages (spec 2026-07-23-harness-orchestration) — Review for every harness
- *  run, Packets for high-assurance ones. Not workspace views: each renders its own run header. */
+/** The harness ledger page (spec 2026-07-23-harness-orchestration) — Review for every harness
+ *  run. Not a workspace view: it renders its own run header. */
 const TaskHarnessReviewRoute = lazyRoute('task-harness-review', () =>
   import('./routes/task-harness/task-harness').then((m) => ({ default: m.TaskHarnessReviewRoute })),
-)
-const TaskHarnessPacketsRoute = lazyRoute('task-harness-packets', () =>
-  import('./routes/task-harness/task-harness').then((m) => ({ default: m.TaskHarnessPacketsRoute })),
 )
 
 /** Lazy because the repo view renders through the `<Diff>` facade and the Shiki singleton —
@@ -374,14 +371,6 @@ export const AppRoutes = memo(function AppRoutes() {
           element={
             <Suspense fallback={<ThreadLoading />}>
               <TaskHarnessReviewRoute />
-            </Suspense>
-          }
-        />
-        <Route
-          path="tasks/:id/packets"
-          element={
-            <Suspense fallback={<ThreadLoading />}>
-              <TaskHarnessPacketsRoute />
             </Suspense>
           }
         />

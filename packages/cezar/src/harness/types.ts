@@ -21,7 +21,6 @@ export const HARNESS_PROFILES = [
   'optimized',
   'multi',
   'multi-optimized',
-  'high-assurance',
 ] as const;
 
 export type HarnessProfile = (typeof HARNESS_PROFILES)[number];
@@ -87,7 +86,7 @@ export const validationCheckSchema = z.object({
 
 export type HarnessValidationCheck = z.infer<typeof validationCheckSchema>;
 
-/** Reserved council/packet shapes (spec Phases 3/5) — persisted loosely so a
+/** Reserved council shapes (spec Phase 3) — persisted loosely so a
  *  newer ledger read by this version never fails validation on them. */
 const looseRecordSchema = z.record(z.string(), z.unknown());
 
@@ -308,7 +307,6 @@ const harnessLedgerBaseShape = {
   models: z.array(harnessModelSchema).default([]),
   phases: z.array(harnessPhaseSchema).default([]),
   councils: z.array(looseRecordSchema).default([]),
-  packets: z.array(looseRecordSchema).default([]),
   validation: z.array(validationCheckSchema).default([]),
   /** The gate run once on the untouched worktree at capture time. A red
    *  baseline is the repo's debt, not this run's: later gates block only on

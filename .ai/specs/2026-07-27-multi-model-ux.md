@@ -207,6 +207,9 @@ the reader reconstructing it from the rail.
  (c) delete `TaskHarnessPacketsRoute`.
 This is a product call, not a layout one — flagged, not assumed.
 
+*Resolved 2026-10-28 (PR #925 review): (c). The `high-assurance` profile, its packet subsystem and
+the Packets tab were removed from the first release; nothing the composer starts reached them.*
+
 **F2 — Rail vs. tab at narrow widths.** Below 1280px the rail becomes a
 bottom drawer. Confirm that is preferred over keeping the Review tab.
 

@@ -98,7 +98,7 @@ import { writeClipboard } from '@/lib/clipboard'
  */
 /** Which run-detail tab this header instance sits above — drives the active underline.
  *  A prop rather than a route match so the header stays testable with a bare render. */
-export type RunTab = 'session' | 'review' | 'packets' | 'changes' | 'commits' | 'files' | 'graph' | 'notes' | 'terminal' | 'preview'
+export type RunTab = 'session' | 'review' | 'changes' | 'commits' | 'files' | 'graph' | 'notes' | 'terminal' | 'preview'
 
 /** Which runs the reader has expanded the phone-width meta row for (#765). A module-level map for
  *  the same reason `WorkflowSteps` keeps one (`openByRun` in step-rail.tsx) — and it has to be BOTH
@@ -417,21 +417,13 @@ function RunHeaderView({
   )
 }
 
-/** The harness ledger pages (spec 2026-07-23-harness-orchestration): Review for every harness
- *  run, Packets only where the high-assurance profile cuts work into packets. */
+/** The harness ledger page (spec 2026-07-23-harness-orchestration): Review for every harness run. */
 function HarnessTabs({ run, tab }: { run: ApiRun; tab: RunTab }) {
   if (!run.harness) return null
   return (
-    <>
-      <TabLink to={`/tasks/${run.id}/review`} active={tab === 'review'}>
-        Review
-      </TabLink>
-      {run.harness.profile === 'high-assurance' ? (
-        <TabLink to={`/tasks/${run.id}/packets`} active={tab === 'packets'}>
-          Packets
-        </TabLink>
-      ) : null}
-    </>
+    <TabLink to={`/tasks/${run.id}/review`} active={tab === 'review'}>
+      Review
+    </TabLink>
   )
 }
 

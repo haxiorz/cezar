@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { pinWorktreeGitDir } from '../git-pin.js';
-import { preserveAndRestorePacket, resetIndexToHead } from './driver.js';
+import { resetIndexToHead } from './driver.js';
 import { advisorCouncilResultMaxBytes } from './prompt-budget.js';
 import { HarnessRuntime } from './runtime.js';
 
@@ -76,23 +76,6 @@ describe('PR #925 review: round 3 runtime seam', () => {
     expect(runtime('verify', '--start-state', start)).toMatchObject({ status: 'clean', drift: [] });
   });
 
-  it('[round3-5] restores a directory replaced by a regular file', async () => {
-    rmSync(join(cwd, 'src'), { recursive: true });
-    writeFileSync(join(cwd, 'src'), 'replacement file\n');
-    const patch = join(root, 'typechange.patch');
-    expect(await preserveAndRestorePacket(cwd, ['src'], patch)).toBe(patch);
-    expect(readFileSync(patch, 'utf8')).toContain('+replacement file');
-    expect(readFileSync(join(cwd, 'src/nested/a.txt'), 'utf8')).toBe('base\n');
-    expect(git('diff', 'HEAD')).toBe('');
-  });
-
-  it('guard: a dangling symlink parent still refuses restore before writing an artifact', async () => {
-    rmSync(join(cwd, 'src'), { recursive: true });
-    symlinkSync(join(root, 'absent'), join(cwd, 'src'));
-    const patch = join(root, 'symlink.patch');
-    await expect(preserveAndRestorePacket(cwd, ['src'], patch)).rejects.toThrow('symlink parent');
-    expect(existsSync(patch)).toBe(false);
-  });
 });
 
 describe('PR #925 review: council result bounds', () => {

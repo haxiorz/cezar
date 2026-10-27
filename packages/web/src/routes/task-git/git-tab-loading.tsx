@@ -7,9 +7,9 @@ import { Button } from '@/components/ui/button'
 
 import type { RunTab } from '../task-thread/run-header'
 
-/** Every run tab that renders through these loading surfaces — the standalone harness pages
- *  (`review`, `packets`) have their own. */
-type GitRunTab = Exclude<RunTab, 'session' | 'review' | 'packets'>
+/** Every run tab that renders through these loading surfaces — the standalone harness page
+ *  (`review`) has its own. */
+type GitRunTab = Exclude<RunTab, 'session' | 'review'>
 
 const LOADING_TITLE: Record<GitRunTab, string> = {
   changes: 'Loading changes…',

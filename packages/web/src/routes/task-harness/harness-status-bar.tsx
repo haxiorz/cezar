@@ -116,7 +116,7 @@ function phaseDurationMs(phase: HarnessPhaseRecord): number {
 const STAGE_OF: ReadonlyArray<[RegExp, string]> = [
   [/^(preflight|capture|qualify|diagnose)/i, 'Preparation'],
   [/spec/i, 'Specification'],
-  [/^(implement|validate|fix|packet)/i, 'Implementation'],
+  [/^(implement|validate|fix)/i, 'Implementation'],
   [/(review|council)/i, 'Review'],
   [/^stage/i, 'Handoff'],
 ]

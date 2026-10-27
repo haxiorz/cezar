@@ -744,14 +744,12 @@ describe('harness form rules (spec 2026-07-23-harness-orchestration)', () => {
       'optimized',
       'multi',
       'multi-optimized',
-      'high-assurance',
     ])
     expect(HARNESS_PROFILE_OPTIONS.map((p) => p.label)).toEqual([
       'Claude solo',
       'Worker offload',
       'Review council',
       'Council + worker',
-      'High assurance',
     ])
   })
 
