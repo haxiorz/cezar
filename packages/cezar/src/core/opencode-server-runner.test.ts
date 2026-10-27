@@ -231,12 +231,13 @@ describe('opencode serve startup', () => {
       (event) => events.push(event),
     );
     void session.result.catch(() => undefined);
-    (child.stderr as PassThrough).write(`${'x'.repeat(1_000)}EADDRINUSE`);
+    // Not EADDRINUSE: a lost port respawns instead of failing (#1537).
+    (child.stderr as PassThrough).write(`${'x'.repeat(1_000)}bad config`);
     (child as unknown as EventEmitter).emit('exit', 1, null);
     await session.result.catch(() => undefined);
     expect(events).toContainEqual({
       type: 'error',
-      message: `opencode: opencode serve exited before it started listening (exit code 1): ${'x'.repeat(790)}EADDRINUSE`,
+      message: `opencode: opencode serve exited before it started listening (exit code 1): ${'x'.repeat(790)}bad config`,
     });
   });
 
@@ -286,7 +287,7 @@ describe('opencode serve startup', () => {
     await session.result;
     expect(spawns).toBe(1);
     expect(events.filter((e) => e.type === 'error')).toEqual([
-      { type: 'error', message: 'opencode: opencode serve exited before it started listening' },
+      { type: 'error', message: 'opencode: opencode serve exited before it started listening (exit code 1): Error: bad config' },
     ]);
     expect(events).toContainEqual({ type: 'note', message: 'opencode serve stderr: Error: bad config' });
   });
@@ -302,7 +303,10 @@ describe('opencode serve startup', () => {
     await session.result;
     expect(spawns).toBe(SERVER_PORT_ATTEMPTS);
     expect(events.filter((e) => e.type === 'error')).toEqual([
-      { type: 'error', message: 'opencode: opencode serve exited before it started listening' },
+      {
+        type: 'error',
+        message: 'opencode: opencode serve exited before it started listening (exit code 1): Error: Unexpected error\n\nServeError',
+      },
     ]);
     expect(events.filter((e) => e.type === 'note')).toHaveLength(1);
   });
