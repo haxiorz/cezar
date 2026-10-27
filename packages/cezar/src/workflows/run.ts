@@ -28,7 +28,7 @@ import {
 } from '../core/private-mcp.ts';
 import { onUsage, registerRunProcess, unregisterRunProcess, type ProcessUsage } from '../core/process-usage.ts';
 import { describeReaped, reapTaskProcesses, taskProcessReapEnabled } from '../core/task-processes.ts';
-import { isUsageLimitMessage, parseUsageLimit } from '../core/usage-limit.ts';
+import { parseUsageLimit } from '../core/usage-limit.ts';
 import { createRunner } from '../core/runner-factory.ts';
 import type { RunnerId } from '../core/agent-runner.ts';
 import { modelConflictsWithRunner, modelNativeToRunner } from '../core/model-presets.ts';
@@ -2324,7 +2324,11 @@ export class RunManager {
               autonomous: run.autonomous,
             }),
           });
-          this.store.updateRun(run.id, { status: 'queued', currentStepId: undefined });
+          // A capture cannot outlive its in-memory round; an in-flight resume can (PR #925 review).
+          this.store.updateRun(run.id, {
+            status: 'queued', currentStepId: undefined,
+            ...(run.autoResumeAttempts === undefined ? { autoResumeAccount: undefined } : {}),
+          });
           this.queue.push(run.id);
           this.store.appendEvent(run.id, {
             type: 'lifecycle',
@@ -7412,12 +7416,15 @@ export class RunManager {
     }
     const captureUsageLimit = (message: string): void => {
       const run = this.store.getRun(runId);
-      if (!phaseResultPath || !run?.harness || !isUsageLimitMessage(message)
+      if (!phaseResultPath || !run?.harness
         || state.cancelled || this.active.get(runId) !== state || state.usageLimitedAccount) return;
+      const capturedAt = Date.now();
+      // A reset-less limit must leave room for a schedulable reviewer (PR #925 review).
+      if (!parseUsageLimit(message, capturedAt)) return;
       // Keep the first account and its deadline paired; an in-flight proof still owns its hold (PR #925 review).
       state.usageLimitedAccount = harnessAccountKey(run, backend);
       state.usageLimitedMessage = message;
-      state.usageLimitedAt = Date.now();
+      state.usageLimitedAt = capturedAt;
       state.usageLimitedSessions = new Set(state.liveSessions);
       this.store.updateRun(runId, { autoResumeAccount: run.autoResumeAccount ?? state.usageLimitedAccount });
     };

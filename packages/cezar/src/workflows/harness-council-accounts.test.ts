@@ -82,12 +82,97 @@ describe('council session ownership (PR #925 review)', () => {
       { concurrent, resultPath, timeoutMs: 20_000 });
   }
 
-  async function failRun(message: string) {
-    sessions[0]!.emit({ type: 'error', message });
-    sessions[0]!.end();
+  async function failRun(message: string, session = sessions[0]!) {
+    session.emit({ type: 'error', message });
+    session.end();
     await expect.poll(() => manager.isActive(runId)).toBe(false);
     expect(store.getRun(runId)?.status).toBe('failed');
   }
+
+  async function restart() {
+    const sessionCount = sessions.length;
+    manager.dispose();
+    sessions[0]!.end();
+    store.flush({ throwOnError: true });
+    store = RunStore.open(join(root, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, root);
+    internals = manager as unknown as typeof internals;
+    await manager.recover();
+    await expect.poll(() => sessions.length, { timeout: 5_000 }).toBe(sessionCount + 1);
+    state = internals.active.get(runId)!;
+    return sessions[sessionCount]!;
+  }
+
+  const resetlessLimits = [
+    { backend: 'opencode' as const, message: 'opencode: usage limit reached: quota exhausted' },
+    { backend: 'codex' as const, message: 'Rate limit reached. Please try again in 1.2s' },
+  ];
+
+  it.each(resetlessLimits)('uses a later Claude reset after a reset-less $backend reviewer fails', async ({ backend, message }) => {
+    const first = phase(backend);
+    await expect.poll(() => sessions.length).toBe(2);
+    const claude = phase('claude');
+    await expect.poll(() => sessions.length).toBe(3);
+    const reset = Math.floor((Date.now() + 3_600_000) / 1000) * 1000;
+    const claudeLimit = `Claude AI usage limit reached|${reset / 1000}`;
+    sessions[1]!.emit({ type: 'error', message });
+    expect(await first).toBe(message);
+    sessions[2]!.emit({ type: 'error', message: claudeLimit });
+    expect(await claude).toBe(claudeLimit);
+    await failRun(`council below quorum: ${message}\n${claudeLimit}`);
+    expect.soft(store.getRun(runId)?.autoResumeAt).toBe(new Date(reset + AUTO_RESUME_GRACE_MS).toISOString());
+    expect.soft(store.getRun(runId)?.autoResumeAccount).toBe('claude:default');
+    expect(manager.accountHolds().deadline).toEqual(new Set(['claude:default']));
+  });
+
+  it.each(resetlessLimits)('guard: a lone reset-less $backend limit schedules nothing', async ({ backend, message }) => {
+    const reviewer = phase(backend);
+    await expect.poll(() => sessions.length).toBe(2);
+    sessions[1]!.emit({ type: 'error', message });
+    expect(await reviewer).toBe(message);
+    await failRun(`council below quorum: ${message}`);
+    expect(store.getRun(runId)?.autoResumeAt).toBeUndefined();
+    expect(manager.accountHolds().deadline.size).toBe(0);
+    expect(manager.accountHolds().inFlight.size).toBe(0);
+  });
+
+  it.each(['running', 'waiting'] as const)('forgets a degraded capture after restarting a %s run before an advisor limit', async (status) => {
+    const reviewer = phase('codex');
+    await expect.poll(() => sessions.length).toBe(2);
+    sessions[1]!.emit({ type: 'error', message: LIMIT });
+    await reviewer;
+    expect(store.getRun(runId)?.autoResumeAccount).toBe('codex:default');
+    expect(store.getRun(runId)?.autoResumeAttempts).toBeUndefined();
+    store.updateRun(runId, { status });
+    const resumed = await restart();
+    expect.soft(store.getRun(runId)?.autoResumeAccount).toBeUndefined();
+    const implement = phase('claude', 'implement', false);
+    await expect.poll(() => sessions.length).toBe(4);
+    sessions[3]!.emit({ type: 'turn-end' });
+    await implement;
+    const reset = Math.floor((Date.now() + 2 * 3_600_000) / 1000) * 1000;
+    await failRun(`advisor failed: Claude AI usage limit reached|${reset / 1000}`, resumed);
+    expect(store.getRun(runId)?.autoResumeAt).toBe(new Date(reset + AUTO_RESUME_GRACE_MS).toISOString());
+    expect.soft(store.getRun(runId)?.autoResumeAccount).toBeUndefined();
+    expect(manager.accountHolds().deadline.size).toBe(0);
+    expect(manager.accountHolds().inFlight.size).toBe(0);
+  });
+
+  it.each([0, 1])('guard: a resume in flight keeps its account across restart (attempts=%s)', async (attempts) => {
+    const reviewer = phase('codex');
+    await expect.poll(() => sessions.length).toBe(2);
+    sessions[1]!.emit({ type: 'error', message: LIMIT });
+    await reviewer;
+    store.updateRun(runId, { autoResumeAttempts: attempts });
+    await restart();
+    expect(store.getRun(runId)).toMatchObject({ autoResumeAccount: 'codex:default', autoResumeAttempts: attempts });
+    const implement = phase('claude', 'implement', false);
+    await expect.poll(() => sessions.length).toBe(4);
+    sessions[3]!.emit({ type: 'turn-end' });
+    await implement;
+    expect(store.getRun(runId)).toMatchObject({ autoResumeAccount: 'codex:default', autoResumeAttempts: attempts });
+    expect(manager.accountHolds().inFlight).toEqual(new Set(['codex:default']));
+  });
 
   it.each([false, true])('expires a degraded council limit before an unrelated failure (next phase=%s)', async (nextPhase) => {
     vi.useFakeTimers({ toFake: ['Date'] });
