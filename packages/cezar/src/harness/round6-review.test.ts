@@ -39,12 +39,13 @@ describe('PR #925 review: round 6 index normalization', () => {
     gitDir = git('rev-parse', '--absolute-git-dir').trim();
     pinWorktreeGitDir(cwd, gitDir);
   });
+  // Removing the benchmark's 10k-file repo can outlast the default hook timeout under load.
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     syncBuiltinESMExports();
     fs.rmSync(root, { recursive: true, force: true });
-  });
+  }, 60_000);
 
   const cases = [
     'plain edit', 'MM', 'touched staged', 'intent-to-add', 'staged new edited',
