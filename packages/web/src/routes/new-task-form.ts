@@ -6,7 +6,6 @@ import type {
   BackendCheck,
   CreateRunInput,
   CreateRunResponse,
-  HarnessCertification,
   HarnessModelRef,
   HarnessPreset,
   HarnessProbeResponse,

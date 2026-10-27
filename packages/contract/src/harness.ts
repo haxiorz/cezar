@@ -113,34 +113,6 @@ export const harnessRunStubSchema = z.object({
 });
 export type HarnessRunStub = z.infer<typeof harnessRunStubSchema>;
 
-/** One role's recorded eval-pack score. */
-export const harnessCertificationRoleSchema = z.object({
-  cases: z.number(),
-  passed: z.number(),
-});
-
-/**
- * Recorded eval-gate evidence for a binding (spec 2026-08-06-eval-gated-model-routing) —
- * resolved server-side from `agentHarness.certifications`. `status` is always present:
- * 'uncertified' means "no valid evidence recorded", 'stale' means the evidence aged out of
- * the freshness window (provenance fields survive so the UI can say what aged). Additive:
- * readiness stays the LIVE measurement; certification is the RECORDED one.
- */
-export const harnessCertificationSchema = z.object({
-  status: z.enum(['certified', 'stale', 'uncertified']),
-  roles: z
-    .object({
-      orchestrator: harnessCertificationRoleSchema.optional(),
-      implementer: harnessCertificationRoleSchema.optional(),
-      reviewer: harnessCertificationRoleSchema.optional(),
-    })
-    .optional(),
-  pack: z.string().optional(),
-  catalogVersion: z.string().optional(),
-  recordedAt: z.string().optional(),
-});
-export type HarnessCertification = z.infer<typeof harnessCertificationSchema>;
-
 export const harnessModelSchema = z.object({
   id: z.string(),
   family: z.string().optional(),
@@ -151,7 +123,6 @@ export const harnessModelSchema = z.object({
   readiness: z.enum(['ready', 'missing', 'failed', 'unknown']).optional(),
   readinessDetail: z.string().optional(),
   binding: z.string().optional(),
-  certification: harnessCertificationSchema.optional(),
   /** A configured binding that makes exactly the call a runner-backed reviewer already makes
    *  (the same trusted endpoint preset and model, or the same `codex exec` review command) —
    *  the composer lists that model once, under the runner spelling. Absent = no equivalent. */
@@ -159,8 +130,8 @@ export const harnessModelSchema = z.object({
 });
 export type HarnessModel = z.infer<typeof harnessModelSchema>;
 
-/** One `/harness/status` roster row: always its profiles and recorded certification, never a
- *  live readiness (that is the probe's). Assignable to `HarnessModel`. */
+/** One `/harness/status` roster row: always its profiles, never a live readiness (that is the
+ *  probe's). Assignable to `HarnessModel`. */
 export const harnessStatusModelSchema = z.object({
   id: z.string(),
   family: z.string().optional(),
@@ -168,7 +139,6 @@ export const harnessStatusModelSchema = z.object({
   adapter: z.string().optional(),
   roles: z.array(z.string()),
   profiles: z.array(harnessProfileSchema),
-  certification: harnessCertificationSchema,
   sameAs: harnessModelSchema.shape.sameAs,
 });
 export type HarnessStatusModel = z.infer<typeof harnessStatusModelSchema>;

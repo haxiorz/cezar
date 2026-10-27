@@ -1,6 +1,8 @@
 # Eval-gated model routing — analysis of the OM harness feedback and the incorporation plan
 
 > Phases 2–3 are cross-repo (open-mercato / skills) and gated on the Phase 0 decisions; Phase 1 is implementable in this repo today.
+>
+> **2026-10-28 — Phase 1 withdrawn from the first release (PR #925 review).** No producer of `agentHarness.certifications` exists yet, so the roster chips, picker badges, "Use best certified" and the status field were removed before they became a protected contract. Re-land Phase 1 with the certify lane that writes the receipts.
 
 **Goal:** Replace the offline, human-mediated learning loop behind cezar's model routing with a recorded evaluation gate: a model binding becomes (or stays) a default for a role only when the OM harness case suite, replayed per role, says so.
 

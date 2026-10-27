@@ -50,7 +50,6 @@ afterEach(() => {
 
 const BUNDLED_RUNTIME = { installed: true, source: 'bundled' as const, commit: 'a'.repeat(40) }
 const NO_BASE_DRIFT = { configured: null, remoteDefault: null, stale: false }
-const UNCERTIFIED = { status: 'uncertified' as const }
 
 describe('Settings → Harness', () => {
   it('renders the model roster with bindings and roles', async () => {
@@ -62,8 +61,8 @@ describe('Settings → Harness', () => {
       runtime: BUNDLED_RUNTIME,
       base: NO_BASE_DRIFT,
       models: [
-        { id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard', 'multi'], certification: UNCERTIFIED },
-        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', roles: ['worker', 'reviewer'], profiles: ['multi'], certification: UNCERTIFIED },
+        { id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard', 'multi'] },
+        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', roles: ['worker', 'reviewer'], profiles: ['multi'] },
       ],
     })
     mount()
@@ -81,7 +80,7 @@ describe('Settings → Harness', () => {
       driven: ['standard'],
       runtime: BUNDLED_RUNTIME,
       base: NO_BASE_DRIFT,
-      models: [{ id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard'], certification: UNCERTIFIED }],
+      models: [{ id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard'] }],
     })
     mount()
     await waitFor(() => expect(screen.getByText(/no external models configured/i)).toBeTruthy())
@@ -96,7 +95,7 @@ describe('Settings → Harness', () => {
       driven: ['standard'],
       runtime: BUNDLED_RUNTIME,
       base: NO_BASE_DRIFT,
-      models: [{ id: 'claude', roles: ['host', 'reviewer'], profiles: ['standard'], certification: UNCERTIFIED }],
+      models: [{ id: 'claude', roles: ['host', 'reviewer'], profiles: ['standard'] }],
     })
     mount()
     await waitFor(() => expect(screen.getByRole('link', { name: /configure models/i })).toBeTruthy())
@@ -105,39 +104,6 @@ describe('Settings → Harness', () => {
     const check = screen.getByRole('link', { name: /check setup/i })
     expect(check.getAttribute('href')).toContain('cez-setup-harness')
     expect(decodeURIComponent(check.getAttribute('href') ?? '')).toContain('--check')
-  })
-
-  it("shows each binding's recorded certification — receipt, staleness, or an honest uncertified", async () => {
-    serve({
-      enabled: true,
-      configured: true,
-      profiles: ['standard', 'multi'],
-      driven: ['standard'],
-      runtime: BUNDLED_RUNTIME,
-      base: NO_BASE_DRIFT,
-      models: [
-        {
-          id: 'deepseek', family: 'deepseek', model: 'deepseek-v4-pro', roles: ['reviewer'], profiles: ['multi'],
-          certification: {
-            status: 'certified',
-            roles: { reviewer: { cases: 28, passed: 27 } },
-            pack: 'omh',
-            catalogVersion: '203',
-            recordedAt: '2026-08-01T00:00:00.000Z',
-          },
-        },
-        {
-          id: 'kimi', family: 'moonshot', model: 'kimi-code/k3', roles: ['reviewer'], profiles: ['multi'],
-          certification: { status: 'uncertified' },
-        },
-      ],
-    })
-    mount()
-    await waitFor(() => expect(screen.getByText('certified · reviewer 27/28 · omh')).toBeTruthy())
-    const chips = document.querySelectorAll('[data-slot="harness-certification"]')
-    expect(chips).toHaveLength(2)
-    expect([...chips].map((chip) => chip.getAttribute('data-status'))).toEqual(['certified', 'uncertified'])
-    expect(screen.getByText('uncertified')).toBeTruthy()
   })
 
   it('explains the gate instead of the roster while the multiModel flag is off', async () => {
@@ -151,7 +117,7 @@ describe('Settings → Harness', () => {
       runtime: BUNDLED_RUNTIME,
       base: NO_BASE_DRIFT,
       models: [
-        { id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard'], certification: UNCERTIFIED },
+        { id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard'] },
       ],
     })
     mount()
