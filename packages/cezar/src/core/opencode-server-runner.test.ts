@@ -34,29 +34,6 @@ vi.mock('node:child_process', async (importOriginal) => {
   };
 });
 
-/** Records tree teardowns instead of performing them: a fake child's made-up
- *  pid would otherwise have `process.kill(-pid)` reach a real process group on
- *  the host. What the teardown then does — group SIGTERM, then a
- *  group-liveness-checked SIGKILL — is exercised against real processes in
- *  `process-tree.test.ts`. */
-const treeHook = vi.hoisted(() => ({
-  recording: false,
-  calls: [] as Array<[unknown, number]>,
-}));
-
-vi.mock('./process-tree.ts', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./process-tree.ts')>();
-  return {
-    ...actual,
-    // Only fake children are recorded; the real-server tests below keep the real teardown.
-    terminateAgentProcessTree: (child: never, graceMs: number) => {
-      if (!treeHook.recording) return actual.terminateAgentProcessTree(child, graceMs);
-      treeHook.calls.push([child, graceMs]);
-      return setTimeout(() => {}, 0);
-    },
-  };
-});
-
 /**
  * #858 — the OpenCode half of #844. `opencode serve` installs its own SIGTERM handler, so the
  * teardown watchdog must decide "is it dead?" from a real exit, never from `ChildProcess.killed`,
@@ -64,7 +41,7 @@ vi.mock('./process-tree.ts', async (importOriginal) => {
  * unreachable for exactly the server it exists for: one leaked process per teardown, and — because
  * every teardown path here is followed by `await this.exited` — a session result that never settles.
  */
-describe('teardown for an opencode server that survives SIGTERM', () => {
+describe('SIGTERM→SIGKILL escalation for an opencode server that survives SIGTERM', () => {
   function signallableChild(): {
     child: ChildProcessWithoutNullStreams;
     signals: NodeJS.Signals[];
@@ -78,13 +55,12 @@ describe('teardown for an opencode server that survives SIGTERM', () => {
       stderr: new PassThrough(),
       exitCode: null as number | null,
       signalCode: null as NodeJS.Signals | null,
-      // Delivery flips `killed` whether or not the child dies, and a server that
-      // handles SIGTERM runs on with the flag already true — the exact state the
-      // old guard read as "already gone".
-      killed: true,
+      killed: false,
       pid: 5150,
+      // Node's semantics: delivery flips `killed` whether or not the child dies.
       kill: (signal: NodeJS.Signals) => {
         signals.push(signal);
+        Object.assign(child, { killed: true });
         return true;
       },
     }) as unknown as ChildProcessWithoutNullStreams;
@@ -98,14 +74,11 @@ describe('teardown for an opencode server that survives SIGTERM', () => {
   function withFakeChild(run: (fake: ReturnType<typeof signallableChild>) => void): void {
     const fake = signallableChild();
     spawnHook.override = () => fake.child;
-    treeHook.calls.length = 0;
-    treeHook.recording = true;
     vi.useFakeTimers();
     try {
       run(fake);
     } finally {
       vi.useRealTimers();
-      treeHook.recording = false;
       spawnHook.override = null;
     }
   }
@@ -121,48 +94,69 @@ describe('teardown for an opencode server that survives SIGTERM', () => {
     return session;
   }
 
-  it('tears the tree down after end() even once Node flagged the server as killed', () => {
+  it('escalates after end() even once Node flagged the server as killed', () => {
     withFakeChild((fake) => {
       const session = startSession(0);
 
       session.end();
-      // Delivered, not dead — the state that used to disable the teardown.
+      expect(fake.signals).toEqual(['SIGTERM']);
+      // Delivered, not dead — the state that used to disable the escalation.
       expect(fake.child.killed).toBe(true);
       expect(fake.child.exitCode).toBeNull();
-      expect(treeHook.calls).toEqual([[fake.child, KILL_GRACE_MS]]);
+
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM', 'SIGKILL']);
     });
   });
 
-  it('tears the tree down on the wall-clock timeout path', () => {
+  it('escalates on the wall-clock timeout path', () => {
     withFakeChild((fake) => {
       startSession(20);
 
       vi.advanceTimersByTime(20);
-      expect(treeHook.calls).toEqual([[fake.child, KILL_GRACE_MS]]);
+      expect(fake.signals).toEqual(['SIGTERM']);
+
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM', 'SIGKILL']);
     });
   });
 
-  it('tears down once per session however many teardown paths run', () => {
+  it('stops escalating once the server really exits after SIGTERM', () => {
+    withFakeChild((fake) => {
+      const session = startSession(0);
+
+      session.end();
+      expect(fake.signals).toEqual(['SIGTERM']);
+      fake.exit(143);
+
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM']);
+    });
+  });
+
+  it('sends one SIGTERM per session however many teardown paths run', () => {
     withFakeChild((fake) => {
       const session = startSession(0);
 
       // `interrupt()` on the deadline and the result promise's `finally` both
-      // reach terminate() for the same session; the teardown runs once.
+      // reach terminate() for the same session; the escalation is armed once.
       session.interrupt();
       session.end();
       session.interrupt();
-      expect(treeHook.calls).toEqual([[fake.child, KILL_GRACE_MS]]);
+      expect(fake.signals).toEqual(['SIGTERM']);
+
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM', 'SIGKILL']);
     });
   });
 
-  it('does not touch a server that exited before the teardown', () => {
+  it('does not signal at all when the server exited before the teardown', () => {
     withFakeChild((fake) => {
       const session = startSession(0);
       fake.exit(0);
 
       session.end();
       vi.advanceTimersByTime(KILL_GRACE_MS);
-      expect(treeHook.calls).toEqual([]);
       expect(fake.signals).toEqual([]);
     });
   });

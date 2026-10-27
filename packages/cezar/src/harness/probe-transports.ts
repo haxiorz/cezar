@@ -7,7 +7,7 @@ import { delimiter, join, resolve } from 'node:path';
 import { PROFILE_ENV_VAR } from '../core/agent-profiles.js';
 import { ClaudeCliRunner } from '../core/claude-cli-runner.js';
 import { resolveProfileEnvForRoot } from '../workspace/agent-profiles.js';
-import { trackAgentProcessTree } from '../core/process-tree.js';
+import { trackAgentProcessTree } from './process-tree.js';
 import { advisorCredentialBindingIssue } from './advisor-identity.js';
 import { createModelProber, sharedHarnessProbeCache, type ModelProber, type ProbeRef, type ProbeTransport, type ProbeVerdict } from './probe.js';
 import { harnessChildEnvironment, terminateProcessTree } from './runtime.js';

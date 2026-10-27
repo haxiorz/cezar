@@ -7,7 +7,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import type { AgentEvent } from './agent-runner.ts';
-import { isCezarTerminationExit, isSignalTerminationExit, prependSystemPrompt } from './agent-runner.ts';
+import { isSignalTerminationExit, prependSystemPrompt } from './agent-runner.ts';
 import {
   buildClaudeArgs,
   CLAUDE_HEADLESS_GUIDANCE,
@@ -30,29 +30,6 @@ vi.mock('node:child_process', async (importOriginal) => {
     ...actual,
     spawn: (...args: Parameters<typeof actual.spawn>) =>
       spawnHook.override ? spawnHook.override() : actual.spawn(...args),
-  };
-});
-
-/** Records tree teardowns instead of performing them, but only while a fake
- *  child is installed — the real-process tests in this file need the real
- *  teardown. See the teardown describe below for why a fake child must never
- *  reach `process.kill`. */
-const treeHook = vi.hoisted(() => ({
-  recording: false,
-  calls: [] as Array<[unknown, number]>,
-  /** Children whose group escalation timer actually fired. */
-  escalations: [] as unknown[],
-}));
-
-vi.mock('./process-tree.ts', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./process-tree.ts')>();
-  return {
-    ...actual,
-    terminateAgentProcessTree: (child: never, graceMs: number) => {
-      if (!treeHook.recording) return actual.terminateAgentProcessTree(child, graceMs);
-      treeHook.calls.push([child, graceMs]);
-      return setTimeout(() => treeHook.escalations.push(child), graceMs);
-    },
   };
 });
 
@@ -158,21 +135,6 @@ describe('isSignalTerminationExit', () => {
   });
 });
 
-// PR #925 review: on Windows the tree dies by `taskkill /f`, which Node reports as exit 1.
-describe('isCezarTerminationExit', () => {
-  it('settles a Windows taskkill exit as cezar\'s own teardown', () => {
-    expect(isCezarTerminationExit(1, 'win32')).toBe(true);
-    expect(isCezarTerminationExit(143, 'win32')).toBe(true);
-  });
-
-  it('keeps exit 1 a failure where cezar signals the group itself', () => {
-    expect(isCezarTerminationExit(1, 'linux')).toBe(false);
-    expect(isCezarTerminationExit(1, 'darwin')).toBe(false);
-    expect(isCezarTerminationExit(143, 'darwin')).toBe(true);
-    for (const code of [0, 2, null]) expect(isCezarTerminationExit(code, 'win32')).toBe(false);
-  });
-});
-
 describe('a teardown cezar initiated', () => {
   const stubBin = fileURLToPath(
     new URL('./__fixtures__/claude/stub-ignores-eof-exits-143.mjs', import.meta.url),
@@ -218,24 +180,19 @@ describe('a teardown cezar initiated', () => {
 });
 
 /**
- * #844 — the watchdogs used to ask `!child.killed` before tearing down, but Node
+ * #844 — the watchdogs used to ask `!child.killed` before escalating, but Node
  * sets `killed` the moment a signal is *delivered*. claude installs its own
  * SIGTERM handler, so the flag went true while the process ran on and the
- * teardown that exists for exactly that case was skipped — one leaked CLI per
- * teardown. Every watchdog now follows real termination instead.
- *
- * The teardown itself is `terminateAgentProcessTree` (group SIGTERM, then a
- * group-liveness-checked SIGKILL), and it is asserted here as a call rather than
- * as signals: the module is mocked because a fake child's made-up pid would
- * otherwise have `process.kill(-pid)` signal a real process group on the host.
- * The escalation inside it is exercised against real processes in
- * `process-tree.test.ts`.
+ * SIGKILL that exists for exactly that case was never sent — one leaked CLI per
+ * teardown. The escalation now follows real termination instead.
  */
-describe('teardown for a CLI that survives SIGTERM', () => {
+describe('SIGTERM→SIGKILL escalation for a CLI that survives SIGTERM', () => {
   function signallableChild(): {
     child: ChildProcessWithoutNullStreams;
+    signals: NodeJS.Signals[];
     exit: (code: number) => void;
   } {
+    const signals: NodeJS.Signals[] = [];
     const emitter = new EventEmitter();
     const child = Object.assign(emitter, {
       stdin: new PassThrough(),
@@ -243,37 +200,36 @@ describe('teardown for a CLI that survives SIGTERM', () => {
       stderr: new PassThrough(),
       exitCode: null as number | null,
       signalCode: null as NodeJS.Signals | null,
-      // Node's semantics: delivery flips `killed`; a CLI with its own handler
-      // keeps running with `exitCode` still null. Pre-set here, because that is
-      // the state an earlier signal leaves behind and the one the old guard
-      // silently treated as "already dead".
-      killed: true,
+      killed: false,
       pid: 4242,
-      kill: () => true,
+      // Node's semantics: delivery flips `killed`; a CLI with its own handler
+      // keeps running with `exitCode` still null.
+      kill: (signal: NodeJS.Signals) => {
+        signals.push(signal);
+        Object.assign(child, { killed: true });
+        return true;
+      },
     }) as unknown as ChildProcessWithoutNullStreams;
     const exit = (code: number) => {
       Object.assign(child, { exitCode: code });
       emitter.emit('exit', code, null);
     };
-    return { child, exit };
+    return { child, signals, exit };
   }
 
   function withFakeChild(run: (fake: ReturnType<typeof signallableChild>) => void): void {
     const fake = signallableChild();
     spawnHook.override = () => fake.child;
-    treeHook.calls.length = 0;
-    treeHook.recording = true;
     vi.useFakeTimers();
     try {
       run(fake);
     } finally {
       vi.useRealTimers();
-      treeHook.recording = false;
       spawnHook.override = null;
     }
   }
 
-  it('tears the tree down after end() even though Node already flagged the child as killed', () => {
+  it('escalates after end() even though Node already flagged the child as killed', () => {
     withFakeChild((fake) => {
       const session = new ClaudeCliRunner({ bin: 'claude', timeoutMs: 0 }).startSession({
         userPrompt: 'do it',
@@ -282,47 +238,17 @@ describe('teardown for a CLI that survives SIGTERM', () => {
       session.end();
 
       vi.advanceTimersByTime(EOF_TERM_GRACE_MS);
-      // Delivered, not dead — the state that used to disable the teardown.
+      expect(fake.signals).toEqual(['SIGTERM']);
+      // Delivered, not dead — the state that used to disable the escalation.
       expect(fake.child.killed).toBe(true);
       expect(fake.child.exitCode).toBeNull();
-      expect(treeHook.calls).toEqual([[fake.child, EOF_KILL_GRACE_MS]]);
+
+      vi.advanceTimersByTime(EOF_KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM', 'SIGKILL']);
     });
   });
 
-  it('keeps the group escalation armed after the leader exits on the EOF path (PR #925 review)', async () => {
-    const fake = signallableChild();
-    spawnHook.override = () => fake.child;
-    treeHook.calls.length = 0;
-    treeHook.escalations.length = 0;
-    treeHook.recording = true;
-    vi.useFakeTimers();
-    try {
-      const session = new ClaudeCliRunner({ bin: 'claude', timeoutMs: 0 }).startSession({
-        userPrompt: 'do it',
-        cwd: process.cwd(),
-      });
-      session.end();
-      await vi.advanceTimersByTimeAsync(EOF_TERM_GRACE_MS);
-      expect(treeHook.calls).toEqual([[fake.child, EOF_KILL_GRACE_MS]]);
-
-      // The leader honours SIGTERM; a SIGTERM-ignoring MCP child in its group would not, and
-      // only the escalation still reaches it.
-      (fake.child.stdout as unknown as PassThrough).end();
-      (fake.child.stderr as unknown as PassThrough).end();
-      fake.exit(143);
-      fake.child.emit('close', 143, null);
-      await session.result;
-
-      await vi.advanceTimersByTimeAsync(EOF_KILL_GRACE_MS);
-      expect(treeHook.escalations).toEqual([fake.child]);
-    } finally {
-      vi.useRealTimers();
-      treeHook.recording = false;
-      spawnHook.override = null;
-    }
-  });
-
-  it('tears the tree down on the inactivity timeout path as well', () => {
+  it('escalates on the wall-clock timeout path as well', () => {
     withFakeChild((fake) => {
       const session = new ClaudeCliRunner({ bin: 'claude', timeoutMs: 20 }).startSession({
         userPrompt: 'do it',
@@ -331,7 +257,10 @@ describe('teardown for a CLI that survives SIGTERM', () => {
       void session.result.catch(() => undefined);
 
       vi.advanceTimersByTime(20);
-      expect(treeHook.calls).toEqual([[fake.child, KILL_GRACE_MS]]);
+      expect(fake.signals).toEqual(['SIGTERM']);
+
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM', 'SIGKILL']);
     });
   });
 
@@ -339,8 +268,6 @@ describe('teardown for a CLI that survives SIGTERM', () => {
   it('never kills a session that keeps streaming, only one that went silent for the whole window', async () => {
     const fake = signallableChild();
     spawnHook.override = () => fake.child;
-    treeHook.calls.length = 0;
-    treeHook.recording = true;
     vi.useFakeTimers();
     try {
       const events: AgentEvent[] = [];
@@ -355,10 +282,10 @@ describe('teardown for a CLI that survives SIGTERM', () => {
         await vi.advanceTimersByTimeAsync(800);
       }
       // 4 s of wall clock against a 1 s limit: still alive, because it never went quiet.
-      expect(treeHook.calls).toEqual([]);
+      expect(fake.signals).toEqual([]);
 
       await vi.advanceTimersByTimeAsync(200);
-      expect(treeHook.calls).toEqual([[fake.child, KILL_GRACE_MS]]);
+      expect(fake.signals).toEqual(['SIGTERM']);
       fake.exit(143);
       await session.result;
       const error = events.find((e) => e.type === 'error');
@@ -368,22 +295,24 @@ describe('teardown for a CLI that survives SIGTERM', () => {
       });
     } finally {
       vi.useRealTimers();
-      treeHook.recording = false;
       spawnHook.override = null;
     }
   });
 
-  it('leaves a CLI that really exited alone', () => {
+  it('stops escalating once the CLI really exits after SIGTERM', () => {
     withFakeChild((fake) => {
       const session = new ClaudeCliRunner({ bin: 'claude', timeoutMs: 0 }).startSession({
         userPrompt: 'do it',
         cwd: process.cwd(),
       });
       session.end();
+
+      vi.advanceTimersByTime(EOF_TERM_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM']);
       fake.exit(143);
 
-      vi.advanceTimersByTime(EOF_TERM_GRACE_MS + EOF_KILL_GRACE_MS);
-      expect(treeHook.calls).toEqual([]);
+      vi.advanceTimersByTime(EOF_KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM']);
     });
   });
 
@@ -425,6 +354,102 @@ describe('prependSystemPrompt (codex/opencode delivery)', () => {
 
   it('leaves the user prompt untouched when no systemPrompt is set', () => {
     expect(prependSystemPrompt(undefined, 'do it')).toBe('do it');
+  });
+});
+
+describe('ClaudeCliRunner token usage', () => {
+  it('counts the aggregate result usage without re-adding assistant-frame snapshots', async () => {
+    const mockBin = fileURLToPath(new URL('../../scripts/mock-claude.mjs', import.meta.url));
+    const runner = new ClaudeCliRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const events: AgentEvent[] = [];
+    const cwd = mkdtempSync(join(tmpdir(), 'cez-claude-token-usage-'));
+
+    try {
+      const result = await runner.run(
+        {
+          userPrompt: 'fix the login redirect',
+          cwd,
+          env: {
+            CEZ_HANDOFF_FILE: '',
+            CEZ_MOCK_ARGS_FILE: '',
+            CEZ_TODOS_FILE: '',
+          },
+          sessionId: '5f701b42-382a-4a6e-b831-0ab9e56eff58',
+        },
+        (event) => events.push(event),
+      );
+
+      // The mock emits four assistant usage snapshots before its aggregate
+      // result usage (1,270 input + 185 output). Only the result is authoritative.
+      expect(result.tokensUsed).toBe(1_455);
+      expect(events.filter((event) => event.type === 'token-usage')).toEqual([
+        { type: 'token-usage', tokensUsed: 1_455 },
+      ]);
+    } finally {
+      rmSync(cwd, { force: true, recursive: true });
+    }
+  });
+});
+
+describe('ClaudeCliRunner private MCP (spec 2026-10-07-private-project-mcp)', () => {
+  it('spawns with --mcp-config pointing at a 0600 file that is gone once the session ends', async () => {
+    const mockBin = fileURLToPath(new URL('../../scripts/mock-claude.mjs', import.meta.url));
+    const runner = new ClaudeCliRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const cwd = mkdtempSync(join(tmpdir(), 'cez-claude-private-mcp-'));
+    const argsFile = join(cwd, 'args.ndjson');
+    try {
+      await runner.run({
+        userPrompt: 'do it',
+        cwd,
+        env: { CEZ_HANDOFF_FILE: '', CEZ_MOCK_ARGS_FILE: argsFile, CEZ_TODOS_FILE: '' },
+        allowedTools: ['Read'],
+        mcpServers: [{ name: 'tracker', transport: 'stdio', command: 'tracker-mcp', args: [], env: { TOKEN: 's3cret' }, headers: {} }],
+      });
+      const argv = JSON.parse(readFileSync(argsFile, 'utf8').trim().split('\n')[0]!) as string[];
+      const configPath = argv[argv.indexOf('--mcp-config') + 1]!;
+      expect(argv).toContain('--mcp-config');
+      expect(argv[argv.indexOf('--allowedTools') + 1]).toBe('Read,mcp__tracker');
+      expect(argv.join(' ')).not.toContain('s3cret');
+      expect(existsSync(configPath)).toBe(false);
+    } finally {
+      rmSync(cwd, { force: true, recursive: true });
+    }
+  });
+});
+
+describe('a CLI that dies before reading its prompt', () => {
+  const stubBin = fileURLToPath(
+    new URL('./__fixtures__/claude/stub-exits-before-reading.mjs', import.meta.url),
+  );
+
+  // A failed stdin write surfaces as an async 'error' event on the pipe, not a throw; unhandled,
+  // it crashed the whole cezar process (seen on a fleet hub when the CLI failed to start).
+  it('fails the session instead of crashing the process on EPIPE', async () => {
+    const runner = new ClaudeCliRunner({ bin: stubBin, timeoutMs: 0 });
+    const session = runner.startSession(
+      { userPrompt: 'x'.repeat(8 * 1024 * 1024), cwd: process.cwd() },
+      () => {},
+    );
+    await expect(session.result).rejects.toThrow('claude CLI exited with code 1');
+    // Give a late EPIPE time to surface as an unhandled error, which vitest reports as a failure.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  });
+});
+
+// Spec 2026-10-24 item 9 (eb4b12dc): a gateway's OpenAI-shaped envelope read as its type and message.
+describe('claude result error with a JSON envelope', () => {
+  it('shows the vendor error type and message, not the raw JSON', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'claude-envelope-'));
+    const bin = join(root, 'claude.mjs');
+    const result = 'API Error: 400 [400]: {"error":{"type":"invalid_request_error","message":"model gpt-5 is not available","param":null,"code":null}}';
+    writeFileSync(bin, `#!/usr/bin/env node\nconsole.log(${JSON.stringify(JSON.stringify({ type: 'result', is_error: true, result }))});\nprocess.exit(1);\n`, { mode: 0o755 });
+    try {
+      const errors: string[] = [];
+      await new ClaudeCliRunner({ bin, timeoutMs: 5000 })
+        .run({ cwd: root, userPrompt: 'work' }, (event) => { if (event.type === 'error') errors.push(event.message); })
+        .catch(() => undefined);
+      expect(errors).toContain('API Error: 400 [400]: invalid_request_error: model gpt-5 is not available');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 
@@ -537,100 +562,4 @@ say({ type: 'result', subtype: 'success', is_error: false, result: 'spec finishe
       await rm(dir, { recursive: true, force: true });
     }
   }, 20_000);
-});
-
-describe('ClaudeCliRunner token usage', () => {
-  it('counts the aggregate result usage without re-adding assistant-frame snapshots', async () => {
-    const mockBin = fileURLToPath(new URL('../../scripts/mock-claude.mjs', import.meta.url));
-    const runner = new ClaudeCliRunner({ bin: mockBin, timeoutMs: 60_000 });
-    const events: AgentEvent[] = [];
-    const cwd = mkdtempSync(join(tmpdir(), 'cez-claude-token-usage-'));
-
-    try {
-      const result = await runner.run(
-        {
-          userPrompt: 'fix the login redirect',
-          cwd,
-          env: {
-            CEZ_HANDOFF_FILE: '',
-            CEZ_MOCK_ARGS_FILE: '',
-            CEZ_TODOS_FILE: '',
-          },
-          sessionId: '5f701b42-382a-4a6e-b831-0ab9e56eff58',
-        },
-        (event) => events.push(event),
-      );
-
-      // The mock emits four assistant usage snapshots before its aggregate
-      // result usage (1,270 input + 185 output). Only the result is authoritative.
-      expect(result.tokensUsed).toBe(1_455);
-      expect(events.filter((event) => event.type === 'token-usage')).toEqual([
-        { type: 'token-usage', tokensUsed: 1_455 },
-      ]);
-    } finally {
-      rmSync(cwd, { force: true, recursive: true });
-    }
-  });
-});
-
-describe('ClaudeCliRunner private MCP (spec 2026-10-07-private-project-mcp)', () => {
-  it('spawns with --mcp-config pointing at a 0600 file that is gone once the session ends', async () => {
-    const mockBin = fileURLToPath(new URL('../../scripts/mock-claude.mjs', import.meta.url));
-    const runner = new ClaudeCliRunner({ bin: mockBin, timeoutMs: 60_000 });
-    const cwd = mkdtempSync(join(tmpdir(), 'cez-claude-private-mcp-'));
-    const argsFile = join(cwd, 'args.ndjson');
-    try {
-      await runner.run({
-        userPrompt: 'do it',
-        cwd,
-        env: { CEZ_HANDOFF_FILE: '', CEZ_MOCK_ARGS_FILE: argsFile, CEZ_TODOS_FILE: '' },
-        allowedTools: ['Read'],
-        mcpServers: [{ name: 'tracker', transport: 'stdio', command: 'tracker-mcp', args: [], env: { TOKEN: 's3cret' }, headers: {} }],
-      });
-      const argv = JSON.parse(readFileSync(argsFile, 'utf8').trim().split('\n')[0]!) as string[];
-      const configPath = argv[argv.indexOf('--mcp-config') + 1]!;
-      expect(argv).toContain('--mcp-config');
-      expect(argv[argv.indexOf('--allowedTools') + 1]).toBe('Read,mcp__tracker');
-      expect(argv.join(' ')).not.toContain('s3cret');
-      expect(existsSync(configPath)).toBe(false);
-    } finally {
-      rmSync(cwd, { force: true, recursive: true });
-    }
-  });
-});
-
-describe('a CLI that dies before reading its prompt', () => {
-  const stubBin = fileURLToPath(
-    new URL('./__fixtures__/claude/stub-exits-before-reading.mjs', import.meta.url),
-  );
-
-  // A failed stdin write surfaces as an async 'error' event on the pipe, not a throw; unhandled,
-  // it crashed the whole cezar process (seen on a fleet hub when the CLI failed to start).
-  it('fails the session instead of crashing the process on EPIPE', async () => {
-    const runner = new ClaudeCliRunner({ bin: stubBin, timeoutMs: 0 });
-    const session = runner.startSession(
-      { userPrompt: 'x'.repeat(8 * 1024 * 1024), cwd: process.cwd() },
-      () => {},
-    );
-    await expect(session.result).rejects.toThrow('claude CLI exited with code 1');
-    // Give a late EPIPE time to surface as an unhandled error, which vitest reports as a failure.
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  });
-});
-
-// Spec 2026-10-24 item 9 (eb4b12dc): a gateway's OpenAI-shaped envelope read as its type and message.
-describe('claude result error with a JSON envelope', () => {
-  it('shows the vendor error type and message, not the raw JSON', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'claude-envelope-'));
-    const bin = join(root, 'claude.mjs');
-    const result = 'API Error: 400 [400]: {"error":{"type":"invalid_request_error","message":"model gpt-5 is not available","param":null,"code":null}}';
-    writeFileSync(bin, `#!/usr/bin/env node\nconsole.log(${JSON.stringify(JSON.stringify({ type: 'result', is_error: true, result }))});\nprocess.exit(1);\n`, { mode: 0o755 });
-    try {
-      const errors: string[] = [];
-      await new ClaudeCliRunner({ bin, timeoutMs: 5000 })
-        .run({ cwd: root, userPrompt: 'work' }, (event) => { if (event.type === 'error') errors.push(event.message); })
-        .catch(() => undefined);
-      expect(errors).toContain('API Error: 400 [400]: invalid_request_error: model gpt-5 is not available');
-    } finally { rmSync(root, { recursive: true, force: true }); }
-  });
 });

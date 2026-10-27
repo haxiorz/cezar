@@ -18,7 +18,7 @@ import { z } from 'zod';
 import { discoverSkills, type Skill } from '../skills.js';
 import type { HarnessValidationCheck } from './types.js';
 import { readHarnessFsEntry, readRegularFileFollowing } from './fs-read.js';
-import { terminateAgentProcessTree, trackAgentProcessTree } from '../core/process-tree.js';
+import { terminateAgentProcessTree, trackAgentProcessTree } from './process-tree.js';
 
 /**
  * The runtime bridge (spec 2026-07-23-harness-orchestration, Architecture §2):

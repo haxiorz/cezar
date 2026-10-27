@@ -15,7 +15,7 @@ import type {
   ContentBlock,
   SessionOptions,
 } from './agent-runner.ts';
-import { isCezarTerminationExit, prependSystemPrompt, trackChildExit } from './agent-runner.ts';
+import { isSignalTerminationExit, prependSystemPrompt, trackChildExit } from './agent-runner.ts';
 import {
   AUTO_END_DELAY_MS,
   DEFAULT_RUN_TIMEOUT_MS,
@@ -25,7 +25,6 @@ import { ASK_MAX_QUESTIONS, parseAskRequest, type AskQuestion } from './ask.ts';
 import { readNdjson } from './ndjson.ts';
 import { skippedServersNote, toCodexConfigOverrides } from './private-mcp.ts';
 import { V1TextCoalescer } from './v1-text-coalescer.ts';
-import { terminateAgentProcessTree } from './process-tree.ts';
 import {
   CodexAppServerRpc,
   codexSpawnError,
@@ -149,6 +148,8 @@ class CodexSession implements AgentSession {
   private ready!: Promise<void>;
   private autoEndTimer: NodeJS.Timeout | undefined;
   private eofTermTimer: NodeJS.Timeout | undefined;
+  private eofKillTimer: NodeJS.Timeout | undefined;
+  private hardKillTimer: NodeJS.Timeout | undefined;
   private spawnFailed: Error | null = null;
   private timedOut = false;
   /** Set the moment WE signal the child (EOF watchdog, cancel, kill switch).
@@ -197,10 +198,18 @@ class CodexSession implements AgentSession {
 
     // Optional inactivity kill switch (disabled for interactive sessions).
     const limitMs = spec.timeoutMs ?? timeoutMs;
+    let killTimer: NodeJS.Timeout | undefined;
     const deadline = armInactivityDeadline(limitMs, () => {
       this.timedOut = true;
       this.interrupt();
       this.child.stdout.destroy();
+      killTimer = setTimeout(() => {
+        if (!this.hasExited()) {
+          this.terminatedByCezar = true;
+          this.child.kill('SIGKILL');
+        }
+      }, KILL_GRACE_MS);
+      killTimer.unref?.();
     });
 
     // Handshake → thread → first turn. Kicked off concurrently with the read
@@ -247,13 +256,15 @@ class CodexSession implements AgentSession {
         }
       } finally {
         deadline.clear();
+        if (killTimer) clearTimeout(killTimer);
         if (this.autoEndTimer) clearTimeout(this.autoEndTimer);
         this.stdinOpen = false;
       }
 
       const exitCode = await waitForCodexAppServerExit(this.child);
-      // Only the pre-signal timer: the group escalation must outlive the leader (PR #925 review).
       if (this.eofTermTimer) clearTimeout(this.eofTermTimer);
+        if (this.eofKillTimer) clearTimeout(this.eofKillTimer);
+        if (this.hardKillTimer) clearTimeout(this.hardKillTimer);
       this.rpc.rejectPending();
 
       if (this.spawnFailed) throw this.spawnFailed;
@@ -277,7 +288,7 @@ class CodexSession implements AgentSession {
 
       // Our own EOF watchdog / cancel signal coming back as 143/137 — the
       // teardown cezar asked for, not a codex failure (#703).
-      if (this.terminatedByCezar && isCezarTerminationExit(exitCode)) {
+      if (this.terminatedByCezar && isSignalTerminationExit(exitCode)) {
         this.emit({
           type: 'note',
           message: `codex app-server did not exit on its own after close; terminated by cezar (code ${exitCode})`,
@@ -305,10 +316,6 @@ class CodexSession implements AgentSession {
 
   get pid(): number | undefined {
     return this.child.pid;
-  }
-
-  get processGroup(): boolean {
-    return true;
   }
 
   sendMessage(content: ContentBlock[]): boolean {
@@ -382,8 +389,9 @@ class CodexSession implements AgentSession {
     try {
       endCodexAppServer(
         this.child,
-        (term) => {
+        (term, kill) => {
           this.eofTermTimer = term;
+          this.eofKillTimer = kill;
         },
         () => {
           this.terminatedByCezar = true;
@@ -404,20 +412,22 @@ class CodexSession implements AgentSession {
         () => undefined,
       );
     }
-    // Liveness is `hasExited()`, never `child.killed`, which only reports that a
-    // signal was delivered (#844). Ours coming back must not read as an agent
-    // failure (#703) — and the teardown is tree-wide so the app-server's own
-    // children die with it.
     if (!this.hasExited()) {
       this.terminatedByCezar = true;
-      terminateAgentProcessTree(this.child, KILL_GRACE_MS);
+      this.child.kill('SIGTERM');
     }
   }
 
-  /** `interrupt()`'s tree teardown already escalates to a group SIGKILL after
-   *  `KILL_GRACE_MS`, so a hard stop needs no second timer of its own. */
   hardStop(): void {
     this.interrupt();
+    if (this.hardKillTimer || this.hasExited()) return;
+    this.hardKillTimer = setTimeout(() => {
+      if (!this.hasExited()) {
+        this.terminatedByCezar = true;
+        this.child.kill('SIGKILL');
+      }
+    }, KILL_GRACE_MS);
+    this.hardKillTimer.unref?.();
   }
 
   // ---- protocol -----------------------------------------------------------

@@ -17,7 +17,7 @@ import type {
 
 // Re-exported for backends and the run manager that still import them from here.
 export type { AgentSession, SessionOptions } from './agent-runner.ts';
-import { isCezarTerminationExit, trackChildExit } from './agent-runner.ts';
+import { isSignalTerminationExit, trackChildExit } from './agent-runner.ts';
 import { thinkingBudgetFor } from './reasoning-effort.ts';
 import { unwrapJsonErrorEnvelope } from './agent-errors.ts';
 import { buildChildEnv } from './agent-env.ts';
@@ -27,11 +27,6 @@ import { costWeightedTokens, type RawUsage } from './usage.ts';
 import { readNdjson } from './ndjson.ts';
 import { armInactivityDeadline, inactivityTimeoutMessage } from './inactivity-deadline.ts';
 import { claudeMcpAllowRules, toClaudeMcpConfig, type PrivateMcpServer } from './private-mcp.ts';
-import {
-  AGENT_PROCESS_DETACHED,
-  terminateAgentProcessTree,
-  trackAgentProcessTree,
-} from './process-tree.ts';
 import {
   claudeTurnStarted,
   createClaudeUiState,
@@ -144,8 +139,7 @@ export class ClaudeCliRunner implements AgentRunner {
     try {
       const env = buildChildEnv({ backend: this.backend, extraEnv: { ...spec.env, ...effortEnv } });
       const [file, argv] = disclaimedCommand(this.bin, args, env);
-      child = nodeSpawn(file, argv, { cwd: spec.cwd, env, detached: AGENT_PROCESS_DETACHED });
-      trackAgentProcessTree(child);
+      child = nodeSpawn(file, argv, { cwd: spec.cwd, env });
     } catch (err) {
       mcpConfig?.cleanup();
       throw wrapSpawnError(err, this.bin);
@@ -157,6 +151,7 @@ export class ClaudeCliRunner implements AgentRunner {
     let stdinOpen = true;
     let autoEndTimer: NodeJS.Timeout | undefined;
     let eofTermTimer: NodeJS.Timeout | undefined;
+    let eofKillTimer: NodeJS.Timeout | undefined;
     let hardKillTimer: NodeJS.Timeout | undefined;
 
     // Protocol v2 emission — additive alongside v1 (`onEvent` keeps flowing
@@ -203,14 +198,11 @@ export class ClaudeCliRunner implements AgentRunner {
     // Set the moment WE signal the child — the EOF watchdog, a cancel, or the
     // inactivity kill switch. claude installs its own SIGTERM handler and exits
     // 143 instead of dying from the signal, so without this flag our own
-    // teardown reads as an agent failure (#703). Termination itself is
-    // tree-wide: the CLI's own children (MCP servers, provider processes) must
-    // not outlive it, and the group-liveness escalation inside
-    // `terminateAgentProcessTree` replaces the per-child SIGKILL timers.
+    // teardown reads as an agent failure (#703).
     let terminatedByCezar = false;
-    const terminateChild = (graceMs: number): NodeJS.Timeout => {
+    const signalChild = (signal: 'SIGTERM' | 'SIGKILL'): void => {
       terminatedByCezar = true;
-      return terminateAgentProcessTree(child, graceMs);
+      child.kill(signal);
     };
     // Every watchdog below asks "is the child still alive?" — and that question
     // is NOT `child.killed`, which only reports signal delivery. claude handles
@@ -230,20 +222,27 @@ export class ClaudeCliRunner implements AgentRunner {
         // already gone
       }
       eofTermTimer = setTimeout(() => {
-        if (!hasExited()) terminateChild(EOF_KILL_GRACE_MS);
+        if (!hasExited()) signalChild('SIGTERM');
+        eofKillTimer = setTimeout(() => {
+          if (!hasExited()) signalChild('SIGKILL');
+        }, EOF_KILL_GRACE_MS);
+        eofKillTimer.unref?.();
       }, EOF_TERM_GRACE_MS);
       eofTermTimer.unref?.();
     };
 
     const interrupt = (): void => {
       stdinOpen = false;
-      if (!hasExited()) terminateChild(KILL_GRACE_MS);
+      if (!hasExited()) signalChild('SIGTERM');
     };
 
     const hardStop = (): void => {
-      stdinOpen = false;
+      interrupt();
       if (hardKillTimer || hasExited()) return;
-      hardKillTimer = terminateChild(1_000);
+      hardKillTimer = setTimeout(() => {
+        if (!hasExited()) signalChild('SIGKILL');
+      }, 1_000);
+      hardKillTimer.unref?.();
     };
 
     // Seed the first user message — the same path every follow-up takes.
@@ -267,11 +266,15 @@ export class ClaudeCliRunner implements AgentRunner {
     // Optional inactivity kill switch (disabled for interactive sessions).
     const limitMs = spec.timeoutMs ?? this.timeoutMs;
     let timedOut = false;
-    // `interrupt()` escalates tree-wide on its own; no per-child SIGKILL timer.
+    let killTimer: NodeJS.Timeout | undefined;
     const deadline = armInactivityDeadline(limitMs, () => {
       timedOut = true;
       interrupt();
       child.stdout.destroy();
+      killTimer = setTimeout(() => {
+        if (!hasExited()) signalChild('SIGKILL');
+      }, KILL_GRACE_MS);
+      killTimer.unref?.();
     });
 
     const result = (async (): Promise<AgentRunResult> => {
@@ -328,6 +331,8 @@ export class ClaudeCliRunner implements AgentRunner {
         if (!timedOut) throw err;
       } finally {
         deadline.clear();
+        if (killTimer) clearTimeout(killTimer);
+        if (hardKillTimer) clearTimeout(hardKillTimer);
         if (autoEndTimer) clearTimeout(autoEndTimer);
         stdinOpen = false;
         // stdout closed: the CLI read `--mcp-config` at startup long ago, so the file can go.
@@ -335,9 +340,8 @@ export class ClaudeCliRunner implements AgentRunner {
       }
 
       const exitCode = await waitForExit(child);
-      // The group escalation armed by the EOF watchdog stays armed (PR #925 review): it outlives
-      // the leader on purpose, and clears itself once the group is empty.
       if (eofTermTimer) clearTimeout(eofTermTimer);
+      if (eofKillTimer) clearTimeout(eofKillTimer);
 
       if (spawnFailed) throw spawnFailed;
 
@@ -352,7 +356,7 @@ export class ClaudeCliRunner implements AgentRunner {
       // A session cezar itself tore down (EOF watchdog after `end()`, or a
       // cancel) exits 143/137 — that is our own signal coming back, not an
       // agent failure, so it settles on the normal path with a note (#703).
-      if (terminatedByCezar && isCezarTerminationExit(exitCode)) {
+      if (terminatedByCezar && isSignalTerminationExit(exitCode)) {
         onEvent?.({
           type: 'note',
           message: `claude CLI did not exit on its own after close; terminated by cezar (code ${exitCode})`,
@@ -382,7 +386,6 @@ export class ClaudeCliRunner implements AgentRunner {
       interrupt,
       hardStop,
       pid: child.pid,
-      processGroup: true,
       get open() {
         return stdinOpen;
       },

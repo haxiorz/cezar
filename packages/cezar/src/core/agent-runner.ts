@@ -110,16 +110,6 @@ export function isSignalTerminationExit(exitCode: number | null): boolean {
   return exitCode === 130 || exitCode === 137 || exitCode === 143;
 }
 
-/** The exit of a teardown cezar caused through `signalAgentProcessTree`: the CLI's own
- *  `128 + signal`, or exit 1 on Windows, where `taskkill /f` ends the tree from outside and
- *  Node sees no signal (PR #925 review; the copilot runner already allowed it). */
-export function isCezarTerminationExit(
-  exitCode: number | null,
-  platform: NodeJS.Platform = process.platform,
-): boolean {
-  return isSignalTerminationExit(exitCode) || (platform === 'win32' && exitCode === 1);
-}
-
 /** The slice of `ChildProcess` a termination tracker needs — keeps the helper
  *  usable from the transport layer and from test fakes alike. */
 export interface TrackableChild {
@@ -230,7 +220,6 @@ export interface AgentSession {
    *  tree (agents spawn Bash children under it). Absent when the spawn
    *  failed before a pid existed. Feeds live resource telemetry (#348). */
   readonly pid?: number;
-  readonly processGroup?: boolean;
   /** Write a user message into the live session. False when it is closed. */
   sendMessage(content: ContentBlock[]): boolean;
   /** Graceful close: end input, then a SIGTERM→SIGKILL watchdog. */

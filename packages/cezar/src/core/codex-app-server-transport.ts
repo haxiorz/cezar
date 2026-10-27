@@ -3,11 +3,6 @@ import { trackChildExit } from './agent-runner.ts';
 import { buildChildEnv } from './agent-env.ts';
 import { disclaimedCommand } from './disclaim-spawn.ts';
 import { EOF_KILL_GRACE_MS, EOF_TERM_GRACE_MS, KILL_GRACE_MS } from './claude-cli-runner.ts';
-import {
-  AGENT_PROCESS_DETACHED,
-  terminateAgentProcessTree,
-  trackAgentProcessTree,
-} from './process-tree.ts';
 
 export interface CodexAppServerMessage {
   id?: number | string;
@@ -42,9 +37,7 @@ export function spawnCodexAppServer(
   try {
     const env = buildCodexAppServerEnv(extraEnv);
     const [file, argv] = disclaimedCommand(bin, ['app-server', ...configArgs], env);
-    const child = nodeSpawn(file, argv, { cwd, env, detached: AGENT_PROCESS_DETACHED });
-    trackAgentProcessTree(child);
-    return child;
+    return nodeSpawn(file, argv, { cwd, env });
   } catch (error) {
     throw codexSpawnError(error, bin);
   }
@@ -141,11 +134,16 @@ export function endCodexAppServer(
   let killTimer: NodeJS.Timeout | undefined;
   const termTimer = setTimeout(() => {
     if (!hasExited()) {
-      // The caller's flag first (#703 — the exit this provokes is ours), then
-      // the tree teardown with its own group-checked SIGKILL escalation.
       onSignal?.();
-      killTimer = terminateAgentProcessTree(child, EOF_KILL_GRACE_MS);
+      child.kill('SIGTERM');
     }
+    killTimer = setTimeout(() => {
+      if (!hasExited()) {
+        onSignal?.();
+        child.kill('SIGKILL');
+      }
+    }, EOF_KILL_GRACE_MS);
+    killTimer.unref?.();
     onTimers?.(termTimer, killTimer);
   }, EOF_TERM_GRACE_MS);
   termTimer.unref?.();

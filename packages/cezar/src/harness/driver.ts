@@ -156,7 +156,7 @@ export interface HarnessAgentPhaseRequest {
    *  session slots, or the last one started would be the only one a Stop could
    *  reach. */
   concurrent?: boolean;
-  onSpawn?: (pid: number, processGroup: boolean) => void;
+  onSpawn?: (pid: number) => void;
 }
 
 /** One concrete model a role runs on ('' = the backend's default model).
@@ -1385,12 +1385,13 @@ export async function runHarnessDriver(
         SSH_AUTH_SOCK: '',
         GH_CONFIG_DIR: noGitHubAuthDir,
       },
-      onSpawn: (pid, processGroup) => {
+      onSpawn: (pid) => {
         invocation.process = {
           pid,
           token,
           startedAt: new Date().toISOString(),
-          group: processGroup,
+          // Runner sessions are not group leaders: recovery signals the pid alone.
+          group: false,
         };
         persist();
         emitInvocation(invocation);

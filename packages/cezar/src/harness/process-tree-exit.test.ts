@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
-const owner = fileURLToPath(new URL('./__fixtures__/process-tree/agent-owner.mjs', import.meta.url));
+const owner = fileURLToPath(new URL('./__fixtures__/process-tree/harness-owner.mjs', import.meta.url));
 const fakeAgent = fileURLToPath(new URL('./__fixtures__/process-tree/fake-agent.mjs', import.meta.url));
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -29,12 +29,13 @@ async function until(predicate: () => boolean, ms: number): Promise<boolean> {
 }
 
 /**
- * PR #925 review: every agent runs detached in its own process group, so the terminal's Ctrl-C
- * and hangup no longer reach it. Before cezar tracked its agents, stopping `cezar serve` left the
- * agent writing the worktree while the next boot `recover()`ed the same run. Real processes: the
- * bug is process semantics, and a fake would only re-assert its own model.
+ * PR #925 review: the harness's runtime ops, validation commands and probes run detached in their
+ * own process groups, so the terminal's Ctrl-C and hangup no longer reach them. Before cezar
+ * tracked them, stopping `cezar serve` left them running while the next boot `recover()`ed the
+ * same run. Real processes: the bug is process semantics, and a fake would only re-assert its own
+ * model.
  */
-describe.skipIf(process.platform === 'win32')('agent process groups die with cezar', () => {
+describe.skipIf(process.platform === 'win32')('harness process groups die with cezar', () => {
   const dirs: string[] = [];
   const leaders: number[] = [];
   const owners: ChildProcess[] = [];
@@ -50,14 +51,14 @@ describe.skipIf(process.platform === 'win32')('agent process groups die with cez
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
-  async function startOwner(mode: 'exit' | 'handled' | 'signal', leaderExits = false, spawner: 'agent' | 'harness' = 'agent') {
+  async function startOwner(mode: 'exit' | 'handled' | 'signal', leaderExits = false) {
     const dir = mkdtempSync(join(tmpdir(), 'cez-tree-exit-'));
     dirs.push(dir);
     const bin = join(dir, 'fake-agent.mjs');
     copyFileSync(fakeAgent, bin);
     chmodSync(bin, 0o755);
     if (leaderExits) writeFileSync(join(dir, 'leader-exits'), '');
-    const child = spawn(process.execPath, ['--import', 'tsx', owner, bin, dir, mode, spawner], {
+    const child = spawn(process.execPath, ['--import', 'tsx', owner, dir, mode], {
       stdio: ['ignore', 'pipe', 'inherit'],
     });
     owners.push(child);
@@ -76,7 +77,9 @@ describe.skipIf(process.platform === 'win32')('agent process groups die with cez
     return { child, pids, exited, ready: () => until(() => out.includes('ready'), 10_000) };
   }
 
-  it('takes the agent and its tool children down when cezar exits', async () => {
+  // PR #925 review: probes, runtime ops and validation commands are detached, but were never
+  // tracked, so `opencode serve` from a readiness probe kept listening after Ctrl-C.
+  it('takes a harness-spawned process group down when cezar exits', async () => {
     const { child, pids, exited, ready } = await startOwner('exit');
     expect(await ready()).toBe(true);
     child.kill('SIGUSR2');
@@ -84,17 +87,7 @@ describe.skipIf(process.platform === 'win32')('agent process groups die with cez
     expect(await until(() => !alive(pids.leader) && !alive(pids.tool), 3_000)).toBe(true);
   }, 20_000);
 
-  // PR #925 review: probes, runtime ops and validation commands are detached too, but were never
-  // tracked, so `opencode serve` from a readiness probe kept listening after Ctrl-C.
-  it('takes a harness-spawned process group down when cezar exits', async () => {
-    const { child, pids, exited, ready } = await startOwner('exit', false, 'harness');
-    expect(await ready()).toBe(true);
-    child.kill('SIGUSR2');
-    expect((await exited).code).toBe(0);
-    expect(await until(() => !alive(pids.leader) && !alive(pids.tool), 3_000)).toBe(true);
-  }, 20_000);
-
-  it('still lets a command that handles SIGINT shut down first, then takes the agent down', async () => {
+  it('still lets a command that handles SIGINT shut down first, then takes the group down', async () => {
     const { child, pids, exited, ready } = await startOwner('handled');
     expect(await ready()).toBe(true);
     child.kill('SIGINT');
@@ -102,16 +95,16 @@ describe.skipIf(process.platform === 'win32')('agent process groups die with cez
     expect(await until(() => !alive(pids.leader) && !alive(pids.tool), 3_000)).toBe(true);
   }, 20_000);
 
-  // PR #925 review: signal-exit's listener made the hook assume an owner, so a hangup was ignored.
-  it('lets a command that owns shutdown handle a hangup, then takes the agent down', async () => {
+  // serve and run own only SIGINT/SIGTERM: a hangup keeps main's default death, groups first.
+  it('takes the group down on a hangup a command does not own, and cezar still dies of it', async () => {
     const { child, pids, exited, ready } = await startOwner('handled');
     expect(await ready()).toBe(true);
     child.kill('SIGHUP');
-    expect((await exited).code).toBe(129);
+    expect((await exited).signal).toBe('SIGHUP');
     expect(await until(() => !alive(pids.leader) && !alive(pids.tool), 3_000)).toBe(true);
   }, 20_000);
 
-  it('takes down a tool child that outlived its agent leader when cezar exits', async () => {
+  it('takes down a tool child that outlived its leader when cezar exits', async () => {
     const { child, pids, exited, ready } = await startOwner('exit', true);
     expect(await ready()).toBe(true);
     expect(await until(() => !alive(pids.leader), 3_000)).toBe(true);
@@ -121,7 +114,7 @@ describe.skipIf(process.platform === 'win32')('agent process groups die with cez
     expect(await until(() => !alive(pids.tool), 3_000)).toBe(true);
   }, 20_000);
 
-  it('takes the agent down on an unhandled Ctrl-C or hangup, and cezar still dies of that signal', async () => {
+  it('takes the group down on an unhandled Ctrl-C or hangup, and cezar still dies of that signal', async () => {
     for (const signal of ['SIGINT', 'SIGHUP'] as const) {
       const { child, pids, exited, ready } = await startOwner('signal');
       expect(await ready()).toBe(true);

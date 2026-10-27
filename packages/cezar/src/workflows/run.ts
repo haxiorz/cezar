@@ -7543,7 +7543,7 @@ export class RunManager {
        *  assignment below. It is still tracked in `liveSessions`, so cancel
        *  reaches it. */
       concurrent?: boolean;
-      onSpawn?: (pid: number, processGroup: boolean) => void;
+      onSpawn?: (pid: number) => void;
       /** Preflight-pinned harness skill prompt. Bypasses catalog precedence so
        *  a project-local shadow cannot replace the skill after it is hashed. */
       skillSystemPrompt?: string;
@@ -8198,7 +8198,7 @@ export class RunManager {
     const attach = (started: AgentSession, resume: boolean): AgentSession => {
       if (started.pid !== undefined && opts.onSpawn) {
         try {
-          opts.onSpawn(started.pid, started.processGroup === true);
+          opts.onSpawn(started.pid);
         } catch (error) {
           started.interrupt();
           void started.result.catch(() => undefined);

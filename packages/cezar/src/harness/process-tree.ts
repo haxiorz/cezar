@@ -1,7 +1,8 @@
 import { ChildProcess, spawn } from 'node:child_process';
 
-/** Agent backends are process-tree owners: every Unix runner is a process
- * group leader and Windows termination uses taskkill /t. */
+/** The harness's own detached processes (runtime ops, validation commands, probes) are
+ * process-tree owners: each is a Unix process-group leader and Windows termination uses
+ * taskkill /t. Agent runners keep main's spawn and teardown. */
 export const AGENT_PROCESS_DETACHED = process.platform !== 'win32';
 
 export function signalAgentProcessTree(
@@ -94,20 +95,21 @@ const liveTrees = new Map<number, ChildProcess>();
 /** How often a group whose leader exited is re-checked until it is empty. */
 const LINGERING_GROUP_CHECK_MS = 5_000;
 let exitHooksInstalled = false;
-let shutdownOwned = false;
+const ownedSignals = new Set<NodeJS.Signals>();
 
 /**
- * `serve` and `run` own shutdown: their signal handlers flush state and call `process.exit`,
+ * `serve` and `run` own SIGINT and SIGTERM: their handlers flush state and call `process.exit`,
  * which the exit hook follows. Ownership is declared, never inferred from listener counts —
- * `signal-exit` (via proper-lockfile) adds listeners that own nothing (PR #925 review).
+ * `signal-exit` (via proper-lockfile) adds listeners that own nothing (PR #925 review). A signal
+ * they leave to its default action (SIGHUP) stays unowned, so cezar still dies of it, as on main.
  */
-export function ownProcessShutdown(): void {
-  shutdownOwned = true;
+export function ownProcessShutdown(signals: readonly NodeJS.Signals[] = ['SIGINT', 'SIGTERM']): void {
+  for (const signal of signals) ownedSignals.add(signal);
 }
 
 /**
- * Register a detached agent so cezar's own exit takes its process group down.
- * A detached agent leaves the terminal's process group, so Ctrl-C or a closed
+ * Register a detached harness process so cezar's own exit takes its process group down.
+ * A detached process leaves the terminal's process group, so Ctrl-C or a closed
  * terminal no longer reaches it, and the next boot would `recover()` the run
  * while the orphan kept writing the worktree (PR #925 review). Only a real
  * `ChildProcess` is tracked: a test double's made-up pid must never be signalled.
@@ -143,7 +145,7 @@ function installExitHooks(): void {
   process.once('exit', terminateLiveAgentProcessTrees);
   for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM'] as const) {
     const onSignal = (): void => {
-      if (shutdownOwned) return;
+      if (ownedSignals.has(signal)) return;
       terminateLiveAgentProcessTrees();
       process.removeListener(signal, onSignal);
       // A remaining `signal-exit` listener re-raises once it is the only one; with none, the

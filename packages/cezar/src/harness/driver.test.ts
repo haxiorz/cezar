@@ -3796,7 +3796,7 @@ syncBuiltinESMExports();
     let observedProcess: unknown;
     h.agentBehavior.set('qualify', (req) => {
       expect(req.env.CEZ_PROCESS_TOKEN).toMatch(/^[0-9a-f-]{36}$/);
-      req.onSpawn?.(4242, true);
+      req.onSpawn?.(4242);
       observedProcess = loadLedger(h.host.dataDir, h.host.runId)?.invocations.find(
         (invocation) => invocation.id === 'agent:qualify:claude',
       )?.process;
@@ -3813,7 +3813,7 @@ syncBuiltinESMExports();
     expect(observedProcess).toMatchObject({
       pid: 4242,
       token: expect.any(String),
-      group: true,
+      group: false,
     });
     expect(
       loadLedger(h.host.dataDir, h.host.runId)?.invocations.find(

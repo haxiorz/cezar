@@ -7,7 +7,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import type { AgentEvent } from './agent-runner.js';
-import { EOF_KILL_GRACE_MS, EOF_TERM_GRACE_MS, KILL_GRACE_MS } from './claude-cli-runner.js';
+import { KILL_GRACE_MS } from './claude-cli-runner.js';
 import { CodexAppServerRunner, codexStageOnlyArgs, userInputAnswers } from './codex-app-server-runner.js';
 import { RunStore } from '../runs/store.ts';
 
@@ -21,30 +21,6 @@ vi.mock('node:child_process', async (importOriginal) => {
     ...actual,
     spawn: (...args: Parameters<typeof actual.spawn>) =>
       spawnHook.override ? spawnHook.override() : actual.spawn(...args),
-  };
-});
-
-/** Records tree teardowns instead of performing them while a fake child is
- *  installed: its made-up pid would otherwise have `process.kill(-pid)` reach a
- *  real process group on the host. The real-process tests in this file keep the
- *  real teardown, and what it does — group SIGTERM, then a
- *  group-liveness-checked SIGKILL — is covered by `process-tree.test.ts`. */
-const treeHook = vi.hoisted(() => ({
-  recording: false,
-  calls: [] as Array<[unknown, number]>,
-  /** Children whose group escalation timer actually fired. */
-  escalations: [] as unknown[],
-}));
-
-vi.mock('./process-tree.ts', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./process-tree.ts')>();
-  return {
-    ...actual,
-    terminateAgentProcessTree: (child: never, graceMs: number) => {
-      if (!treeHook.recording) return actual.terminateAgentProcessTree(child, graceMs);
-      treeHook.calls.push([child, graceMs]);
-      return setTimeout(() => treeHook.escalations.push(child), graceMs);
-    },
   };
 });
 
@@ -528,15 +504,12 @@ describe('an asynchronous turn/start or turn/steer rejection (#955)', () => {
 
 /**
  * #844 — the runner's own SIGTERM sets `ChildProcess.killed`, so a watchdog
- * gated on `!child.killed` refused to tear down for exactly the app-server it
+ * gated on `!child.killed` refused to escalate for exactly the app-server it
  * was written for: one that handles the signal and keeps running. The guard now
  * tracks real termination, and `terminatedByCezar` (#703) is still set before
- * every teardown so the resulting 137/143 stays a teardown note, not a failure.
- *
- * The teardown itself is `terminateAgentProcessTree`, asserted here as a call
- * rather than as signals — see the module mock above.
+ * every signal so the resulting 137/143 stays a teardown note, not a failure.
  */
-describe('teardown for an app-server that survives SIGTERM', () => {
+describe('SIGTERM→SIGKILL escalation for an app-server that survives SIGTERM', () => {
   function signallableChild(): {
     child: ChildProcessWithoutNullStreams;
     signals: NodeJS.Signals[];
@@ -550,12 +523,12 @@ describe('teardown for an app-server that survives SIGTERM', () => {
       stderr: new PassThrough(),
       exitCode: null as number | null,
       signalCode: null as NodeJS.Signals | null,
-      // Delivery flips `killed` whether or not the child dies; an app-server
-      // that handles SIGTERM runs on with the flag already true.
-      killed: true,
+      killed: false,
       pid: 4243,
+      // Node's semantics: delivery flips `killed` whether or not the child dies.
       kill: (signal: NodeJS.Signals) => {
         signals.push(signal);
+        Object.assign(child, { killed: true });
         return true;
       },
     }) as unknown as ChildProcessWithoutNullStreams;
@@ -569,19 +542,16 @@ describe('teardown for an app-server that survives SIGTERM', () => {
   function withFakeChild(run: (fake: ReturnType<typeof signallableChild>) => void): void {
     const fake = signallableChild();
     spawnHook.override = () => fake.child;
-    treeHook.calls.length = 0;
-    treeHook.recording = true;
     vi.useFakeTimers();
     try {
       run(fake);
     } finally {
       vi.useRealTimers();
-      treeHook.recording = false;
       spawnHook.override = null;
     }
   }
 
-  it('tears the tree down on the wall-clock timeout even after Node flagged the child as killed', () => {
+  it('escalates on the wall-clock timeout even after Node flagged the child as killed', () => {
     withFakeChild((fake) => {
       const session = new CodexAppServerRunner({ bin: 'codex', timeoutMs: 20 }).startSession({
         userPrompt: 'do it',
@@ -590,14 +560,34 @@ describe('teardown for an app-server that survives SIGTERM', () => {
       void session.result.catch(() => undefined);
 
       vi.advanceTimersByTime(20);
-      // Delivered, not dead — the state that used to disable the teardown.
+      expect(fake.signals).toEqual(['SIGTERM']);
+      // Delivered, not dead — the state that used to disable the escalation.
       expect(fake.child.killed).toBe(true);
       expect(fake.child.exitCode).toBeNull();
-      expect(treeHook.calls).toEqual([[fake.child, KILL_GRACE_MS]]);
+
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM', 'SIGKILL']);
     });
   });
 
-  it('does not touch an app-server that interrupt() saw exit', () => {
+  it('stops escalating once the app-server really exits after SIGTERM', () => {
+    withFakeChild((fake) => {
+      const session = new CodexAppServerRunner({ bin: 'codex', timeoutMs: 20 }).startSession({
+        userPrompt: 'do it',
+        cwd: process.cwd(),
+      });
+      void session.result.catch(() => undefined);
+
+      vi.advanceTimersByTime(20);
+      expect(fake.signals).toEqual(['SIGTERM']);
+      fake.exit(143);
+
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM']);
+    });
+  });
+
+  it('does not signal a second time once interrupt() saw the child exit', () => {
     withFakeChild((fake) => {
       const session = new CodexAppServerRunner({ bin: 'codex', timeoutMs: 0 }).startSession({
         userPrompt: 'do it',
@@ -607,45 +597,8 @@ describe('teardown for an app-server that survives SIGTERM', () => {
       fake.exit(0);
 
       session.interrupt();
-      expect(treeHook.calls).toEqual([]);
       expect(fake.signals).toEqual([]);
     });
-  });
-
-  it('keeps the group escalation armed after the leader exits on the EOF path (PR #925 review)', async () => {
-    const fake = signallableChild();
-    spawnHook.override = () => fake.child;
-    treeHook.calls.length = 0;
-    treeHook.escalations.length = 0;
-    treeHook.recording = true;
-    vi.useFakeTimers();
-    try {
-      const session = new CodexAppServerRunner({ bin: 'codex', timeoutMs: 0 }).startSession({
-        userPrompt: 'do it',
-        cwd: process.cwd(),
-      });
-      const settled = session.result.catch(() => undefined);
-      session.end();
-      await vi.advanceTimersByTimeAsync(EOF_TERM_GRACE_MS);
-      expect(treeHook.calls).toEqual([[fake.child, EOF_KILL_GRACE_MS]]);
-
-      // The leader exits on SIGTERM (answering the pending handshake with an error on the way
-      // out); a SIGTERM-ignoring child in its group would not, and only the escalation reaches it.
-      const stdout = fake.child.stdout as unknown as PassThrough;
-      stdout.write(`${JSON.stringify({ id: 1, error: { code: -1, message: 'shutting down' } })}\n`);
-      stdout.end();
-      (fake.child.stderr as unknown as PassThrough).end();
-      fake.exit(143);
-      fake.child.emit('close', 143, null);
-      await settled;
-
-      await vi.advanceTimersByTimeAsync(EOF_KILL_GRACE_MS);
-      expect(treeHook.escalations).toEqual([fake.child]);
-    } finally {
-      vi.useRealTimers();
-      treeHook.recording = false;
-      spawnHook.override = null;
-    }
   });
 
   it('hard-stops a SIGTERM-ignoring app-server within the bounded grace', () => {
@@ -657,8 +610,9 @@ describe('teardown for an app-server that survives SIGTERM', () => {
       void session.result.catch(() => undefined);
 
       session.hardStop?.();
-      // The group SIGTERM → SIGKILL escalation lives in `terminateAgentProcessTree`.
-      expect(treeHook.calls).toEqual([[fake.child, KILL_GRACE_MS]]);
+      expect(fake.signals).toEqual(['SIGTERM']);
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM', 'SIGKILL']);
     });
   });
 });
