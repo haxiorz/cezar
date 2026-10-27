@@ -3473,8 +3473,8 @@ export class RunManager {
    * `MAX_TRANSIENT_RETRIES` times per streak, through the usage-limit resume's timer and exits.
    */
   private scheduleTransientRetry(run: RunRecord): void {
-    // Same refusals as a usage-limit resume: an archived task, the switch off, no session.
-    if (run.archived || !this.semaphore.autoResumeOnUsageLimit() || !run.steps.some((step) => step.sessionId)) {
+    // Harness resumes its ledger; ordinary runs need a session (PR #925 review).
+    if (run.archived || !this.semaphore.autoResumeOnUsageLimit() || (!run.harness && !run.steps.some((step) => step.sessionId))) {
       this.reportUnretriedTransient(run, 'not_retried');
       return;
     }
