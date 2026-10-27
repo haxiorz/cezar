@@ -28,7 +28,7 @@ import {
 } from '../core/private-mcp.ts';
 import { onUsage, registerRunProcess, unregisterRunProcess, type ProcessUsage } from '../core/process-usage.ts';
 import { describeReaped, reapTaskProcesses, taskProcessReapEnabled } from '../core/task-processes.ts';
-import { parseUsageLimit } from '../core/usage-limit.ts';
+import { isUsageLimitMessage, parseUsageLimit } from '../core/usage-limit.ts';
 import { diskFullAgentErrorText } from '../disk-space.ts';
 import { accountStateHint, classifyAgentFailure, MAX_TRANSIENT_RETRIES, transientRetryDelayMs } from '../core/agent-failure-class.ts';
 import { reportAgentError } from '../runs/agent-error-telemetry.ts';
@@ -562,7 +562,8 @@ interface ActiveRun {
   usageLimitedAccount?: string;
   usageLimitedMessage?: string;
   usageLimitedAt?: number;
-  usageLimitedSessions?: Set<AgentSession>;
+  /** Reset-less limits also disqualify in-flight turns as window proof (PR #925 review). */
+  unprovenSessions: Map<string, Set<AgentSession>>;
   /** Graph node parks with no agent session (spec 2026-09-30-workflow-node-editor, 1c):
    *  `deliverMessage` hands a user's reply to `graphAnswer`, `finish()` calls `graphFinish`,
    *  and a settling dispatch child resolves its entry in `graphChildWaits`. */
@@ -1111,10 +1112,11 @@ export function agentDirectories(
   libraryDir: string | undefined,
   env: Record<string, string>,
 ): string[] {
-  // A stage-only harness phase gets its phase-output dir instead of the runs tree: on Linux every
-  // `--add-dir` is a sandbox write root, and the runs tree holds the guard and the ledger (PR #925 review).
-  const stageOnlyOutput = env.CEZ_HARNESS_STAGE_ONLY === '1' ? env.CEZ_HARNESS_OUTPUT_DIR : undefined;
-  const dirs = [stageOnlyOutput || runsDir, ...(libraryDir ? [libraryDir] : []), ...(env.TMPDIR ? [env.TMPDIR] : [])];
+  // Every `--add-dir` is a sandbox write root on Linux (PR #925 review).
+  if (env.CEZ_HARNESS_STAGE_ONLY === '1') {
+    return [...(env.CEZ_HARNESS_OUTPUT_DIR ? [env.CEZ_HARNESS_OUTPUT_DIR] : []), ...(env.TMPDIR ? [env.TMPDIR] : [])];
+  }
+  const dirs = [runsDir, ...(libraryDir ? [libraryDir] : []), ...(env.TMPDIR ? [env.TMPDIR] : [])];
   // A dispatched run's tree directory (spec 2026-09-10-dispatch: the filesystem channel) — its
   // brief, its notes, its inbox. Same rule as TMPDIR: the env names it, so the file tools must
   // reach it.
@@ -1590,6 +1592,7 @@ export class RunManager {
     this.offSemaphore();
     clearInterval(this.queueWatchdog);
     for (const [runId, state] of this.active) {
+      state.unprovenSessions?.clear();
       this.clearIdleTimer(state);
       this.clearMonitoringWakeTimer(state, runId);
       this.clearMonitoringLivenessTimer(state);
@@ -2598,13 +2601,13 @@ export class RunManager {
     let pendingAccount: string | undefined;
     if (run.harness) {
       const state = this.active.get(runId);
+      // An already-running sibling cannot prove a newly closed window (PR #925 review).
+      if (account && session && state?.unprovenSessions.get(account)?.delete(session)) return;
+      if (account) state?.unprovenSessions.delete(account);
       if (state && state.usageLimitedAccount === account) {
-        // An already-running sibling cannot prove a newly closed window (PR #925 review).
-        if (session && state.usageLimitedSessions?.delete(session)) return;
         state.usageLimitedAccount = undefined;
         state.usageLimitedMessage = undefined;
         state.usageLimitedAt = undefined;
-        state.usageLimitedSessions = undefined;
       }
       pendingAccount = state?.usageLimitedAccount;
     }
@@ -2674,6 +2677,7 @@ export class RunManager {
     this.waiting.delete(runId);
     this.leaveMonitoring(runId);
     if (state) this.clearMonitoringWakeTimer(state, runId);
+    state?.unprovenSessions?.clear();
     this.active.delete(runId);
     // Session result has settled and its sink has flushed before terminal cleanup.
     this.store.clearRunSecrets(runId);
@@ -5155,7 +5159,7 @@ export class RunManager {
         cwd: beforePreparation.worktreePath, autonomous: beforePreparation.autonomous === true, autoContinues: 0,
         autosaveExcludedPaths: this.checkArtifactSnapshots.get(runId) ?? new Map(),
         checkInProgress: false, autosaveCheckpointBlocked: this.autosaveCheckpointBlockedRuns.has(runId),
-        interruptHandlers: new Set(), liveSessions: new Set(),
+        interruptHandlers: new Set(), liveSessions: new Set(), unprovenSessions: new Map(),
       };
       this.active.set(runId, preparing); this.starting.delete(runId);
       const preparationController = new AbortController();
@@ -5208,6 +5212,7 @@ export class RunManager {
       interruptHandlers: new Set(),
       cwd,
       liveSessions: new Set(),
+      unprovenSessions: new Map(),
       autonomous: record?.autonomous === true,
       autoContinues: 0,
       autosaveExcludedPaths: this.checkArtifactSnapshots.get(runId) ?? new Map(),
@@ -5766,6 +5771,7 @@ export class RunManager {
       interruptHandlers: new Set(),
       cwd: this.repoRoot,
       liveSessions: new Set(),
+      unprovenSessions: new Map(),
       autonomous: input.autonomous === true,
       autoContinues: 0,
       autosaveExcludedPaths: this.checkArtifactSnapshots.get(runId) ?? new Map(),
@@ -7640,7 +7646,7 @@ export class RunManager {
     // at all. Deliberately NOT nested in the branch above: gating the paths on an image block
     // existing is what would leave an agent holding a task about a `.pdf` it was never told the
     // location of.
-    state.grantedAttachmentLibrary = this.prepareAttachmentLibrary();
+    state.grantedAttachmentLibrary = opts.env?.CEZ_HARNESS_STAGE_ONLY === '1' ? undefined : this.prepareAttachmentLibrary();
     if (attachments.length) {
       userPrompt += `\n\n${pastedAttachmentsText(attachments, this.attachmentLibraryHint(attachments, state.grantedAttachmentLibrary))}`;
     }
@@ -7651,28 +7657,29 @@ export class RunManager {
 
     const phaseResultPath = !interactive ? opts.resultPath : undefined;
     // Starting the next sequential phase ends a degraded council's capture round (PR #925 review).
-    if (phaseResultPath && !concurrentPhase && state.usageLimitedAccount && this.store.getRun(runId)?.harness) {
+    if (phaseResultPath && !concurrentPhase && this.store.getRun(runId)?.harness) {
       const run = this.store.getRun(runId)!;
-      if (run.autoResumeAttempts === undefined && run.autoResumeAccount === state.usageLimitedAccount) {
+      if (state.usageLimitedAccount && run.autoResumeAttempts === undefined && run.autoResumeAccount === state.usageLimitedAccount) {
         this.store.updateRun(runId, { autoResumeAccount: undefined });
       }
       state.usageLimitedAccount = undefined;
       state.usageLimitedMessage = undefined;
       state.usageLimitedAt = undefined;
-      state.usageLimitedSessions = undefined;
+      state.unprovenSessions.clear();
     }
     const captureUsageLimit = (message: string): void => {
       const run = this.store.getRun(runId);
       if (!phaseResultPath || !run?.harness
-        || state.cancelled || this.active.get(runId) !== state || state.usageLimitedAccount) return;
+        || state.cancelled || this.active.get(runId) !== state || !isUsageLimitMessage(message)) return;
+      const account = harnessAccountKey(run, backend);
+      state.unprovenSessions.set(account, new Set(state.liveSessions));
       const capturedAt = Date.now();
       // A reset-less limit must leave room for a schedulable reviewer (PR #925 review).
-      if (!parseUsageLimit(message, capturedAt)) return;
+      if (state.usageLimitedAccount || !parseUsageLimit(message, capturedAt)) return;
       // Keep the first account and its deadline paired; an in-flight proof still owns its hold (PR #925 review).
-      state.usageLimitedAccount = harnessAccountKey(run, backend);
+      state.usageLimitedAccount = account;
       state.usageLimitedMessage = message;
       state.usageLimitedAt = capturedAt;
-      state.usageLimitedSessions = new Set(state.liveSessions);
       this.store.updateRun(runId, { autoResumeAccount: run.autoResumeAccount ?? state.usageLimitedAccount });
     };
     let phaseNudges = 0;
