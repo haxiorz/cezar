@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { HealthResponse } from '@open-mercato/cezar-api-client'
 import { AppShell } from './app-shell'
 import { ThemeProvider } from './theme-provider'
-import { ToolsMenu, forgeNote, toolsBlocker, toolsTooltip } from './tools-menu'
+import { ToolsMenu, diskNote, forgeNote, toolsBlocker, toolsTooltip } from './tools-menu'
 
 afterEach(cleanup)
 
@@ -319,5 +319,43 @@ describe('ToolsMenu in the app shell', () => {
 
     const drawer = await screen.findByRole('dialog', { name: 'Navigation' })
     expect(drawer.querySelector('[data-slot="tools-menu-trigger"]')).not.toBeNull()
+  })
+})
+
+/** 9cdcedc3: the free-space warning, pointing at the cleanup that already exists (#483). */
+describe('disk space', () => {
+  const GIB = 1024 ** 3
+  const LOW: HealthResponse = { ...ALL_GOOD, disk: { freeBytes: 3 * GIB, totalBytes: 500 * GIB, level: 'low', worktreesBytes: 12 * GIB } }
+  const CRITICAL: HealthResponse = { ...ALL_GOOD, disk: { freeBytes: 300 * 1024 ** 2, totalBytes: 500 * GIB, level: 'critical' } }
+
+  it('says nothing while the disk is fine or was never probed', () => {
+    expect(diskNote(ALL_GOOD)).toBeNull()
+    expect(diskNote({ ...ALL_GOOD, disk: { freeBytes: 50 * GIB, totalBytes: 500 * GIB, level: 'ok' } })).toBeNull()
+  })
+
+  it('warns when low, with the worktrees size when the server knows it, without blocking', () => {
+    expect(diskNote(LOW)).toBe(
+      "Only 3.0 GB free on the disk holding task worktrees. Task worktrees use 12.0 GB. Reclaim finished tasks' worktrees (branches are kept) or delete old tasks."
+    )
+    expect(toolsBlocker(LOW)).toBeNull()
+    expect(toolsTooltip(LOW)).toBe('cezar v0.1.3 · low disk space (3.0 GB free)')
+  })
+
+  it('names the refusal below the floor, as a blocker', () => {
+    expect(diskNote(CRITICAL)).toMatch(/Only 300 MB free .* New agents will not start until space is freed\./)
+    expect(toolsBlocker(CRITICAL)).toBe('disk almost full — 300 MB free')
+    // Under 100 MiB free, health's 100 MiB steps report 0 — still a readable amount.
+    const NEARLY_FULL: HealthResponse = { ...ALL_GOOD, disk: { freeBytes: 0, totalBytes: 500 * GIB, level: 'critical' } }
+    expect(toolsBlocker(NEARLY_FULL)).toBe('disk almost full — under 100 MB free')
+    expect(diskNote(NEARLY_FULL)).toMatch(/^Only under 100 MB free on/)
+  })
+
+  it('goes amber and links to Settings → Worktrees', async () => {
+    renderMenu(LOW)
+    expect(triggerDot().getAttribute('data-tone')).toBe('pending')
+    const menu = await openMenu()
+    expect(menu.querySelector('[data-slot="disk-note"]')?.textContent).toMatch(/^Only 3\.0 GB free/)
+    fireEvent.click(within(menu).getByText('Manage worktrees →'))
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/settings/worktrees'))
   })
 })

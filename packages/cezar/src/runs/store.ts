@@ -355,6 +355,9 @@ export const runRecordSchema = z.object({
   /** The account (`backend:profile`) a harness run's usage limit closed: its holds and its resume
    *  stay keyed to that account, not the composer's (PR #925 review). */
   autoResumeAccount: z.string().max(200).optional().catch(undefined),
+  /** Which automatic resume `autoResumeAt`/`autoResumeAttempts` belong to: a usage limit's reset
+   *  window, or a retry after a transient provider failure — which holds no account. Absent = limit. */
+  autoResumeReason: z.enum(['usage_limit', 'transient']).optional().catch(undefined),
   createdAt: z.string(),
   startedAt: z.string().optional(),
   finishedAt: z.string().optional(),
@@ -547,10 +550,15 @@ export interface RunEvent {
 
 /** A layout file this young may belong to a run another process has not saved to the index yet. */
 const ORPHAN_LAYOUT_GRACE_MS = 10 * 60_000;
-const MAX_RUNS_KEPT = 300;
+const DEFAULT_RUNS_KEPT = 300;
+const DEFAULT_ARCHIVED_KEPT = 500;
+/** `CEZ_RUNS_KEEP` / `CEZ_ARCHIVED_RUNS_KEEP`: how many settled runs the index keeps (at least 1; live runs and active dispatch trees are never pruned). */
+function keepLimit(name: string, fallback: number): number {
+  const n = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isFinite(n) && n >= 1 ? n : fallback;
+}
 /** Every save rewrites the whole index, and a live run touches its record at event rate. */
 const SAVE_DEBOUNCE_MS = 1_000;
-const MAX_ARCHIVED_KEPT = 500;
 /** Statuses the run manager still acts on — a record in one of them must outlive pruning. */
 const LIVE_STATUSES: ReadonlySet<string> = new Set<RunStatus>(['queued', 'running', 'waiting']);
 
@@ -633,6 +641,7 @@ function clearPendingAutoResume(run: RunRecord): void {
   run.autoResumeAt = undefined;
   run.autoResumeAttempts = undefined;
   run.autoResumeAccount = undefined;
+  run.autoResumeReason = undefined;
 }
 
 /** The OS refused the write (EPERM/EACCES/EROFS) — the file is there, cezar may not touch it. */
@@ -2197,8 +2206,8 @@ export class RunStore extends EventEmitter {
       if (run.dispatch?.rootRunId) pinned.add(run.dispatch.rootRunId);
     }
     const stalePool = [
-      ...all.filter((r) => !r.archived).slice(MAX_RUNS_KEPT),
-      ...all.filter((r) => r.archived).slice(MAX_ARCHIVED_KEPT),
+      ...all.filter((r) => !r.archived).slice(keepLimit('CEZ_RUNS_KEEP', DEFAULT_RUNS_KEPT)),
+      ...all.filter((r) => r.archived).slice(keepLimit('CEZ_ARCHIVED_RUNS_KEEP', DEFAULT_ARCHIVED_KEPT)),
     ].filter((r) => !pinned.has(r.id));
     for (const stale of stalePool) {
       this.forget(stale.id);

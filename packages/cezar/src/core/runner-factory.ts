@@ -7,6 +7,7 @@ import { CopilotAcpRunner } from './copilot-acp-runner.ts';
 import { OpencodeServerRunner } from './opencode-server-runner.ts';
 import { CursorAgentRunner } from './cursor-agent-runner.ts';
 import { PiRunner } from './pi-runner.ts';
+import { diskFloorRefusal } from '../disk-space.ts';
 
 /**
  * The single place that maps a backend id onto a concrete runner. Everything
@@ -45,13 +46,16 @@ export function missingWorkingDirectoryMessage(backend: string, cwd: string): st
 }
 
 /**
- * Refuse to spawn in a directory that is gone (27d2e432). Without this, Node reports the missing
- * cwd as the binary's ENOENT ("`claude` not found on PATH — install …"), or the agent starts and
- * dies on it. Wraps by prototype so each runner's own state and extra members stay reachable.
+ * Refuse to spawn in a directory that is gone (27d2e432), or on a volume below the free-space
+ * floor (9cdcedc3) — there the agent would die mid-write with a bare ENOSPC. Without the first,
+ * Node reports the missing cwd as the binary's ENOENT ("`claude` not found on PATH — install …").
+ * Wraps by prototype so each runner's own state and extra members stay reachable.
  */
 function guardWorkingDirectory(runner: AgentRunner): AgentRunner {
   const check = (spec: AgentRunSpec): void => {
     if (!existsSync(spec.cwd)) throw new Error(missingWorkingDirectoryMessage(runner.backend, spec.cwd));
+    const lowDisk = diskFloorRefusal(runner.backend, spec.cwd);
+    if (lowDisk) throw new Error(lowDisk);
   };
   const guarded = Object.create(runner) as AgentRunner;
   guarded.startSession = function (spec, onEvent, opts) {

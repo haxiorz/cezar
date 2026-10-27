@@ -115,6 +115,35 @@ describe('a usage-limit hold belongs to the account that hit the limit', () => {
     expect(manager.accountHolds().inFlight.size).toBe(0);
   });
 
+  // A transient retry (#1690) says nothing about an account's window: a capture left from an
+  // earlier limit must not ride along and hold that account while the retry is in flight.
+  it('carries no account through a transient retry of a harness run', () => {
+    failedRun(true);
+    const run = store.listRuns()[0]!;
+    const workflow = harnessWorkflowDefs().find((item) => item.name === HARNESS_FIX_ISSUE)!;
+    writeFileSync(join(root, '.ai/cezar/config.json'), JSON.stringify({ multiModel: true, skillsRepos: [] }));
+    manager.dispose();
+    manager = new RunManager(store, root, { semaphore: new WorkspaceSemaphore({ initial: { maxParallel: 0 } }) });
+    store.updateStep(run.id, 'implement', { sessionId: 's-1', error: 'API Error: 529 overloaded' });
+    store.updateRun(run.id, {
+      workflowDef: workflow,
+      error: 'phase "implement" failed: API Error: 529 overloaded',
+      autoResumeAt: undefined,
+    });
+    const internal = manager as unknown as {
+      scheduleAutoResumeIfLimited: (id: string) => void;
+      fireAutoResume: (id: string) => void;
+    };
+
+    internal.scheduleAutoResumeIfLimited(run.id);
+    expect(store.getRun(run.id)?.autoResumeReason).toBe('transient');
+    internal.fireAutoResume(run.id);
+
+    expect(store.getRun(run.id)).toMatchObject({ status: 'queued', autoResumeAttempts: 1, autoResumeReason: 'transient' });
+    expect(store.getRun(run.id)?.autoResumeAccount).toBeUndefined();
+    expect(manager.accountHolds().inFlight.size).toBe(0);
+  });
+
   it('schedules from persisted limited-account attribution without an active state', () => {
     failedRun(true);
     const run = store.listRuns()[0]!;

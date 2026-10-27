@@ -1,10 +1,9 @@
+import { classifyAgentFailure } from '../core/agent-failure-class.ts';
 import { isClaudeMissingSessionError } from '../core/claude-cli-runner.ts';
-import { isCopilotAuthFailure } from '../core/copilot-ui-mapper.ts';
-import { isRuntimeProviderAuthFailure } from '../core/provider-auth.ts';
-import { isUsageLimitMessage } from '../core/usage-limit.ts';
 
 /** `task_failed`'s closed set (#1438): the label never carries the error text itself. */
-export type FailureKind = 'missing_session' | 'usage_limit' | 'auth' | 'timeout' | 'other';
+export type FailureKind =
+  | 'missing_session' | 'usage_limit' | 'auth' | 'billing' | 'context_too_large' | 'disk_full' | 'transient' | 'timeout' | 'other';
 
 /** The prefixes `run.ts` puts in front of the agent's own error; line-anchored auth patterns need it bare. */
 const RUN_ERROR_PREFIX_RE = /^(?:continue failed: |step "[^"]*" failed: )/;
@@ -18,8 +17,8 @@ export function failureKind(error: string | undefined): FailureKind | undefined 
   const message = (error ?? '').replace(RUN_ERROR_PREFIX_RE, '');
   if (INTERRUPTED_RE.test(message)) return undefined;
   if (isClaudeMissingSessionError(message)) return 'missing_session';
-  if (isUsageLimitMessage(message)) return 'usage_limit';
-  if (isRuntimeProviderAuthFailure(message) || isCopilotAuthFailure(message)) return 'auth';
+  const failure = classifyAgentFailure(message);
+  if (failure !== 'other') return failure;
   if (TIMEOUT_RE.test(message)) return 'timeout';
   return 'other';
 }
