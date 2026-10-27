@@ -89,29 +89,100 @@ describe('PR #925 review: council history row stability', () => {
     expect(windows).toBeGreaterThan(2)
   })
 
-  // A queued bubble already precedes its section's entries; adoption only corrupts phase clocks (PR #925 review).
-  it.each<[string, string | undefined]>([
-    ['keeps harness messages separate from an unset phase', undefined],
-    ['keeps harness messages separate from a matching phase', 'fix-2'],
-    ['guard: keeps harness messages separate from a different phase', 'review'],
-  ])('%s', (_name, stepId) => {
+  // Without later council activity, Continue keeps the reply and phase together (PR #925 review).
+  it.each<[string, string | undefined, boolean]>([
+    ['adopts a Continue reply with an unset phase', undefined, true],
+    ['adopts a Continue reply with a matching phase', 'fix-2', true],
+    ['guard: keeps a Continue reply separate from a different phase', 'review', false],
+  ])('%s', (_name, stepId, adopted) => {
     const ts = '2026-09-23T10:00:00.000Z'
     const thread = reduceThread([
       { seq: 1, ts, type: 'user-message', text: 'Continue' },
-      ...(stepId ? [{ seq: 2, ts, type: 'note', stepId, message: 'Preparing' }] : []),
-      { seq: 3, ts, type: 'turn.started', stepId: 'fix-2', turnId: 'next' },
+      { seq: 2, ts, type: 'harness.message.queued' },
+      ...(stepId ? [{ seq: 3, ts, type: 'note', stepId, message: 'Preparing' }] : []),
+      { seq: 4, ts, type: 'turn.started', stepId: 'fix-2', turnId: 'next' },
     ], { stepNames: new Map([['fix-2', 'Fixes']]) })
-    expect(thread.turns).toHaveLength(2)
+    expect(thread.turns).toHaveLength(adopted ? 1 : 2)
     expect(thread.turns[0]).toMatchObject({ id: 'turn-seq-1', startedAt: ts, userMessage: { text: 'Continue' } })
-    expect(thread.turns[0]?.turnId).toBeUndefined()
-    expect(thread.turns[1]).toMatchObject({ id: 'turn-seq-3', turnId: 'next', stepId: 'fix-2', startedAt: ts })
+    expect(thread.turns[0]?.turnId).toBe(adopted ? 'next' : undefined)
+    expect(thread.turns.at(-1)).toMatchObject({ id: adopted ? 'turn-seq-1' : 'turn-seq-4', turnId: 'next', stepId: 'fix-2', startedAt: ts })
     const rows = buildTranscriptRows(mainTranscriptSections({ task: '' } as ApiRun, thread), 'run')
     expect(rows[0]?.content.kind).toBe('user-message')
     expect(rows.map((row) => row.key)).toEqual([
       'turn-seq-1:user',
-      ...(stepId ? ['turn-seq-1:v1:2'] : []),
-      ...(stepId && stepId !== 'fix-2' ? ['turn-seq-1:step-start:3'] : []),
+      ...(stepId ? ['turn-seq-1:v1:3'] : []),
+      ...(!adopted ? ['turn-seq-1:step-start:4'] : []),
     ])
+  })
+
+  describe.each<[string, string | undefined]>([
+    ['an unset', undefined],
+    ['a matching', 'fix-2'],
+  ])('mid-council message with %s phase', (_name, stepId) => {
+    it.each<[string, Record<string, unknown>]>([
+      ['reviewer output', { type: 'item.completed', item: { kind: 'message', id: 'review', role: 'assistant', text: 'Finding' } }],
+      ['a reviewer delta', { type: 'item.delta', itemId: 'review', field: 'text', delta: ' more' }],
+      ['a reviewer completion', { type: 'turn.completed', turnId: 'review' }],
+      ['a reviewer nudge', { type: 'note', message: 'Still reviewing' }],
+      ['a session closure', { type: 'session.ended', reason: 'end_turn' }],
+      ['a session start', { type: 'session.started', backend: 'claude' }],
+      ['an ignored event', { type: 'harness.invocation.updated' }],
+      ['a malformed item', { type: 'item.completed', item: { kind: 'message' } }],
+    ])('keeps the message separate after %s without a stepped driver note', (_activity, activity) => {
+      const at = (seq: number, type: string, rest: Record<string, unknown> = {}): RunEvent => ({
+        seq, ts: new Date(Date.UTC(2026, 8, 23, 10, 0, seq)).toISOString(), type, ...rest,
+      })
+      const events = [
+        at(1, 'turn.started', { stepId: 'review', sessionKey: 'a', turnId: 'review' }),
+        at(2, 'item.started', { stepId: 'review', sessionKey: 'a', item: { kind: 'message', id: 'review', role: 'assistant', text: 'Reviewing' } }),
+        at(3, 'user-message', { text: 'Also check tests', ...(stepId !== undefined ? { stepId } : {}) }),
+        at(4, 'harness.message.queued'),
+        at(5, 'note', { stepId: 'review', sessionKey: 'a', ...activity }),
+        at(6, 'turn.started', { stepId: 'fix-2', turnId: 'next' }),
+        at(7, 'item.completed', { stepId: 'fix-2', item: { kind: 'message', id: 'fix', role: 'assistant', text: 'Fixed' } }),
+        at(8, 'turn.completed', { stepId: 'fix-2', turnId: 'next' }),
+      ]
+      const options = { stepNames: new Map([['review', 'Review'], ['fix-2', 'Fixes']]) }
+      const thread = reduceThread(events, options)
+      const message = thread.turns.find((turn) => turn.userMessage !== undefined)!
+      const phase = thread.turns.find((turn) => turn.turnId === 'next')!
+      expect(message.turnId).toBeUndefined()
+      expect(phase).toMatchObject({ id: 'turn-seq-6', stepId: 'fix-2', startedAt: events[5]!.ts, completed: { ts: events[7]!.ts } })
+      expect(phase.userMessage).toBeUndefined()
+      expect(message.startedAt).toBe(events[2]!.ts)
+      const rows = buildTranscriptRows(mainTranscriptSections({ task: '' } as ApiRun, thread), 'run')
+      expect(rows.filter((row) => row.scope === phase.id).map((row) => row.key)).toEqual(['turn-seq-6:fix', 'turn-seq-6:turn-time'])
+      expect(reduceThread(JSON.parse(JSON.stringify(events)) as RunEvent[], options)).toEqual(thread)
+    })
+  })
+
+  it('adopts a fresh Continue reply after an earlier mid-council message', () => {
+    const ts = '2026-09-23T10:00:00.000Z'
+    const thread = reduceThread([
+      { seq: 1, ts, type: 'turn.started', sessionKey: 'a', stepId: 'review', turnId: 'review' },
+      { seq: 2, ts, type: 'user-message', text: 'Also check tests' },
+      { seq: 3, ts, type: 'turn.completed', sessionKey: 'a', stepId: 'review', turnId: 'review' },
+      { seq: 4, ts, type: 'user-message', text: 'Continue' },
+      { seq: 5, ts, type: 'harness.feedback.applied', stepId: 'fix-2' },
+      { seq: 6, ts, type: 'turn.started', stepId: 'fix-2', turnId: 'next' },
+    ], { stepNames: new Map([['review', 'Review'], ['fix-2', 'Fixes']]) })
+    expect(thread.turns).toHaveLength(3)
+    expect(thread.turns[1]?.turnId).toBeUndefined()
+    expect(thread.turns[2]).toMatchObject({ id: 'turn-seq-4', userMessage: { text: 'Continue' }, turnId: 'next' })
+  })
+
+  it('guard: ordinary messages still adopt after keyed activity with a different phase', () => {
+    const ts = '2026-09-23T10:00:00.000Z'
+    const thread = reduceThread([
+      { seq: 1, ts, type: 'turn.started', stepId: 'review', sessionKey: 'a', turnId: 'review' },
+      { seq: 2, ts, type: 'user-message', stepId: 'old-step', text: 'Continue' },
+      { seq: 3, ts, type: 'turn.completed', stepId: 'review', sessionKey: 'a', turnId: 'review' },
+      { seq: 4, ts, type: 'turn.started', stepId: 'next-step', turnId: 'next' },
+    ])
+    expect(thread.turns[1]).toEqual({
+      id: 'turn-seq-2', stepId: 'old-step', turnId: 'next', startedAt: ts,
+      userMessage: { text: 'Continue', imageCount: 0, images: [], ts }, items: [],
+    })
   })
 
   it('guard: harness lazy commentary still attaches before any council exists', () => {

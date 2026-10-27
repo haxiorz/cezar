@@ -247,6 +247,8 @@ interface DraftTurn {
   v2Items: boolean
   /** The concurrent council session this turn belongs to, when it has one. */
   sessionKey?: string
+  /** Later council activity distinguishes a queued message from Continue (PR #925 review). */
+  councilAfterMessage?: boolean
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -575,6 +577,10 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
   let currentStepId: string | undefined
   for (const event of events) {
     const session = sessionOf(event)
+    if (stepNames !== undefined && session !== undefined) {
+      const current = turns.at(-1)
+      if (current?.userMessage !== undefined && current.turnId === undefined) current.councilAfterMessage = true
+    }
     const sessionTurn = session === undefined ? undefined : sessionTurns.get(session)
     if (sessionTurn) recordActivity(sessionTurn, event)
     const runningPhase = event.type === 'harness.phase.updated' && isRecord(event.phase) && event.phase.status === 'running' &&
@@ -631,9 +637,10 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
           break
         }
         const current = turns.at(-1)
-        // Harness messages must not lend their clock or row keys to a phase (PR #925 review).
+        // Only queued council messages must keep their own clock and row keys (PR #925 review).
         const attached = current && current.sessionKey === undefined && current.turnId === undefined && !current.v2Items &&
-          (stepNames === undefined || current.userMessage === undefined) &&
+          (stepNames === undefined || (!current.councilAfterMessage &&
+            (current.userMessage === undefined || current.stepId === undefined || current.stepId === str(event.stepId)))) &&
           (current.userMessage !== undefined || sessionTurns.size === 0) ? current : newTurn(event.seq, str(event.stepId))
         attached.stepId ??= str(event.stepId)
         attached.turnId = turnId
