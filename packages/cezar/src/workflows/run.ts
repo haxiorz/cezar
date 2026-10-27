@@ -7680,7 +7680,10 @@ export class RunManager {
       state.usageLimitedAccount = account;
       state.usageLimitedMessage = message;
       state.usageLimitedAt = capturedAt;
-      this.store.updateRun(runId, { autoResumeAccount: run.autoResumeAccount ?? state.usageLimitedAccount });
+      // A transient retry has no account; its council capture stays round-local (PR #925 review).
+      if (run.autoResumeReason !== 'transient') {
+        this.store.updateRun(runId, { autoResumeAccount: run.autoResumeAccount ?? state.usageLimitedAccount });
+      }
     };
     let phaseNudges = 0;
     let phaseTurnSeq = 0;
