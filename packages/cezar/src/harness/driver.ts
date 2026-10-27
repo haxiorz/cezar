@@ -91,6 +91,7 @@ import { readHarnessFsEntry } from './fs-read.js';
 import { pinnedGitEnv, pinWorktreeGitDir, resolveTrustedGitDir, verifyWorktreeGitPointer } from '../git-pin.js';
 import { harnessPhaseSkills } from './skill-routing.js';
 import { isUsageLimitMessage } from '../core/usage-limit.js';
+import { classifyAgentFailure } from '../core/agent-failure-class.js';
 import { createClaudeStageOnlySettings } from './claude-guard.js';
 import type {
   HarnessInvocation,
@@ -1215,11 +1216,13 @@ export async function runHarnessDriver(
     emitInvocation(invocation);
     return null;
   };
-  // A cancel or crash interrupts an attempt before it ends, so it spends no
-  // budget; a completed attempt later demoted for a changed artifact keeps its
-  // artifact hash and still counts (PR #925 review).
+  // Undelivered attempts spend no contract budget, including persisted advisor/older transient
+  // failures; a demoted completed artifact still counts (PR #925 review).
   const consumedAttempts = (invocation: HarnessInvocation): number =>
-    invocation.status === 'interrupted' && invocation.artifactSha256 === undefined
+    (invocation.status === 'interrupted' ||
+      (invocation.status === 'failed' && invocation.role === 'reviewer' &&
+        classifyAgentFailure(invocation.error) === 'transient')) &&
+    invocation.artifactSha256 === undefined
       ? invocation.attempt - 1
       : invocation.attempt;
   const attemptsForInput = (id: string, inputSha256: string): number => {
@@ -2706,16 +2709,15 @@ export async function runHarnessDriver(
     return 'the review subject changed during the council, so this round is void; the changed worktree was preserved for manual recovery, and Continue re-validates and re-reviews it';
   };
 
-  /** A usage-limited reviewer spends no attempt and is not retried into the closed window: both
-   *  attempts burned at once, so the auto-resume at the reset ran no reviewer (PR #925 review). A
-   *  timeout or crash still counts, which is what a recorded proceed decision skips. */
+  // A proceed decision also skips undelivered transient/limited reviewers: the user declined
+  // to pay for them again, even though they spent no contract attempt (PR #925 review).
   const reviewerFailedBefore = (invocationId: string, inputSha256: string): boolean => {
     if (attemptsForInput(invocationId, inputSha256) > 0) return true;
     const prior = ledger.invocations.find((invocation) => invocation.id === invocationId);
     return (
       prior?.inputSha256 === inputSha256 &&
       prior.status === 'interrupted' &&
-      isUsageLimitMessage(prior.error ?? '')
+      (isUsageLimitMessage(prior.error ?? '') || classifyAgentFailure(prior.error) === 'transient')
     );
   };
 
@@ -4712,7 +4714,7 @@ export async function runHarnessDriver(
               if (failure) {
                 lastFailure = failure;
                 const limited = isUsageLimitMessage(failure);
-                finishInvocation(invocation, limited ? 'interrupted' : 'failed', { error: failure });
+                finishInvocation(invocation, limited || classifyAgentFailure(failure) === 'transient' ? 'interrupted' : 'failed', { error: failure });
                 if (limited || !isRetryableReviewerFailure(failure)) break;
                 // The spec changed under this reviewer: the round is void, so a retry buys nothing.
                 if (failure.startsWith(REVIEWER_MUTATION_FAILURE) && hashFile(join(host.cwd, specPath)) !== specSubjectSha256) break;
@@ -4736,7 +4738,7 @@ export async function runHarnessDriver(
               }
             }
             if (parsed === null) {
-              const reason = lastFailure ?? 'no valid review';
+              const reason = lastFailure ?? priorReviewerFailure(invocationId);
               outcomes.push({ label, family: councilFamilyOf(reviewer), status: 'failed', reason });
               councilReviewers.push({ id: label, ...reviewer, status: 'failed', reason, freshContext: true });
               host.emit({
@@ -5601,7 +5603,7 @@ export async function runHarnessDriver(
             if (failure) {
               lastFailure = failure;
               const limited = isUsageLimitMessage(failure);
-              finishInvocation(invocation, limited ? 'interrupted' : 'failed', { error: failure });
+              finishInvocation(invocation, limited || classifyAgentFailure(failure) === 'transient' ? 'interrupted' : 'failed', { error: failure });
               if (limited || !isRetryableReviewerFailure(failure)) break;
               // The subject changed under this reviewer and stayed changed: the round is void, so a
               // retry would only pay to review an edit no gate validated (PR #925 review).
@@ -5631,7 +5633,7 @@ export async function runHarnessDriver(
             }
           }
           if (parsed === null) {
-            const reason = lastFailure ?? 'no valid review';
+            const reason = lastFailure ?? priorReviewerFailure(invocationId);
             outcomes.push({ label, family: councilFamilyOf(reviewer), status: 'failed', reason });
             councilReviewers.push({ id: label, ...reviewer, status: 'failed', reason, freshContext: true });
             host.emit({

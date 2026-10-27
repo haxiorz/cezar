@@ -8171,7 +8171,7 @@ export class RunManager {
           // strand the run — both close the session, and a park whose session
           // closed unanswered settles as `failed` with a Continue button (see
           // the `askPark` branch in `execute`), never as a run stuck `waiting`.
-          // Harness phases pass their own per-phase wall clock via `opts`.
+          // Harness opts set per-phase inactivity windows; runners enforce an 8× hard ceiling (PR #925 review).
           timeoutMs: interactive ? 0 : opts.timeoutMs,
         },
         onEvent,
