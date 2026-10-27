@@ -3065,6 +3065,70 @@ syncBuiltinESMExports();
     }
   });
 
+  it.each([
+    ['[r6-F4] rediscover and re-stage after deleting a staged new file and reverting a staged edit', true],
+    ['guard: [r6-F4] unchanged real staged handoff is reused without resetting its index', false],
+  ] as const)('%s', async (_name, change) => {
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'test@local');
+    git('config', 'user.name', 'test');
+    git('config', 'gc.auto', '0');
+    mkdirSync(join(dir, 'src'));
+    writeFileSync(join(dir, 'src/a.txt'), 'base\n');
+    writeFileSync(join(dir, 'src/x'), 'base\n');
+    git('add', 'src');
+    git('commit', '-qm', 'base');
+    const cwd = join(dir, 'task');
+    git('worktree', 'add', '-q', '-b', 'task', cwd);
+    const runtimeScript = new URL('../../vendor/skills/cez-harness/scripts/harness.mjs', import.meta.url).pathname;
+    const realHarness = () => {
+      const h = makeHarness(dir);
+      h.host.cwd = cwd;
+      delete h.deps.discoverChangedPaths;
+      delete h.deps.snapshotStageSubject;
+      const fake = h.deps.createRuntime!;
+      h.deps.createRuntime = (opts) => {
+        const fallback = fake(opts);
+        const real = new HarnessRuntime({ ...opts, script: runtimeScript });
+        return {
+          run: async (op, args, options) => {
+            if (!['capture', 'verify', 'stage'].includes(op)) return fallback.run(op, args, options);
+            h.ops.push({ kind: 'op', id: op, args });
+            return real.run(op, args, options);
+          },
+          kill: () => { fallback.kill(); real.kill(); },
+        };
+      };
+      h.agentBehavior.set('implement', (req) => {
+        for (const path of ['src/a.txt', 'src/x', 'src/new']) writeFileSync(join(cwd, path), 'handoff edit\n');
+        writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/a.txt', 'src/x', 'src/new'] }));
+        return null;
+      });
+      return h;
+    };
+    const first = realHarness();
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const gitTask = (...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' });
+    expect(gitTask('diff', '--cached', '--name-only')).toBe('src/a.txt\nsrc/new\nsrc/x\n');
+    const indexPath = join(gitTask('rev-parse', '--absolute-git-dir').trim(), 'index');
+    const index = readFileSync(indexPath);
+    if (change) {
+      rmSync(join(cwd, 'src/new'));
+      writeFileSync(join(cwd, 'src/x'), 'base\n');
+    }
+    const continued = realHarness();
+    expect(await runHarnessDriver(continued.host, input, continued.deps)).toBeNull();
+    expect(continued.calls.filter((call) => call.kind === 'agent')).toHaveLength(0);
+    expect(continued.ops.filter((op) => op.id === 'stage')).toHaveLength(change ? 1 : 0);
+    expect(gitTask('diff', '--cached', '--name-only')).toBe(change ? 'src/a.txt\n' : 'src/a.txt\nsrc/new\nsrc/x\n');
+    expect(loadLedger(continued.host.dataDir, continued.host.runId)?.outcome.status).toBe('ready');
+    if (!change) expect(readFileSync(indexPath)).toEqual(index);
+    const third = realHarness();
+    expect(await runHarnessDriver(third.host, input, third.deps)).toBeNull();
+    expect(third.ops.filter((op) => op.id === 'stage')).toHaveLength(0);
+  });
+
   it('reruns stage when the complete post-review code subject changes', async () => {
     const first = makeHarness(dir);
     expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();

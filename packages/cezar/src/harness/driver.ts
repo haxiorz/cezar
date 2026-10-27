@@ -3,6 +3,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { copyFile, stat, utimes } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import {
+  copyFileSync,
   cpSync,
   existsSync,
   lstatSync,
@@ -12,9 +13,10 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { z } from 'zod';
 import {
@@ -310,18 +312,26 @@ function hashWorktreeContentVsHead(
   hash: ReturnType<typeof createHash>,
   cwd: string,
   git: (args: string[], env?: Record<string, string>) => Buffer,
+  indexRoot?: string,
 ): void {
   hash.update('\0head\0');
   hash.update(git(['rev-parse', 'HEAD']));
-  // Ignore absent sparse entries, but expose flagged edits in a private index (PR #925 review).
-  const absentSparse = new Set(git(['ls-files', '-v', '-z']).toString('utf8').split('\0')
-    .filter((entry) => /^[Ss] /.test(entry) && !existsSync(join(cwd, entry.slice(2))))
-    .map((entry) => entry.slice(2)));
-  const temporary = mkdtempSync(join(tmpdir(), 'cez-subject-index-'));
+  // Keep the private index beyond packet workers' writable temp roots (PR #925 review).
+  const gitDir = pinnedGitEnv(cwd)?.GIT_DIR ?? git(['rev-parse', '--absolute-git-dir']).toString('utf8').trim();
+  const temporary = mkdtempSync(join(indexRoot ?? gitDir, 'cez-subject-index-'));
   let status: Buffer;
   try {
-    const env = { GIT_INDEX_FILE: join(temporary, 'index') };
-    git(['read-tree', 'HEAD'], env);
+    const indexPath = join(temporary, 'index');
+    const env = { GIT_INDEX_FILE: indexPath };
+    try {
+      const realIndex = join(gitDir, 'index');
+      const { atime, mtime } = statSync(realIndex);
+      copyFileSync(realIndex, indexPath);
+      utimesSync(indexPath, atime, mtime);
+    } catch {
+      // A missing or unreadable index can still be seeded from HEAD.
+    }
+    normalizeHarnessIndex(cwd, (args) => git(args, env));
     status = git([
       'status',
       '--porcelain=v1',
@@ -337,7 +347,6 @@ function hashWorktreeContentVsHead(
     .split('\0')
     .filter(Boolean)
     .map((entry) => entry.slice(3))
-    .filter((path) => !absentSparse.has(path))
     .sort();
   for (const path of paths) {
     hash.update('\0');
@@ -359,16 +368,16 @@ function hashWorktreeContentVsHead(
   }
 }
 
-export async function snapshotHarnessReviewSubject(cwd: string): Promise<string> {
+export async function snapshotHarnessReviewSubject(cwd: string, indexRoot?: string): Promise<string> {
   const hash = createHash('sha256');
   const git = (args: string[], env?: Record<string, string>): Buffer =>
-    execFileSync('git', args, {
+    execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], {
       cwd,
       encoding: 'buffer',
       maxBuffer: 256 * 1024 * 1024,
       env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', ...pinnedGitEnv(cwd), ...env },
     });
-  hashWorktreeContentVsHead(hash, cwd, git);
+  hashWorktreeContentVsHead(hash, cwd, git, indexRoot);
   hash.update('\0head-reflog\0');
   hash.update(git(['reflog', 'show', 'HEAD', '--format=%H%x09%gs']));
   return hash.digest('hex');
@@ -378,17 +387,48 @@ export async function snapshotHarnessReviewSubject(cwd: string): Promise<string>
  * worktree and index. `git diff HEAD` normalizes both states while untracked
  * files remain explicit, so a post-stage edit changes the hash but staging
  * itself does not. */
-export async function snapshotHarnessStageSubject(cwd: string): Promise<string> {
+export async function snapshotHarnessStageSubject(cwd: string, indexRoot?: string): Promise<string> {
   const hash = createHash('sha256');
   const git = (args: string[], env?: Record<string, string>): Buffer =>
-    execFileSync('git', args, {
+    execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], {
       cwd,
       encoding: 'buffer',
       maxBuffer: 256 * 1024 * 1024,
       env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', ...pinnedGitEnv(cwd), ...env },
     });
-  hashWorktreeContentVsHead(hash, cwd, git);
+  hashWorktreeContentVsHead(hash, cwd, git, indexRoot);
   return hash.digest('hex');
+}
+
+// Share sparse/flag semantics between review subjects and staging (PR #925 review).
+function normalizeHarnessIndex(cwd: string, git: (args: string[]) => Buffer): void {
+  try { git(['read-tree', '--reset', 'HEAD']); } catch { git(['read-tree', 'HEAD']); }
+  let sparse = false;
+  try { sparse = git(['config', '--bool', 'core.sparseCheckout']).toString('utf8').trim() === 'true'; } catch {
+    // An unset sparse-checkout option is the ordinary full worktree.
+  }
+  const entries = git(['ls-files', '-v', '-z']).toString('utf8').split('\0').filter(Boolean);
+  const clear = (flag: string, paths: string[]) => {
+    let batch: string[] = [];
+    let bytes = 0;
+    for (const path of paths) {
+      const size = Buffer.byteLength(path) + 1;
+      if (batch.length && bytes + size > 32_768) {
+        git(['update-index', flag, '--', ...batch]);
+        batch = [];
+        bytes = 0;
+      }
+      batch.push(path);
+      bytes += size;
+    }
+    if (batch.length) git(['update-index', flag, '--', ...batch]);
+  };
+  clear('--no-assume-unchanged', entries.filter((entry) => /^[a-z] /.test(entry)).map((entry) => entry.slice(2)));
+  clear('--no-skip-worktree', entries.filter((entry) => {
+    if (!/^[Ss] /.test(entry)) return false;
+    if (!sparse) return true;
+    try { lstatSync(join(cwd, entry.slice(2))); return true; } catch { return false; }
+  }).map((entry) => entry.slice(2)));
 }
 
 /** Clear superseded staging without changing the captured HEAD reflog (PR #925 review). */
@@ -396,36 +436,14 @@ export function resetIndexToHead(cwd: string): void {
   // Only a pinned harness worktree: never whatever repository happens to enclose `cwd`.
   const env = pinnedGitEnv(cwd);
   if (!env) return;
-  const git = (args: string[]) => execFileSync('git', args, {
+  const git = (args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], {
     cwd,
-    encoding: 'utf8',
     maxBuffer: 256 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'ignore'],
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env },
   });
   try {
-    try { git(['read-tree', '-m', 'HEAD']); } catch { git(['read-tree', 'HEAD']); }
-    const hidden = git(['ls-files', '-v', '-z']).split('\0')
-      .filter((entry) => /^[a-zS] /.test(entry) && existsSync(join(cwd, entry.slice(2))))
-      .map((entry) => entry.slice(2));
-    // Preserve absent sparse entries and unchanged stat caches (PR #925 review).
-    // Git applies only one flag mode per update-index call.
-    let batch: string[] = [];
-    let bytes = 0;
-    for (const path of hidden) {
-      if (batch.length && bytes + Buffer.byteLength(path) > 32_768) {
-        git(['update-index', '--no-assume-unchanged', '--', ...batch]);
-        git(['update-index', '--no-skip-worktree', '--', ...batch]);
-        batch = [];
-        bytes = 0;
-      }
-      batch.push(path);
-      bytes += Buffer.byteLength(path) + 1;
-    }
-    if (batch.length) {
-      git(['update-index', '--no-assume-unchanged', '--', ...batch]);
-      git(['update-index', '--no-skip-worktree', '--', ...batch]);
-    }
+    normalizeHarnessIndex(cwd, git);
   } catch {
     // The stage op's own index checks still refuse anything left behind.
   }
@@ -521,7 +539,10 @@ export async function preserveAndRestorePacket(cwd: string, paths: readonly stri
         preservedPath = `${artifactPath}.${number}`;
       }
     }
-    renameSync(temporaryPath, preservedPath);
+    try { renameSync(temporaryPath, preservedPath); } catch (error) {
+      rmSync(preservedPath, { force: true });
+      throw error;
+    }
   } finally {
     rmSync(temporaryPath, { force: true });
   }
@@ -868,8 +889,8 @@ export async function runHarnessDriver(
     deps.validate ??
     ((commands, cwd, opts) => runValidationCommands(commands, cwd, opts));
   const exportConfig = deps.exportConfig ?? exportTrustedConfig;
-  const snapshotReviewSubject = deps.snapshotReviewSubject ?? snapshotHarnessReviewSubject;
-  const snapshotStageSubject = deps.snapshotStageSubject ?? snapshotHarnessStageSubject;
+  const snapshotReviewSubject = deps.snapshotReviewSubject ?? ((cwd: string) => snapshotHarnessReviewSubject(cwd, artifactDir));
+  const snapshotStageSubject = deps.snapshotStageSubject ?? ((cwd: string) => snapshotHarnessStageSubject(cwd, artifactDir));
   const discoverChangedPaths =
     deps.discoverChangedPaths ?? ((cwd: string) => currentChangedPaths(cwd));
   const discoverCandidates = deps.discoverSkillCandidates ?? discoverSkillCandidates;
@@ -5829,33 +5850,40 @@ export async function runHarnessDriver(
     }
 
     if (!(phaseDone('stage') && ledger.stage.status === 'staged')) resetIndexToHead(host.cwd);
-    const discoveredPaths = discoverChangedPaths(host.cwd, [...allowlist]);
-    if (discoveredPaths === null) {
-      const reason =
-        'could not derive the complete changed-path set from git; refusing to stage a model-declared subset';
-      setOutcome({ status: 'blocked', blockingReasons: [reason] });
-      return reason;
-    }
-    const omitted = discoveredPaths.filter((path) => !allowlist.has(path));
-    if (omitted.length > 0) {
-      host.emit({
-        type: 'note',
-        stepId: 'stage',
-        message:
-          `phase result allowlists omitted ${omitted.length} changed path(s); Cezar derived the ` +
-          `complete handoff from git and will stage them too:\n- ${omitted.join('\n- ')}`,
-      });
-    }
-    allowlist.clear();
-    for (const path of discoveredPaths) allowlist.add(path);
-    const unsafeStagePath = [...allowlist].find(
-      (path) => /[\x00-\x1f\x7f]/.test(path) || path.startsWith('/') || path.split(/[\\/]/).includes('..'),
-    );
-    if (unsafeStagePath) {
-      return `cannot stage unsafe changed path: ${JSON.stringify(unsafeStagePath)}`;
-    }
     const allowlistPath = join(artifactDir, 'allowlist.txt');
-    writeFileSync(allowlistPath, `${[...allowlist].sort().join('\n')}\n`, 'utf8');
+    const discoverStagePaths = (): string | null => {
+      const discoveredPaths = discoverChangedPaths(host.cwd, [...allowlist]);
+      if (discoveredPaths === null) {
+        const reason =
+          'could not derive the complete changed-path set from git; refusing to stage a model-declared subset';
+        return reason;
+      }
+      const omitted = discoveredPaths.filter((path) => !allowlist.has(path));
+      if (omitted.length > 0) {
+        host.emit({
+          type: 'note',
+          stepId: 'stage',
+          message:
+            `phase result allowlists omitted ${omitted.length} changed path(s); Cezar derived the ` +
+            `complete handoff from git and will stage them too:\n- ${omitted.join('\n- ')}`,
+        });
+      }
+      allowlist.clear();
+      for (const path of discoveredPaths) allowlist.add(path);
+      const unsafeStagePath = [...allowlist].find(
+        (path) => /[\x00-\x1f\x7f]/.test(path) || path.startsWith('/') || path.split(/[\\/]/).includes('..'),
+      );
+      if (unsafeStagePath) {
+        return `cannot stage unsafe changed path: ${JSON.stringify(unsafeStagePath)}`;
+      }
+      writeFileSync(allowlistPath, `${[...allowlist].sort().join('\n')}\n`, 'utf8');
+      return null;
+    };
+    const discoveryError = discoverStagePaths();
+    if (discoveryError) {
+      setOutcome({ status: 'blocked', blockingReasons: [discoveryError] });
+      return discoveryError;
+    }
     const stageResultPath = join(artifactDir, 'stage-result.json');
     const stageInvocationId = 'runtime:stage';
     let stageSubjectSha256: string;
@@ -5868,7 +5896,7 @@ export async function runHarnessDriver(
       setOutcome({ status: 'blocked', blockingReasons: [reason] });
       return reason;
     }
-    const stageInputSha256 = sha256(
+    const stageInputHash = () => sha256(
       JSON.stringify({
         inputHashVersion: 2,
         operation: 'stage',
@@ -5877,6 +5905,7 @@ export async function runHarnessDriver(
         subjectSha256: stageSubjectSha256,
       }),
     );
+    let stageInputSha256 = stageInputHash();
     const recoveredStage = reusableInvocation(
       stageInvocationId,
       stageInputSha256,
@@ -5903,6 +5932,14 @@ export async function runHarnessDriver(
       emitPhase('stage');
     }
     if (phaseDone('stage') && !recoveredStage) {
+      // Stale staging can outlive deleted or reverted handoff paths (PR #925 review).
+      resetIndexToHead(host.cwd);
+      const discoveryError = discoverStagePaths();
+      if (discoveryError) {
+        setOutcome({ status: 'blocked', blockingReasons: [discoveryError] });
+        return discoveryError;
+      }
+      stageInputSha256 = stageInputHash();
       invalidateFollowingPhases('stage');
       const phase = ledger.phases.find((entry) => entry.id === 'stage');
       if (phase) phase.status = 'pending';

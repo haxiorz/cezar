@@ -207,9 +207,11 @@ prompt instructions are how you get 8/10 worktree escapes. It's enforced in laye
    macOS the sandbox also strips credential environment variables
    (`ANTHROPIC_API_KEY`, OAuth, GitHub tokens) from Bash; elsewhere the
    environment hardening below is what removes them. Each phase session has its
-   own phase-output directory. Codex phases get the workspace-write sandbox with
+   own phase-output directory. Codex runner phases get the workspace-write sandbox with
    that directory and the run's own temp directory as their only extra writable
-   roots; the shared `/tmp` and host `TMPDIR` are excluded. Codex has no
+   roots; the shared `/tmp` and host `TMPDIR` are excluded by the runner, while
+   packet workers use `codex exec --sandbox workspace-write`, which keeps the
+   host `TMPDIR` writable. Codex has no
    read-deny setting, so a Codex phase **can** read those credential stores;
    with no network, the only way out is the staged diff, which you review before
    publishing. Environment is hardened for every phase:
