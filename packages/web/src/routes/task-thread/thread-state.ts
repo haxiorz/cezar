@@ -122,6 +122,8 @@ export interface ThreadTurn {
    *  follow each other for the same turn produce one coherent start rather than two. This is the
    *  left-hand side of the turn duration. */
   startedAt?: string
+  /** Reviewer activity distinguishes queued messages from crash resumes (PR #925 review). */
+  lastActivityAt?: string
   items: ThreadEntry[]
   /** Latest `plan.updated` snapshot seen during this turn (full-replacement semantics). */
   planEntries?: PlanEntry[]
@@ -236,6 +238,7 @@ interface DraftTurn {
   stepId?: string
   userMessage?: { text: string; imageCount: number; images: string[]; ts?: string }
   startedAt?: string
+  lastActivityAt?: string
   entries: DraftEntry[]
   planEntries?: PlanEntry[]
   completed?: { stopReason: StopReason; costUsd?: number; ts?: string }
@@ -476,9 +479,13 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
   const sessionTurns = new Map<string, DraftTurn>()
   const sessionOf = (event: RunEvent): string | undefined =>
     typeof event.sessionKey === 'string' ? event.sessionKey : undefined
+  const recordActivity = (turn: DraftTurn, event: RunEvent) => {
+    if (turn.sessionKey !== undefined && turn.sessionKey === sessionOf(event)) turn.lastActivityAt = stamp(event.ts) ?? turn.lastActivityAt
+  }
   const openSessionTurn = (key: string, event: RunEvent): DraftTurn => {
     const turn = newTurn(event.seq, str(event.stepId))
     turn.sessionKey = key
+    recordActivity(turn, event)
     sessionTurns.set(key, turn)
     return turn
   }
@@ -493,11 +500,13 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
       const peersOpen = stepId !== undefined && [...sessionTurns.values()].some((peer) =>
         peer.stepId === stepId && peer.completed === undefined && peer.sessionEnded === undefined,
       )
-      turn = peersOpen && (current?.sessionKey !== undefined || current?.stepId !== stepId)
+      turn = peersOpen && (current?.sessionKey !== undefined ||
+        (current?.stepId !== stepId && !(current?.userMessage !== undefined && current.stepId === undefined)))
         ? newTurn(event.seq, stepId)
         : currentTurn()
     }
     turn.stepId ??= str(event.stepId)
+    recordActivity(turn, event)
     return turn
   }
 
@@ -530,6 +539,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
   }
 
   const upsertV2 = (turn: DraftTurn, raw: UiItem, key: string, event: RunEvent) => {
+    recordActivity(turn, event)
     // Clone: deltas append in place, and the event object off the wire must stay untouched.
     const item = scopedItem(event, raw)
     if (!turn.v2Items) {
@@ -564,6 +574,9 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
   const stepNames = options.stepNames
   let currentStepId: string | undefined
   for (const event of events) {
+    const session = sessionOf(event)
+    const sessionTurn = session === undefined ? undefined : sessionTurns.get(session)
+    if (sessionTurn) recordActivity(sessionTurn, event)
     const runningPhase = event.type === 'harness.phase.updated' && isRecord(event.phase) && event.phase.status === 'running' &&
       stepNames?.has(str(event.stepId) ?? '')
     const eventStepId = stepNames && (!str(event.type)?.startsWith('harness.') || runningPhase) ? str(event.stepId) : undefined
@@ -621,6 +634,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         // User messages and ordinary lazy turns can precede turn.started;
         // council commentary belongs to its own turn (PR #925 review).
         const attached = current && current.sessionKey === undefined && current.turnId === undefined && !current.v2Items &&
+          (stepNames === undefined || current.userMessage === undefined || current.stepId === undefined || current.stepId === str(event.stepId)) &&
           (current.userMessage !== undefined || sessionTurns.size === 0) ? current : newTurn(event.seq, str(event.stepId))
         attached.stepId ??= str(event.stepId)
         attached.turnId = turnId
@@ -641,6 +655,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         }
         const turn = matched ?? (session === undefined ? turns.at(-1) : sessionTurns.get(session))
         if (turn) {
+          recordActivity(turn, event)
           const ts = stamp(event.ts)
           turn.completed = {
             stopReason: (str(event.stopReason) ?? 'end_turn') as StopReason,
@@ -679,6 +694,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         const located = itemsById.get(itemKey(event, itemId))
         const delta = str(event.delta) ?? ''
         if (!located || delta === '' || !isUiItem(located.entry.entry)) break
+        recordActivity(located.turn, event)
         const item = located.entry.entry
         if (event.field === 'output' && item.kind === 'tool') {
           item.output = (item.output ?? '') + delta
@@ -735,6 +751,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         if (!located || located.turn.v2Items || located.entry.origin !== 'v1') break
         const item = located.entry.entry
         if (item.kind !== 'tool') break
+        recordActivity(located.turn, event)
         item.status = 'completed'
         item.output = resultText(event.result)
         break
@@ -953,6 +970,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         ...(draft.sessionKey !== undefined ? { sessionKey: draft.sessionKey } : {}),
         ...(draft.userMessage !== undefined ? { userMessage: draft.userMessage } : {}),
         ...(draft.startedAt !== undefined ? { startedAt: draft.startedAt } : {}),
+        ...(draft.lastActivityAt !== undefined ? { lastActivityAt: draft.lastActivityAt } : {}),
         ...(draft.planEntries !== undefined ? { planEntries: draft.planEntries } : {}),
         ...(draft.completed !== undefined ? { completed: draft.completed } : {}),
         ...(draft.sessionEnded !== undefined ? { sessionEnded: draft.sessionEnded } : {}),

@@ -212,13 +212,13 @@ export function TaskThreadRoute() {
 
 const NO_EVENTS: readonly RunEvent[] = []
 
-/** The transcript column beside a harness run's rail; an ordinary run renders it bare, as on main
- *  (PR #925 review). */
-function RailLayout({ rail, children }: { rail: ReactNode; children: ReactNode }) {
-  if (!rail) return <>{children}</>
+/** A harness run keeps stable wrappers so its transcript survives the ledger's arrival; an ordinary
+ *  run never gets a rail and renders bare, as on main (PR #925 review). */
+function RailLayout({ harness, rail, children }: { harness: boolean; rail: ReactNode; children: ReactNode }) {
+  if (!harness) return <>{children}</>
   return (
-    <div data-slot="run-rail-grid" className={RUN_RAIL_GRID}>
-      <div className="flex min-w-0 flex-col gap-2.5 md:gap-3.5">{children}</div>
+    <div data-slot={rail ? 'run-rail-grid' : undefined} className={rail ? RUN_RAIL_GRID : 'contents'}>
+      <div className={rail ? 'flex min-w-0 flex-col gap-2.5 md:gap-3.5' : 'contents'}>{children}</div>
       {rail}
     </div>
   )
@@ -497,6 +497,7 @@ export function ThreadView({
           </Suspense>
         ) : null}
         <RailLayout
+          harness={Boolean(run.harness)}
           rail={harnessLedger && harnessRailHasContent(harnessLedger) ? (
             <Suspense fallback={null}>
               <HarnessRail
@@ -895,14 +896,20 @@ function HistoryBoundary({
 export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefined {
   const last = thread.turns.at(-1)
   if (last === undefined) return run.startedAt
-  // Driver notes can trail the reviewers; their clocks still belong to the council (PR #925 review).
-  if (last.sessionKey !== undefined || (last.stepId !== undefined && last.turnId === undefined && last.userMessage === undefined && last.startedAt === undefined)) {
+  // Queued messages and driver notes can trail an active council (PR #925 review).
+  const pendingMessage = last.userMessage !== undefined && last.turnId === undefined
+  if (last.sessionKey !== undefined || pendingMessage || (last.stepId !== undefined && last.turnId === undefined && last.startedAt === undefined)) {
     // A resumed council cannot inherit a reviewer's pre-crash clock (PR #925 review).
     const resumeIndex = thread.turns.reduce((latest, turn, index) => turn.userMessage !== undefined ? index : latest, -1)
-    const allPeers = thread.turns.filter((turn) => turn.sessionKey !== undefined && turn.stepId === last.stepId)
-    const resumed = thread.turns.slice(resumeIndex + 1).filter((turn) => turn.sessionKey !== undefined && turn.stepId === last.stepId)
-    const peers = resumed.length > 0 ? resumed : allPeers
-    if (peers.length > 0) {
+    const resume = thread.turns[resumeIndex]
+    const stepId = last.stepId ?? (pendingMessage ? thread.turns.filter((turn) => turn.sessionKey !== undefined).at(-1)?.stepId : undefined)
+    const allPeers = thread.turns.filter((turn) => turn.sessionKey !== undefined && turn.stepId === stepId)
+    const resumed = thread.turns.slice(resumeIndex + 1).filter((turn) => turn.sessionKey !== undefined && turn.stepId === stepId)
+    const activeAfterMessage = resume === undefined || allPeers.some((turn) =>
+      turn.lastActivityAt !== undefined && resume.startedAt !== undefined && Date.parse(turn.lastActivityAt) > Date.parse(resume.startedAt),
+    )
+    const peers = resumed.length > 0 ? resumed : activeAfterMessage ? allPeers : []
+    if (peers.length > 0 && (!pendingMessage || peers.some((turn) => turn.completed === undefined && turn.sessionEnded === undefined))) {
       const open = peers.filter((turn) => turn.completed === undefined && turn.sessionEnded === undefined)
       const earliestStart = (turns: typeof peers) => turns.reduce<string | undefined>((earliest, turn) => {
         const startedAt = turn.startedAt
@@ -915,6 +922,7 @@ export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefi
         return endedAt !== undefined && (latest === undefined || Date.parse(endedAt) > Date.parse(latest)) ? endedAt : latest
       }, undefined) ?? earliestStart(peers) ?? run.startedAt
     }
+    if (allPeers.length > 0 && resume !== undefined && last.startedAt === undefined) return resume.startedAt ?? run.startedAt
   }
   if (last.completed === undefined) return last.startedAt ?? run.startedAt
   return last.completed.ts ?? run.startedAt

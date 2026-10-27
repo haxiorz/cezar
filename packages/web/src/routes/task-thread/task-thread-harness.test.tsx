@@ -345,6 +345,60 @@ describe('harness rail layout', () => {
     expect(rail.className).not.toContain('top-[calc(var(--run-header-h')
   })
 
+  it('preserves transcript, review and history DOM identity when the ledger rail appears', async () => {
+    stubHarnessFetch(undefined)
+    const client = createQueryClient()
+    const subject: ApiRun = { ...run, status: 'review' }
+    const thread = reduceThread([at(1, 'item.completed', {
+      item: { kind: 'message', id: 'answer', role: 'assistant', text: 'Ready to review' },
+    })])
+    const view = (snapshot?: HarnessLedgerResponse) => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ThreadView run={subject} thread={thread} history={historyWindow([], true)} harnessLedger={snapshot} embedded />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const { rerender } = render(view())
+    const transcript = document.querySelector('[data-slot="thread-rows"]')!
+    const answer = screen.getByText('Ready to review')
+    const review = document.querySelector('[data-slot="review-panel"]')!
+    const boundary = document.querySelector('[data-slot="history-boundary"]')!
+    const notes = screen.getByLabelText<HTMLTextAreaElement>('Notes for the agent')
+    fireEvent.change(notes, { target: { value: 'Keep my review notes' } })
+
+    rerender(view(ledger))
+    await waitFor(() => expect(document.querySelector('[data-slot="harness-rail"]')).not.toBeNull())
+
+    expect(document.querySelector('[data-slot="thread-rows"]'), 'transcript DOM node must survive ledger arrival').toBe(transcript)
+    expect(screen.getByText('Ready to review')).toBe(answer)
+    expect(document.querySelector('[data-slot="review-panel"]')).toBe(review)
+    expect(document.querySelector('[data-slot="history-boundary"]')).toBe(boundary)
+    expect(screen.getByLabelText<HTMLTextAreaElement>('Notes for the agent').value).toBe('Keep my review notes')
+  })
+
+  it('guard: composer drafts and DOM survive rail appearance and disappearance', async () => {
+    stubHarnessFetch(undefined)
+    const client = createQueryClient()
+    const view = (snapshot: HarnessLedgerResponse) => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ThreadView run={run} thread={reduceThread([])} harnessLedger={snapshot} embedded />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const emptyLedger = { ...ledger, phases: [], models: [] }
+    const { rerender } = render(view(emptyLedger))
+    const composer = screen.getByLabelText<HTMLTextAreaElement>('Reply to the agent')
+    fireEvent.change(composer, { target: { value: 'Preserve this composer draft' } })
+    rerender(view(ledger))
+    await waitFor(() => expect(document.querySelector('[data-slot="harness-rail"]')).not.toBeNull())
+    rerender(view(emptyLedger))
+    expect(screen.getByLabelText('Reply to the agent')).toBe(composer)
+    expect(composer.value).toBe('Preserve this composer draft')
+    expect(document.querySelector('[data-slot="run-rail-grid"]')).toBeNull()
+  })
+
   it('reserves no rail track while the ledger has nothing to show', () => {
     renderThread(run, { ...ledger, phases: [], models: [] })
 
@@ -352,11 +406,12 @@ describe('harness rail layout', () => {
     expect(document.querySelector('[data-slot="harness-rail"]')).toBeNull()
   })
 
-  it('leaves an ordinary run exactly as on main', () => {
+  it('guard: leaves an ordinary run layout exactly as on main', () => {
     const { harness: _harness, ...ordinary } = run
     renderThread(ordinary)
 
     expect(document.querySelector('[data-route="task-thread"]')!.className).toBe('flex min-h-full flex-col')
     expect(document.querySelector('[data-slot="run-rail-grid"]')).toBeNull()
+    expect(document.querySelector('[data-route="task-thread"] .contents')).toBeNull()
   })
 })

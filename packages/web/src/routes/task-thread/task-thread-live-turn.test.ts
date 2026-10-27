@@ -89,6 +89,71 @@ describe('PR #925 round3 issue3: restart boundaries', () => {
 })
 
 describe('PR #925 review: mid-council messages', () => {
+  it.each([false, true])('keeps a queued-message council clock with or without a driver note (note=%s)', (driverNote) => {
+    const thread = reduceThread([
+      ...started,
+      { seq: 3, type: 'user-message', text: 'Also check tests', ts: bEnd },
+      { seq: 4, type: 'item.completed', stepId: 'review', sessionKey: 'b', ts: aEnd,
+        item: { kind: 'message', id: 'finding', role: 'assistant', text: 'Checking tests' } },
+      ...(driverNote ? [{ seq: 5, type: 'note', stepId: 'review', message: 'Still reviewing', ts: aEnd }] : []),
+    ])
+    expect(liveTurnStart(run, thread)).toBe(aStart)
+  })
+
+  it.each([false, true])('starts at Continue during durable-ledger reuse notes before a resumed reviewer opens (earlier phase note=%s)', (earlierPhaseNote) => {
+    const resumedAt = '2026-09-23T11:00:00.000Z'
+    const thread = reduceThread([
+      ...started,
+      event(3, 'turn.completed', 'a', aEnd),
+      { seq: 4, type: 'lifecycle', message: 'cezar restarted', ts: '2026-09-23T10:30:00.000Z' },
+      { seq: 5, type: 'user-message', text: 'Continue', ts: resumedAt },
+      { seq: 6, type: 'lifecycle', message: 'Harness resumed', ts: resumedAt },
+      ...(earlierPhaseNote ? [{ seq: 7, type: 'note', stepId: 'implement', message: 'Reused completed implementer from the durable ledger', ts: resumedAt }] : []),
+      { seq: 8, type: 'harness.phase.updated', stepId: 'review', phase: { id: 'review', status: 'running' }, ts: resumedAt },
+      { seq: 9, type: 'note', stepId: 'review', message: 'Reused completed reviewer A from the durable ledger', ts: resumedAt },
+    ], { stepNames: new Map([['implement', 'Implement'], ['review', 'Review']]) })
+    expect(thread.turns.find((turn) => turn.sessionKey === 'b')?.lastActivityAt).toBe(bStart)
+    expect(liveTurnStart(run, thread)).toBe(resumedAt)
+  })
+
+  it.each(['item.updated', 'item.completed', 'item.delta', 'usage.updated', 'plan.updated'])('uses %s activity on an existing reviewer after a queued message', (type) => {
+    const item = { kind: 'message', id: 'finding', role: 'assistant', text: 'Checking' }
+    const thread = reduceThread([
+      ...started,
+      { seq: 3, type: 'item.started', stepId: 'review', sessionKey: 'a', ts: bStart, item },
+      { seq: 4, type: 'user-message', text: 'Also check tests', ts: bEnd },
+      { seq: 5, type, stepId: 'review', sessionKey: 'a', ts: aEnd, item, itemId: 'finding', field: 'text', delta: ' tests', entries: [], usage: { total: 100 } },
+    ])
+    expect(thread.turns[0]?.lastActivityAt).toBe(aEnd)
+    expect(liveTurnStart(run, thread)).toBe(aStart)
+  })
+
+  it('guard: a queued message after a closed council keeps its own clock', () => {
+    const messageAt = '2026-09-23T11:00:00.000Z'
+    const thread = reduceThread([
+      ...started, event(3, 'turn.completed', 'a', aEnd), event(4, 'turn.completed', 'b', bEnd),
+      { seq: 5, type: 'user-message', text: 'Continue', ts: messageAt },
+    ])
+    expect(liveTurnStart(run, thread)).toBe(messageAt)
+  })
+
+  it('guard: ordinary queued messages retain identical turns and their message clock', () => {
+    const thread = reduceThread([
+      { seq: 1, type: 'turn.started', turnId: 'ordinary', ts: aStart },
+      { seq: 2, type: 'user-message', text: 'Follow up', ts: bStart },
+      { seq: 3, type: 'note', message: 'Queued', ts: bEnd },
+    ])
+    expect(thread).toEqual({
+      turns: [
+        { id: 'turn-seq-1', turnId: 'ordinary', startedAt: aStart, items: [] },
+        { id: 'turn-seq-2', startedAt: bStart, userMessage: { text: 'Follow up', imageCount: 0, images: [], ts: bStart },
+          items: [{ kind: 'note', id: 'v1:3', text: 'Queued', tone: 'dim' }] },
+      ],
+      lastEventAt: bEnd,
+    })
+    expect(liveTurnStart(run, thread)).toBe(bStart)
+  })
+
   it('guard: keeps the surviving reviewer clock under commentary without a queued message', () => {
     const thread = reduceThread([
       ...started,
