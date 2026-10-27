@@ -145,7 +145,7 @@ import { resolveProfileEnvForRoot } from '../workspace/agent-profiles.ts';
 import { DEFAULT_AGENT_ACCOUNT_ID } from '../workspace/agent-accounts.ts';
 import { WorkspaceSemaphore, type AccountHolds } from '../workspace/semaphore.ts';
 import { SecretStore } from '../workspace/secrets.ts';
-import { PROJECT_ID_RE } from '../workspace/config.ts';
+import { PROJECT_ID_RE, loadWorkspaceConfig } from '../workspace/config.ts';
 import { prunePrHeadRefs } from '../automations/pr-head.ts';
 import { MIN_SECRET_LEN } from '../core/secret-redaction.ts';
 import { track } from '../telemetry.ts';
@@ -1003,16 +1003,30 @@ export interface StartRunInput {
  * The effective "extra" system prompt for a run (spec §protocol v2, R2 2.3):
  * the per-run override (`POST /api/runs` `systemPrompt`) REPLACES the
  * `config.json` default — they are the same knob at two scopes, so the more
- * specific one wins outright; they never concatenate. Whichever wins is
- * ADDITIVE to the skill body and the handoff contract, which always ride
- * along (see `composeSystemPrompt`). Blank strings count as unset.
+ * specific one wins outright; they never concatenate. The global instructions
+ * (`~/.cezar/config.json` `systemPrompt`) are a different knob: they always
+ * ride along, placed FIRST and labelled as yielding to the project's. Whichever
+ * wins is ADDITIVE to the skill body and the handoff contract (see
+ * `composeSystemPrompt`). Blank strings count as unset.
  */
 export function resolveExtraSystemPrompt(
   override: string | undefined,
   configDefault: string | undefined,
+  globalDefault?: string,
 ): string | undefined {
-  return override?.trim() || configDefault?.trim() || undefined;
+  const project = override?.trim() || configDefault?.trim() || undefined;
+  const global = globalDefault?.trim() || undefined;
+  if (!global || !project) return project ?? global;
+  return [
+    `${GLOBAL_INSTRUCTIONS_HEADING}\n\n${global}`,
+    `${PROJECT_INSTRUCTIONS_HEADING}\n\n${project}`,
+  ].join('\n\n---\n\n');
 }
+
+export const GLOBAL_INSTRUCTIONS_HEADING =
+  '## Global instructions\n\nThese apply to every project. Where they conflict with the project instructions below, the project instructions win.';
+export const PROJECT_INSTRUCTIONS_HEADING =
+  '## Project instructions\n\nThese are specific to this project and take precedence over the global instructions above.';
 
 /**
  * Joins the parts of one agent step's system prompt in fixed order — skill
@@ -1035,12 +1049,13 @@ export function composeSystemPrompt(...parts: Array<string | undefined>): string
  *
  * De-duplicated against the run's extra system prompt, and that is not a micro-optimisation:
  * `dispatch()` seeds a child's extra prompt with the very same text, so composing both would
- * hand the backend the same instructions twice.
+ * hand the backend the same instructions twice. Containment, not equality: with global
+ * instructions set, `resolveExtraSystemPrompt` wraps that seed under its own heading.
  */
 export function dispatchPromptPart(prompt: string | undefined, extra: string | undefined): string | undefined {
   const part = prompt?.trim();
   if (!part) return undefined;
-  return part === extra?.trim() ? undefined : part;
+  return extra?.includes(part) ? undefined : part;
 }
 
 /**
@@ -5550,7 +5565,7 @@ export class RunManager {
     const extraSystemPrompt = resumeStep && original?.systemPrompt !== undefined
       ? original.systemPrompt
       : composeSystemPrompt(
-        resolveExtraSystemPrompt(input.systemPrompt, config.systemPrompt),
+        resolveExtraSystemPrompt(input.systemPrompt, config.systemPrompt, (await loadWorkspaceConfig().catch(() => null))?.systemPrompt),
         state.autoLand ? landingPromptPart(state.autoLand.baseLabel, state.autoLand.checks, state.autonomous === true) : undefined,
         state.readOnly ? READ_ONLY_PROMPT : undefined,
       ) || undefined;
