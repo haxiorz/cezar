@@ -252,6 +252,7 @@ describe('PR #925 review: round 6 index normalization', () => {
     expect(git('diff', 'HEAD')).toBe('');
   });
 
+  // Report-only; building the 10k-file repo dominates under full-suite load.
   it('subject snapshot timing on at least 10000 tracked files', async () => {
     fs.mkdirSync(join(cwd, 'src/bulk'));
     for (let i = 0; i < 10_000; i += 1) write(`src/bulk/${i}.txt`, `file ${i}\n${'x'.repeat(2048)}\n`);
@@ -269,7 +270,7 @@ describe('PR #925 review: round 6 index normalization', () => {
       }
     }
     process.stdout.write(`subject snapshot benchmark ${JSON.stringify({ count, timings })}\n`);
-  }, 30_000);
+  }, 120_000);
 
   it('[r6-docs] distinguishes runner temp isolation from packet codex exec', () => {
     const doc = fs.readFileSync(new URL('../../../../docs/multi-model-harness.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
