@@ -168,7 +168,7 @@ afterEach(() => {
   document.documentElement.classList.remove('light')
 })
 
-const PROJECT_SECTIONS = ['tracker', 'secrets', 'integrations', 'agents', 'instructions', 'tasks', 'agent-config', 'worktrees', 'bookmarklets']
+const PROJECT_SECTIONS = ['tracker', 'secrets', 'webhooks', 'integrations', 'agents', 'instructions', 'tasks', 'agent-config', 'worktrees', 'bookmarklets']
 const GLOBAL_SECTIONS = [
   'appearance',
   'notifications',
@@ -216,8 +216,9 @@ describe('the section registry', () => {
     for (const capabilities of [undefined, {}, { multiModel: false }]) {
       expect(visibleSettingsSections('project', capabilities).map((s) => s.id)).toEqual(PROJECT_SECTIONS)
     }
+    const afterAgents = PROJECT_SECTIONS.indexOf('agents') + 1
     expect(visibleSettingsSections('project', { multiModel: true }).map((s) => s.id)).toEqual([
-      ...PROJECT_SECTIONS.slice(0, 4), 'harness', ...PROJECT_SECTIONS.slice(4),
+      ...PROJECT_SECTIONS.slice(0, afterAgents), 'harness', ...PROJECT_SECTIONS.slice(afterAgents),
     ])
   })
 })

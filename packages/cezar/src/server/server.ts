@@ -1,3 +1,7 @@
+import { createWebhookRoutes } from './webhooks.ts';
+import { WebhookCoordinator } from '../webhooks/coordinator.ts';
+import { webhooksEnabled } from '../webhooks/service.ts';
+import { listServerInstances } from '../server-install/state.ts';
 import { resolveDeferredReset, deferredHoldUntil } from '../automations/deferred-reset.ts';
 import { deferredStartOptions, previewDeferredStart, digest, validateDeferredBinding } from '../automations/deferred-start.ts';
 import { deferredOptionsInputSchema, deferredPreviewInputSchema, deferredCreateInputSchema, deferredMutationQuerySchema } from '@open-mercato/cezar-contract';
@@ -52,7 +56,7 @@ import { trackerTriggerSchema, trackerAutomationOptionsSchema, trackerAutomation
 import type { IncomingMessage } from 'node:http';
 import { access, constants as fsConstants, lstat, mkdir, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, posix, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Hono, type Context } from 'hono';
 import type { Next } from 'hono';
@@ -422,6 +426,8 @@ export interface ServerDeps {
    *  context is seeded from `deps.{store,manager}` (which src/index.ts already
    *  recovered/pruned at startup) and the resolver short-circuits to it. */
   contexts?: ProjectContexts;
+  webhooks?: WebhookCoordinator;
+  webhookPort?: number;
   /** Boot project's shared automation store. `startServer` injects the
    *  coordinator-owned instance so HTTP routes and the scheduler never cache
    *  separate views of the same project files. */
@@ -1663,6 +1669,26 @@ export function createApp(deps: ServerDeps) {
     },
     semaphore: deps.semaphore,
   });
+  const webhooks = deps.webhooks ?? (webhooksEnabled() ? new WebhookCoordinator({
+    mode: () => capabilities().localHandoff ? 'local' : 'hosted',
+    ports: () => [deps.webhookPort ?? 4321, ...listServerInstances().map(instance => instance.state.primaryPort)],
+    projects: async () => listProjects(capabilities().singleProject ? { projectId: await resolveBootProject() } : undefined),
+    dryRun: process.env.CEZ_DRY_RUN === '1',
+  }) : undefined);
+  const offWebhookPrepare = contexts.onBeforeRecover(async context => {
+    await webhooks?.attach(context, context.id, false);
+    return () => webhooks?.detach(context);
+  });
+  const offWebhookReady = contexts.onContextBuilt(context => webhooks?.ready(context.root, context));
+  deps.onDispose?.(() => { offWebhookPrepare(); offWebhookReady(); void webhooks?.dispose(); });
+  const webhookRoutes = createWebhookRoutes(async context => {
+    if (!webhooks) throw new Error('Webhook service is unavailable');
+    const id = context === bootContext ? await resolveBootProject() : context.id;
+    await webhooks.attach(context, id, true, context === bootContext);
+    return webhooks.get(id, context.root, context === bootContext);
+  });
+  // Production injects the observer before boot recovery; embedded callers attach before serving.
+  if (webhooks) void resolveBootProject().then(id => webhooks.attach(bootContext, id, true, true)).then(() => { if (deps.webhookPort !== undefined) webhooks.start(); });
   // Workspace-level SSE bus (step 2.8) — the registry mutators and the
   // checkout flow (Phase 4) emit here; /api/workspace/events relays.
   const workspaceEvents = deps.workspaceEvents ?? new WorkspaceEventBus();
@@ -1837,6 +1863,12 @@ export function createApp(deps: ServerDeps) {
     if (raw === 'default' || raw === (await resolveBootProject())) {
       c.set('project', bootContext);
       return next();
+    }
+    // Enforce the scope before opening a context: production and embedded
+    // callers can inject an unfiltered context provider. Hiding registry rows
+    // alone must not allow a direct URL to recover or mutate another project.
+    if (capabilities().singleProject) {
+      return c.json({ error: `unknown project: ${raw}` }, 404);
     }
     try {
       c.set('project', await contexts.context(raw));
@@ -3073,6 +3105,9 @@ export function createApp(deps: ServerDeps) {
       // Lost a race with another writer (or another cezar process): the entry is
       // gone, which is what the caller wanted, but say it honestly.
       if (!removed) return c.json({ error: `unknown project: ${id}` }, 404);
+      // Stop capture only after the registry commit; failed removal must leave
+      // the registered project operational. Pause before disposing its context.
+      const webhookWarning = await webhooks?.remove(entry.root);
       // In-process handles for a project no route can reach any more: store
       // closed (index flushed), manager's timers and usage subscription dropped.
       trackerWatches.invalidateProject(entry.root);
@@ -3080,7 +3115,7 @@ export function createApp(deps: ServerDeps) {
       for (const run of contexts.peek(id)?.store.listRuns() ?? []) stopTaskProcesses(run.id);
       contexts.dispose(id);
       workspaceEvents.emit('project-removed', { id });
-      const body: RemoveProjectResponse = { removed: true, id };
+      const body: RemoveProjectResponse = { removed: true, id, ...(webhookWarning ? { warning: webhookWarning } : {}) };
       return c.json(body);
     })
 
@@ -6309,18 +6344,43 @@ export function createApp(deps: ServerDeps) {
           'cache-control': 'private, max-age=31536000, immutable',
         });
       }
+      // A worktree-off run browses the REAL checkout: apply `/repo/files`' index guard so ignored
+      // files (`.env`, `.ai/cezar/` state and webhook keys) stay unreadable here too.
+      let indexed: { files: Set<string>; dirs: Set<string> } | undefined;
+      if (run.worktree === false) {
+        const index = await listRepoPaths(workingDirectory, Number.MAX_SAFE_INTEGER);
+        if (!index.ok) return c.json({ error: index.error }, 409);
+        indexed = { files: new Set(index.paths), dirs: new Set(['']) };
+        for (const path of index.paths) {
+          for (let cut = path.indexOf('/'); cut !== -1; cut = path.indexOf('/', cut + 1)) indexed.dirs.add(path.slice(0, cut));
+        }
+        // Checked before touching the disk too, so a missing ignored path answers exactly like a present one.
+        const requested = posix.normalize(query.path || '.').replace(/^\.\/?$/, '').replace(/\/+$/, '');
+        if (!indexed.files.has(requested) && !indexed.dirs.has(requested)) {
+          return c.json({ error: `path is not in the repository index: ${query.path}` }, 409);
+        }
+      }
       const result = await readWorktreePath(workingDirectory, query.path ?? '');
       if (result.kind === 'invalid' || result.kind === 'missing') {
         return c.json({ error: result.error }, 409);
       }
+      // One message for ignored and absent alike, as in `/repo/files`: never disclose an ignored path.
+      if (indexed && !(result.kind === 'dir' ? indexed.dirs : indexed.files).has(result.path)) {
+        return c.json({ error: `path is not in the repository index: ${query.path}` }, 409);
+      }
       if (result.kind === 'dir') {
+        const visible = indexed;
+        const prefix = result.path ? `${result.path}/` : '';
+        const entries = visible
+          ? result.entries.filter((entry) => (entry.type === 'file' ? visible.files : visible.dirs).has(prefix + entry.name))
+          : result.entries;
         return c.json({
           // `as const` or the literal widens to `string` during Hono's route-type inference,
           // which erases the discriminant a consumer narrows on — `entry.type === 'dir'` then
           // leaves `never` and every field access on it fails. The wire was always 'dir'.
           type: 'dir' as const,
           path: result.path,
-          entries: result.entries,
+          entries,
         });
       }
       if (wantsRaw) {
@@ -6475,6 +6535,7 @@ export function createApp(deps: ServerDeps) {
           store.updateRun(id, {
             pullRequestUrl: outcome.url,
             status: 'done',
+            completionReason: 'pr_opened',
             finishedAt: run.finishedAt ?? new Date().toISOString(),
           });
           store.appendEvent(id, {
@@ -8490,6 +8551,7 @@ export function createApp(deps: ServerDeps) {
     .route('/', planRoutes)
     .route('/', automationsRoutes)
     .route('/', harnessRoutes)
+    .route('/', webhookRoutes)
     .route('/', dispatchRoutes)
     .route('/', runsRoutes)
     .route('/', draftRoutes)
@@ -8877,6 +8939,7 @@ export function startServer(deps: ServerDeps, port: number): ServerType & { shut
     ...deps,
     onDispose: (cleanup) => { appCleanups.push(cleanup); deps.onDispose?.(cleanup); },
     contexts: sharedContexts,
+    webhookPort: port,
     automationStore: bootAutomationStore,
     workspaceEvents,
     skillsUpdate,
