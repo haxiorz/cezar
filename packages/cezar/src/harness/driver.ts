@@ -323,6 +323,7 @@ function hashWorktreeContentVsHead(
   try {
     const indexPath = join(temporary, 'index');
     const env = { GIT_INDEX_FILE: indexPath };
+    const privateGit = (args: string[]) => git(['-c', 'core.splitIndex=false', '-c', 'advice.sparseIndexExpanded=false', ...args], env);
     try {
       const realIndex = join(gitDir, 'index');
       const { atime, mtime } = statSync(realIndex);
@@ -331,14 +332,14 @@ function hashWorktreeContentVsHead(
     } catch {
       // A missing or unreadable index can still be seeded from HEAD.
     }
-    normalizeHarnessIndex(cwd, (args) => git(args, env));
-    status = git([
+    normalizeHarnessIndex(cwd, privateGit);
+    status = privateGit([
       'status',
       '--porcelain=v1',
       '-z',
       '--untracked-files=all',
       '--no-renames',
-    ], env);
+    ]);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -400,28 +401,40 @@ export async function snapshotHarnessStageSubject(cwd: string, indexRoot?: strin
   return hash.digest('hex');
 }
 
+// Reserve argv room below Windows' 32 KiB and macOS's 1 MiB limits (PR #925 review).
+function harnessPathBatches(paths: readonly string[]): string[][] {
+  const batches: string[][] = [];
+  let batch: string[] = [];
+  let bytes = 0;
+  for (const path of paths) {
+    const size = Buffer.byteLength(path) + 1;
+    if (batch.length && bytes + size > 16_384) {
+      batches.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(path);
+    bytes += size;
+  }
+  if (batch.length) batches.push(batch);
+  return batches;
+}
+
 // Share sparse/flag semantics between review subjects and staging (PR #925 review).
-function normalizeHarnessIndex(cwd: string, git: (args: string[]) => Buffer): void {
-  try { git(['read-tree', '--reset', 'HEAD']); } catch { git(['read-tree', 'HEAD']); }
+export function normalizeHarnessIndex(cwd: string, git: (args: string[]) => Buffer): void {
   let sparse = false;
   try { sparse = git(['config', '--bool', 'core.sparseCheckout']).toString('utf8').trim() === 'true'; } catch {
     // An unset sparse-checkout option is the ordinary full worktree.
   }
+  try { git(['read-tree', '--reset', 'HEAD']); } catch (error) {
+    // Plain read-tree loses absent sparse entries' S bits (PR #925 review).
+    if (!sparse) git(['read-tree', 'HEAD']);
+    else if (/index\.lock|another git process/i.test(String(error))) git(['read-tree', '--reset', 'HEAD']);
+    else throw error;
+  }
   const entries = git(['ls-files', '-v', '-z']).toString('utf8').split('\0').filter(Boolean);
   const clear = (flag: string, paths: string[]) => {
-    let batch: string[] = [];
-    let bytes = 0;
-    for (const path of paths) {
-      const size = Buffer.byteLength(path) + 1;
-      if (batch.length && bytes + size > 32_768) {
-        git(['update-index', flag, '--', ...batch]);
-        batch = [];
-        bytes = 0;
-      }
-      batch.push(path);
-      bytes += size;
-    }
-    if (batch.length) git(['update-index', flag, '--', ...batch]);
+    for (const batch of harnessPathBatches(paths)) git(['update-index', flag, '--', ...batch]);
   };
   clear('--no-assume-unchanged', entries.filter((entry) => /^[a-z] /.test(entry)).map((entry) => entry.slice(2)));
   clear('--no-skip-worktree', entries.filter((entry) => {
@@ -439,7 +452,7 @@ export function resetIndexToHead(cwd: string): void {
   const git = (args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], {
     cwd,
     maxBuffer: 256 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'ignore'],
+    stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env },
   });
   try {
@@ -454,7 +467,7 @@ export async function harnessDiff(cwd: string, paths: readonly string[], indexPa
   const pinned = pinnedGitEnv(cwd);
   if (!pinned) throw new Error('packet worktree has no pinned Git directory');
   const env = { ...process.env, ...pinned, GIT_INDEX_FILE: indexPath, GIT_TERMINAL_PROMPT: '0' };
-  const git = async (args: string[]) => (await promisify(execFile)('git', args, {
+  const git = async (args: string[]) => (await promisify(execFile)('git', ['-c', 'core.splitIndex=false', '-c', 'advice.sparseIndexExpanded=false', ...args], {
     cwd, env, encoding: 'buffer', maxBuffer: 256 * 1024 * 1024,
   })).stdout;
   try {
@@ -480,8 +493,10 @@ export async function harnessDiff(cwd: string, paths: readonly string[], indexPa
       }
       if (present) scopes.push(`:(literal)${path}`);
     }
-    if (scopes.length || paths.length === 0) await git(['add', '-A', ...(scopes.length ? ['--', ...scopes] : [])]);
-    return await git(['diff', '--cached', '--no-ext-diff', '--binary', 'HEAD', '--', ...scopes]);
+    if (paths.length === 0) await git(['add', '-A']);
+    else for (const batch of harnessPathBatches(scopes)) await git(['add', '-A', '--', ...batch]);
+    // This private index contains only the selected scopes (PR #925 review).
+    return await git(['diff', '--cached', '--no-ext-diff', '--binary', 'HEAD', '--']);
   } finally {
     rmSync(indexPath, { force: true });
     rmSync(`${indexPath}.lock`, { force: true });
@@ -504,8 +519,9 @@ export async function preserveAndRestorePacket(cwd: string, paths: readonly stri
   const git = (args: string[]) => execFileSync('git', args, { cwd, env, maxBuffer: 256 * 1024 * 1024 });
   const scopes = paths.map((path) => `:(literal)${path}`);
   const names = (args: string[]) => git(args).toString('utf8').split('\0').filter(Boolean);
-  const headPaths = names(['ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', ...scopes]);
-  const currentPaths = names(['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', ...scopes]);
+  const batches = scopes.length ? harnessPathBatches(scopes) : [[]];
+  const headPaths = [...new Set(batches.flatMap((batch) => names(['ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', ...batch])))];
+  const currentPaths = [...new Set(batches.flatMap((batch) => names(['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', ...batch])))];
   const affected = [...new Set([...headPaths, ...currentPaths])];
   for (const path of affected) {
     for (let parent = dirname(resolve(cwd, path)); parent !== resolve(cwd); parent = dirname(parent)) {
@@ -552,8 +568,8 @@ export async function preserveAndRestorePacket(cwd: string, paths: readonly stri
       rmSync(join(cwd, path), { force: true });
       git(['update-index', '--force-remove', '--', path]);
     }
-    if (headPaths.length) {
-      git(['restore', '--source=HEAD', '--staged', '--worktree', '--', ...headPaths.map((path) => `:(literal)${path}`)]);
+    for (const batch of harnessPathBatches(headPaths.map((path) => `:(literal)${path}`))) {
+      git(['restore', '--source=HEAD', '--staged', '--worktree', '--', ...batch]);
     }
     if ((await harnessDiff(cwd, paths, `${artifactPath}.index`)).length) {
       throw new Error('packet allowed paths still contain uncommitted changes after restoration');
@@ -566,9 +582,10 @@ export async function preserveAndRestorePacket(cwd: string, paths: readonly stri
 
 function currentChangedPaths(cwd: string): string[] | null {
   try {
-    const tracked = execFileSync('git', ['diff', '--name-only', '-z', 'HEAD', '--'], {
+    const tracked = execFileSync('git', ['-c', 'core.hooksPath=/dev/null', 'diff', '--name-only', '-z', 'HEAD', '--'], {
       cwd,
       encoding: 'utf8',
+      maxBuffer: 256 * 1024 * 1024,
       stdio: ['ignore', 'pipe', 'ignore'],
       env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', ...pinnedGitEnv(cwd) },
     })
@@ -576,10 +593,11 @@ function currentChangedPaths(cwd: string): string[] | null {
       .filter(Boolean);
     const untracked = execFileSync(
       'git',
-      ['ls-files', '--others', '--exclude-standard', '-z', '--'],
+      ['-c', 'core.hooksPath=/dev/null', 'ls-files', '--others', '--exclude-standard', '-z', '--'],
       {
         cwd,
         encoding: 'utf8',
+        maxBuffer: 256 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'ignore'],
         env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', ...pinnedGitEnv(cwd) },
       },
@@ -5849,7 +5867,22 @@ export async function runHarnessDriver(
       return reason;
     }
 
-    if (!(phaseDone('stage') && ledger.stage.status === 'staged')) resetIndexToHead(host.cwd);
+    const invalidateStage = (): void => {
+      const phase = ledger.phases.find((entry) => entry.id === 'stage');
+      if (phase) {
+        phase.status = 'pending';
+        phase.startedAt = undefined;
+        phase.endedAt = undefined;
+        phase.error = undefined;
+      }
+      ledger.stage = { status: 'pending' };
+      persist();
+    };
+    const resetBeforeStage = !(phaseDone('stage') && ledger.stage.status === 'staged');
+    if (resetBeforeStage) {
+      invalidateStage();
+      resetIndexToHead(host.cwd);
+    }
     const allowlistPath = join(artifactDir, 'allowlist.txt');
     const discoverStagePaths = (): string | null => {
       const discoveredPaths = discoverChangedPaths(host.cwd, [...allowlist]);
@@ -5906,16 +5939,12 @@ export async function runHarnessDriver(
       }),
     );
     let stageInputSha256 = stageInputHash();
-    const recoveredStage = reusableInvocation(
+    const recoveredStage = resetBeforeStage ? null : reusableInvocation(
       stageInvocationId,
       stageInputSha256,
       harnessStageResultSchema,
     );
-    if (
-      recoveredStage &&
-      phaseDone('stage') &&
-      ledger.stage.status === 'staged'
-    ) {
+    if (recoveredStage) {
       if (ledger.outcome.status === 'pending') setOutcome({ status: 'ready', blockingReasons: [] });
       host.emit({
         type: 'note',
@@ -5924,15 +5953,9 @@ export async function runHarnessDriver(
       });
       return null;
     }
-    if (recoveredStage && !phaseDone('stage')) {
-      startPhase(ledger, { id: 'stage', name: 'Stage', kind: 'op' });
-      finishPhase(ledger, 'stage', 'done');
-      persist();
-      host.setStepStatus('stage', 'done');
-      emitPhase('stage');
-    }
-    if (phaseDone('stage') && !recoveredStage) {
-      // Stale staging can outlive deleted or reverted handoff paths (PR #925 review).
+    if (!resetBeforeStage) {
+      // Keep validation and contested outcomes when only staging expires (PR #925 review).
+      invalidateStage();
       resetIndexToHead(host.cwd);
       const discoveryError = discoverStagePaths();
       if (discoveryError) {
@@ -5940,9 +5963,6 @@ export async function runHarnessDriver(
         return discoveryError;
       }
       stageInputSha256 = stageInputHash();
-      invalidateFollowingPhases('stage');
-      const phase = ledger.phases.find((entry) => entry.id === 'stage');
-      if (phase) phase.status = 'pending';
     }
     // Scope report: which staged files the task actually asked for, and which
     // came in as collateral while making a red gate green again. 71edb02c staged
@@ -5963,7 +5983,7 @@ export async function runHarnessDriver(
       });
     }
 
-    const stageError = recoveredStage ? null : await opPhase('stage', 'Stage', async () => {
+    const stageError = await opPhase('stage', 'Stage', async () => {
       const invocation = beginInvocation({
         id: stageInvocationId,
         phaseId: 'stage',

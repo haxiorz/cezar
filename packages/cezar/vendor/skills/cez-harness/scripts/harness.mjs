@@ -1214,9 +1214,20 @@ function pinnedGitEnv(cwd) {
 }
 
 function git(args, cwd, options = {}) {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: options.stdio || 'pipe', env: { ...process.env, ...pinnedGitEnv(cwd), ...(options.env || {}) } })
+  if (options.env?.GIT_INDEX_FILE) args = ['-c', 'core.splitIndex=false', '-c', 'advice.sparseIndexExpanded=false', ...args]
+  const result = spawnSync('git', args, { cwd, input: options.input, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: options.stdio || 'pipe', env: { ...process.env, ...pinnedGitEnv(cwd), ...(options.env || {}) } })
   if (result.status !== 0) throw new Error((result.stderr || result.stdout || `git ${args[0]} failed`).trim())
   return result.stdout
+}
+
+// Reserve argv room below Windows' 32 KiB and macOS's 1 MiB limits (PR #925 review).
+const PATHSPEC_ARGV_MAX_BYTES = 16_384
+function gitAddPaths(args, paths, worktree, options = {}) {
+  const pathspecs = paths.map((path) => `:(literal)${path}`)
+  if (pathspecs.reduce((bytes, path) => bytes + Buffer.byteLength(path) + 1, 0) > PATHSPEC_ARGV_MAX_BYTES) {
+    return git([...args, '--pathspec-from-file=-', '--pathspec-file-nul'], worktree, { ...options, input: pathspecs.join('\0') + '\0' })
+  }
+  return git([...args, '--', ...pathspecs], worktree, options)
 }
 
 function buildWorktreeDiff(worktree, paths = []) {
@@ -1225,10 +1236,9 @@ function buildWorktreeDiff(worktree, paths = []) {
   const env = { GIT_INDEX_FILE: index }
   try {
     git(['read-tree', 'HEAD'], worktree, { env })
-    const pathspecs = paths.map((path) => `:(literal)${path}`)
-    const addArgs = paths.length ? ['add', '-A', '--', ...pathspecs] : ['add', '-A']
-    git(addArgs, worktree, { env })
-    return git(['diff', '--cached', '--no-ext-diff', '--binary', 'HEAD', ...(paths.length ? ['--', ...pathspecs] : [])], worktree, { env })
+    if (paths.length) gitAddPaths(['add', '-A'], paths, worktree, { env })
+    else git(['add', '-A'], worktree, { env })
+    return git(['diff', '--cached', '--no-ext-diff', '--binary', 'HEAD'], worktree, { env })
   } finally {
     rmSync(temp, { recursive: true, force: true })
   }
@@ -2266,11 +2276,14 @@ function commandStage(args) {
   const ghosts = paths.filter((path) => !existsSync(join(worktree, path)) && !tracked.has(path))
   const addable = paths.filter((path) => !ghosts.includes(path))
   if (!addable.length) throw new Error('Stage allowlist is empty after dropping entries that no longer exist')
+  let sparse = false
+  try { sparse = git(['config', '--bool', 'core.sparseCheckout'], worktree).trim() === 'true' } catch {}
+  const addArgs = ['add', ...(sparse ? ['--sparse'] : [])]
   try {
-    git(['add', '--', ...addable.map((path) => `:(literal)${path}`)], worktree)
+    gitAddPaths(addArgs, addable, worktree)
   } catch (error) {
     if (!/index\.lock|unable to create/i.test(String(error.message || ''))) throw error
-    git(['add', '--', ...addable.map((path) => `:(literal)${path}`)], worktree)
+    gitAddPaths(addArgs, addable, worktree)
   }
   const staged = git(['diff', '--cached', '--name-status'], worktree).trim()
   if (!staged) throw new Error('Staged diff is empty')

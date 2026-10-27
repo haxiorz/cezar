@@ -3109,7 +3109,7 @@ syncBuiltinESMExports();
     };
     const first = realHarness();
     expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
-    const gitTask = (...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' });
+    const gitTask = (...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
     expect(gitTask('diff', '--cached', '--name-only')).toBe('src/a.txt\nsrc/new\nsrc/x\n');
     const indexPath = join(gitTask('rev-parse', '--absolute-git-dir').trim(), 'index');
     const index = readFileSync(indexPath);
@@ -3123,10 +3123,239 @@ syncBuiltinESMExports();
     expect(continued.ops.filter((op) => op.id === 'stage')).toHaveLength(change ? 1 : 0);
     expect(gitTask('diff', '--cached', '--name-only')).toBe(change ? 'src/a.txt\n' : 'src/a.txt\nsrc/new\nsrc/x\n');
     expect(loadLedger(continued.host.dataDir, continued.host.runId)?.outcome.status).toBe('ready');
-    if (!change) expect(readFileSync(indexPath)).toEqual(index);
+    if (!change) {
+      expect(readFileSync(indexPath)).toEqual(index);
+      expect(continued.events).toContainEqual(expect.objectContaining({ type: 'note', message: 'reused the hash-bound staged handoff from the durable ledger' }));
+    }
     const third = realHarness();
     expect(await runHarnessDriver(third.host, input, third.deps)).toBeNull();
     expect(third.ops.filter((op) => op.id === 'stage')).toHaveLength(0);
+  });
+
+  function round7StageHarness() {
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'test@local');
+    git('config', 'user.name', 'test');
+    git('config', 'gc.auto', '0');
+    mkdirSync(join(dir, 'src'));
+    for (const path of ['src/a.txt', 'src/x']) writeFileSync(join(dir, path), 'base\n');
+    git('add', 'src');
+    git('commit', '-qm', 'base');
+    const cwd = join(dir, 'task');
+    git('worktree', 'add', '-q', '-b', 'task', cwd);
+    const gitTask = (...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+    const make = () => {
+      const h = makeHarness(dir);
+      h.host.cwd = cwd;
+      delete h.deps.discoverChangedPaths;
+      delete h.deps.snapshotStageSubject;
+      const fake = h.deps.createRuntime!;
+      h.deps.createRuntime = (opts) => {
+        const fallback = fake(opts);
+        const real = new HarnessRuntime({ ...opts, script: new URL('../../vendor/skills/cez-harness/scripts/harness.mjs', import.meta.url).pathname });
+        return {
+          run: async (op, args, options) => {
+            if (!['capture', 'verify', 'stage'].includes(op)) return fallback.run(op, args, options);
+            h.ops.push({ kind: 'op', id: op, args });
+            return real.run(op, args, options);
+          },
+          kill: () => { fallback.kill(); real.kill(); },
+        };
+      };
+      h.agentBehavior.set('implement', (req) => {
+        for (const path of ['src/a.txt', 'src/new']) writeFileSync(join(cwd, path), 'handoff edit\n');
+        writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/a.txt', 'src/new'] }));
+        return null;
+      });
+      return h;
+    };
+    return { make, cwd, git: gitTask };
+  }
+
+  it('[r7-reuse] re-stages identical bytes after a review input expires', async () => {
+    const f = round7StageHarness();
+    const first = f.make();
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const before = loadLedger(first.host.dataDir, first.host.runId)!;
+    before.invocations.find((entry) => entry.phaseId === 'review')!.inputSha256 = 'updated-rubric';
+    saveLedger(first.host.dataDir, first.host.runId, before);
+    const next = f.make();
+    expect(await runHarnessDriver(next.host, input, next.deps)).toBeNull();
+    const after = loadLedger(next.host.dataDir, next.host.runId)!;
+    const cached = f.git('diff', '--cached', '--name-only').trim().split('\n');
+    expect(cached, 'index must match the staged ledger').toEqual(['src/a.txt', 'src/new']);
+    expect(cached).toEqual(after.stage.stagedPaths);
+    expect(next.ops.filter((op) => op.id === 'stage')).toHaveLength(1);
+    expect(after.invocations.find((entry) => entry.id === 'runtime:stage')).toMatchObject({ status: 'completed', attempt: 2 });
+  });
+
+  it('guard: [r7-reuse] unchanged staged handoff promotes a pending outcome without resetting', async () => {
+    const f = round7StageHarness();
+    const first = f.make();
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    ledger.outcome = { status: 'pending', blockingReasons: [] };
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+    const indexPath = join(f.git('rev-parse', '--absolute-git-dir').trim(), 'index');
+    const index = readFileSync(indexPath);
+    const next = f.make();
+    expect(await runHarnessDriver(next.host, input, next.deps)).toBeNull();
+    expect(next.ops.filter((op) => op.id === 'stage')).toHaveLength(0);
+    expect(readFileSync(indexPath)).toEqual(index);
+    expect(loadLedger(next.host.dataDir, next.host.runId)?.outcome.status).toBe('ready');
+  });
+
+  it.each(['pending', 'running', 'done'] as const)('[r7-restart] completed runtime with %s stage phase re-stages safely', async (status) => {
+    const f = round7StageHarness();
+    const first = f.make();
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    ledger.phases.find((entry) => entry.id === 'stage')!.status = status;
+    ledger.stage = { status: 'pending' };
+    ledger.outcome = { status: 'pending', blockingReasons: [] };
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+    const next = f.make();
+    expect(await runHarnessDriver(next.host, input, next.deps)).toBeNull();
+    expect(f.git('diff', '--cached', '--name-only')).toBe('src/a.txt\nsrc/new\n');
+    expect(next.ops.filter((op) => op.id === 'stage')).toHaveLength(1);
+    expect(loadLedger(next.host.dataDir, next.host.runId)?.stage.status).toBe('staged');
+  });
+
+  it('[r7-discovery] invalidates the stage before F4 reset even when rediscovery fails', async () => {
+    const f = round7StageHarness();
+    const first = f.make();
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    const stageInvocation = ledger.invocations.find((entry) => entry.id === 'runtime:stage')!;
+    const originalInputSha256 = stageInvocation.inputSha256;
+    stageInvocation.inputSha256 = 'expired';
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+    const next = f.make();
+    let calls = 0;
+    next.deps.discoverChangedPaths = () => ++calls === 1 ? ['src/a.txt', 'src/new'] : null;
+    expect(await runHarnessDriver(next.host, input, next.deps)).toMatch(/could not derive/);
+    const after = loadLedger(next.host.dataDir, next.host.runId)!;
+    expect(f.git('diff', '--cached')).toBe('');
+    expect(after.stage.status, 'reset index cannot be reported staged').toBe('pending');
+    const phase = after.phases.find((entry) => entry.id === 'stage')!;
+    expect(phase.status).toBe('pending');
+    for (const field of ['startedAt', 'endedAt', 'error'] as const) expect(phase[field]).toBeUndefined();
+    expect(after.claim?.held).toBe(false);
+    after.invocations.find((entry) => entry.id === 'runtime:stage')!.inputSha256 = originalInputSha256;
+    saveLedger(next.host.dataDir, next.host.runId, after);
+    const retry = f.make();
+    expect(await runHarnessDriver(retry.host, input, retry.deps)).toBeNull();
+    expect(f.git('diff', '--cached', '--name-only')).toBe('src/a.txt\nsrc/new\n');
+    expect(retry.ops.filter((op) => op.id === 'stage')).toHaveLength(1);
+  });
+
+  it.each(['discovery', 'subject'] as const)('[r7-early] reset stage stays pending on initial %s failure', async (failure) => {
+    const f = round7StageHarness();
+    const first = f.make();
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    ledger.phases.find((entry) => entry.id === 'stage')!.status = 'pending';
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+    const next = f.make();
+    if (failure === 'discovery') next.deps.discoverChangedPaths = () => null;
+    else next.deps.snapshotStageSubject = async () => { throw new Error('subject unavailable'); };
+    expect(await runHarnessDriver(next.host, input, next.deps)).toMatch(/could not/);
+    expect(f.git('diff', '--cached')).toBe('');
+    const after = loadLedger(next.host.dataDir, next.host.runId)!;
+    expect(after.stage.status).toBe('pending');
+    expect(after.claim?.held).toBe(false);
+  });
+
+  it.each([false, true])('[r7-outcome] F4 preserves validation and contested outcome (accepted=%s)', async (accepted) => {
+    const f = round7StageHarness();
+    const first = f.make();
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    ledger.outcome = { status: 'contested', blockingReasons: ['review risk'], ...(accepted ? { acceptedAt: '2026-10-27T10:00:00.000Z', acceptedBy: 'user', acceptanceReason: 'reviewed risk' } : {}) };
+    ledger.invocations.find((entry) => entry.id === 'runtime:stage')!.inputSha256 = 'expired';
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+    const next = f.make();
+    expect(await runHarnessDriver(next.host, input, next.deps)).toBeNull();
+    const after = loadLedger(next.host.dataDir, next.host.runId)!;
+    expect(after.outcome).toEqual(ledger.outcome);
+    expect(after.validation).toEqual(ledger.validation);
+    expect(after.stage.prBody).toContain('`echo ok` → passed');
+    expect(after.stage.prBody).toContain('review risk');
+    expect(next.ops.filter((op) => op.id === 'stage')).toHaveLength(1);
+  });
+
+  it('guard: [r7-outcome] a failed F4 re-stage blocks a contested run', async () => {
+    const f = round7StageHarness();
+    const first = f.make();
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    ledger.outcome = { status: 'contested', blockingReasons: ['review risk'] };
+    ledger.invocations.find((entry) => entry.id === 'runtime:stage')!.inputSha256 = 'expired';
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+    const next = f.make();
+    const create = next.deps.createRuntime!;
+    next.deps.createRuntime = (opts) => {
+      const runtime = create(opts);
+      return { ...runtime, run: async (op, args, options) => {
+        if (op === 'stage') writeFileSync(join(f.git('rev-parse', '--absolute-git-dir').trim(), 'index.lock'), 'held');
+        return runtime.run(op, args, options);
+      } };
+    };
+    expect(await runHarnessDriver(next.host, input, next.deps)).toMatch(/stage refused/);
+    const after = loadLedger(next.host.dataDir, next.host.runId)!;
+    expect(after.stage.status).toBe('failed');
+    expect(after.outcome.status).toBe('blocked');
+  });
+
+  it.each(['untracked', 'tracked'] as const)('[r7-discovery-buffer] stages a %s path list larger than one MiB', async (state) => {
+    const f = round7StageHarness();
+    const paths = Array.from({ length: 12_000 }, (_, i) => `src/${String(i).padStart(5, '0')}-${'x'.repeat(100)}.txt`);
+    if (state === 'tracked') {
+      for (const path of paths) writeFileSync(join(f.cwd, path), 'base\n');
+      f.git('add', 'src');
+      f.git('commit', '-qm', 'large tracked fixture');
+    }
+    const h = f.make();
+    h.agentBehavior.set('implement', (req) => {
+      for (const path of paths) writeFileSync(join(f.cwd, path), 'handoff\n');
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: paths }));
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    const ledger = loadLedger(h.host.dataDir, h.host.runId)!;
+    expect(ledger.stage.stagedPaths).toEqual(paths);
+    expect(f.git('diff', '--cached', '--name-only', '-z').split('\0').filter(Boolean)).toEqual(paths);
+  }, 30_000);
+
+  it('guard: [r7-hooks] discovery keeps undeclared real worktree changes in the handoff', async () => {
+    const f = round7StageHarness();
+    const h = f.make();
+    h.agentBehavior.set('implement', (req) => {
+      for (const path of ['src/a.txt', 'src/new']) writeFileSync(join(f.cwd, path), 'handoff\n');
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/a.txt'] }));
+      return null;
+    });
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.stage.stagedPaths).toEqual(['src/a.txt', 'src/new']);
+  });
+
+  it('[r7-hooks] changed-path discovery disables hooks on both git calls', async () => {
+    const f = round7StageHarness();
+    const h = f.make();
+    const spy = vi.spyOn(childProcess, 'execFileSync');
+    syncBuiltinESMExports();
+    try {
+      expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+      const discovery = spy.mock.calls.filter(([cmd, args]) => cmd === 'git' && Array.isArray(args) && (
+        args.includes('--exclude-standard') || (args.includes('--name-only') && args.includes('HEAD'))
+      ));
+      expect(discovery).toHaveLength(2);
+      for (const [, args] of discovery) expect(args).toEqual(expect.arrayContaining(['-c', 'core.hooksPath=/dev/null']));
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
   });
 
   it('reruns stage when the complete post-review code subject changes', async () => {
@@ -3145,7 +3374,7 @@ syncBuiltinESMExports();
     ).toMatchObject({ status: 'completed', attempt: 1 });
   });
 
-  it('clears prior risk acceptance when the staged subject is invalidated', async () => {
+  it('guard: clears prior risk acceptance when the reviewed subject is invalidated', async () => {
     const first = makeHarness(dir);
     expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
     const accepted = loadLedger(first.host.dataDir, first.host.runId)!;
@@ -3166,6 +3395,7 @@ syncBuiltinESMExports();
 
     const changed = makeHarness(dir);
     changed.deps.snapshotStageSubject = async () => 'changed-stage-subject';
+    changed.deps.snapshotReviewSubject = async () => 'changed-review-subject';
     expect(await runHarnessDriver(changed.host, input, changed.deps)).toBeNull();
     const outcome = loadLedger(first.host.dataDir, first.host.runId)?.outcome;
     expect(outcome?.acceptedAt).toBeUndefined();
@@ -3217,7 +3447,7 @@ syncBuiltinESMExports();
     expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
 
     expect(resumed.calls.map((call) => call.id)).toContain('qualify');
-    expect(resumed.calls.map((call) => call.id)).not.toContain('stage');
+    expect(resumed.calls.map((call) => call.id)).toContain('stage');
     const ledger = loadLedger(resumed.host.dataDir, resumed.host.runId);
     expect(
       ledger?.invocations.find((invocation) => invocation.id === 'agent:qualify:claude'),
