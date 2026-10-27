@@ -53,6 +53,50 @@ describe('queued harness task edits (PR #925 review)', () => {
     expect(store.getRun(run.id)?.harness?.issueId).toBe('999');
   });
 
+  it.each(['issue #600', 'https://github.com/open-mercato/cezar/issues/600'])
+  ('keeps an API issue binding when PATCH retains a reference to %s', async (reference) => {
+    const run = manager.startRun(workflow, { task: `Same root cause as ${reference} — fix it`, harness: { issueId: '642' } });
+    expect(run.harness?.issueId).toBe('642');
+    expect((await patch(run.id, `Same root cause as ${reference} — fix it please`)).status).toBe(200);
+    expect(store.getRun(run.id)?.harness?.issueId).toBe('642');
+    const internal = manager as unknown as {
+      pendingJobs: Map<string, { input: Parameters<RunManager['startRun']>[1] }>;
+      hydrateQueuedInput: (id: string, input: Parameters<RunManager['startRun']>[1]) => Parameters<RunManager['startRun']>[1];
+    };
+    expect(internal.hydrateQueuedInput(run.id, internal.pendingJobs.get(run.id)!.input).harness?.issueId).toBe('642');
+  });
+
+  it('guard: a retained bare reference preserves the API issue binding', async () => {
+    const run = manager.startRun(workflow, { task: 'Same root cause as #600 — fix it', harness: { issueId: '642' } });
+    expect((await patch(run.id, 'Same root cause as #600 — fix it please')).status).toBe(200);
+    expect(store.getRun(run.id)?.harness?.issueId).toBe('642');
+  });
+
+  it('keeps an API binding when an edit promotes a reference already in the old brief', async () => {
+    const run = manager.startRun(workflow, { task: 'Related to issue #600 and issue #700', harness: { issueId: '642' } });
+    expect((await patch(run.id, 'Related to issue #700')).status).toBe(200);
+    expect(store.getRun(run.id)?.harness?.issueId).toBe('642');
+  });
+
+  it('guard: PATCH can retarget a binding inferred from the old text', async () => {
+    const run = manager.startRun(workflow, { task: 'Fix issue #642' });
+    expect((await patch(run.id, 'Fix issue #600')).status).toBe(200);
+    expect(store.getRun(run.id)?.harness?.issueId).toBe('600');
+  });
+
+  it('guard: PATCH can restore a missing binding from a retained concrete issue reference', async () => {
+    const run = manager.startRun(workflow, { task: 'Fix issue #642' });
+    store.updateRun(run.id, { harness: { workflow: workflow.name, profile: 'standard' } });
+    expect((await patch(run.id, 'Fix issue #642 please')).status).toBe(200);
+    expect(store.getRun(run.id)?.harness?.issueId).toBe('642');
+  });
+
+  it('guard: a newly introduced reference can retarget an explicit API binding', async () => {
+    const run = manager.startRun(workflow, { task: 'Related to issue #600', harness: { issueId: '642' } });
+    expect((await patch(run.id, 'Fix issue #999, related to issue #600')).status).toBe(200);
+    expect(store.getRun(run.id)?.harness?.issueId).toBe('999');
+  });
+
   it('guard: a task already dequeued still returns 409 and leaves its title unchanged', async () => {
     const run = manager.startRun(workflow, { task: 'Fix issue #1' });
     (manager as unknown as { pendingJobs: Map<string, unknown> }).pendingJobs.delete(run.id);
