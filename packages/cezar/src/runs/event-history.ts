@@ -12,8 +12,10 @@ import {
 } from '@open-mercato/cezar-contract';
 
 const READ_CHUNK_BYTES = 64 * 1024;
-// One MiB covers nearby council starts without searching the implement archive (PR #925 review).
+// Unscoped keys keep the short search; phases bound council starts (PR #925 review).
 const SESSION_START_SEARCH_BYTES = 1024 * 1024;
+// 16 MiB fits the 11.5 MB reproducer but bounds missing phase metadata (spec #717, PR #925 review).
+const COUNCIL_START_SEARCH_MAX_BYTES = 16 * 1024 * 1024;
 const MAX_CURSOR_BYTES = 2_048;
 
 const pageCursorSchema = z.object({
@@ -271,6 +273,8 @@ async function reverseEventsUntil(
   let fileHighWater = 0;
   let canonical: CanonicalItem[] | undefined;
   const sessionAnchors = new Set<string>();
+  const sessionSteps = new Map<string, string>();
+  const phaseAnchors = new Map<string, number>();
   let missingStarts: Set<string> | undefined;
   let startSearchBytes = 0;
   try {
@@ -289,6 +293,19 @@ async function reverseEventsUntil(
           fileHighWater = Math.max(fileHighWater, event.seq);
           if (event.seq < beforeSeq) {
             reversed.push(event);
+            if (typeof event.sessionKey === 'string' && typeof event.stepId === 'string') {
+              sessionSteps.set(event.sessionKey, event.stepId);
+            }
+            if (
+              event.type === 'harness.phase.updated' && typeof event.stepId === 'string' &&
+              typeof event.phase === 'object' && event.phase !== null &&
+              (event.phase as { status?: unknown }).status === 'running'
+            ) {
+              phaseAnchors.set(event.stepId, event.seq);
+              for (const key of missingStarts ?? []) {
+                if (sessionSteps.get(key) === event.stepId) missingStarts!.delete(key);
+              }
+            }
             if (isSessionStart(event) && typeof event.sessionKey === 'string') {
               missingStarts?.delete(event.sessionKey);
               // Session anchors also close pre-launch notes; later turns cannot (PR #925 review).
@@ -299,7 +316,13 @@ async function reverseEventsUntil(
       }
       if (missingStarts !== undefined) {
         canonical = undefined;
-        if (missingStarts.size === 0 || totalBytesRead - startSearchBytes >= SESSION_START_SEARCH_BYTES) break;
+        const searched = totalBytesRead - startSearchBytes;
+        if (searched >= SESSION_START_SEARCH_BYTES) {
+          for (const key of missingStarts) {
+            if (!sessionSteps.has(key)) missingStarts.delete(key);
+          }
+        }
+        if (missingStarts.size === 0 || searched >= COUNCIL_START_SEARCH_MAX_BYTES) break;
         continue;
       }
       const chronological = [...reversed].reverse();
@@ -310,7 +333,11 @@ async function reverseEventsUntil(
       ) {
         const page = pageEventSlice(chronological, canonical.slice(-wantedItems));
         missingStarts = sessionsWithoutStarts(page);
-        for (const key of sessionAnchors) missingStarts.delete(key);
+        for (const key of missingStarts) {
+          const phaseSeq = phaseAnchors.get(sessionSteps.get(key) ?? '');
+          const firstSeq = page.find((event) => event.sessionKey === key)!.seq;
+          if (sessionAnchors.has(key) || (phaseSeq !== undefined && phaseSeq < firstSeq)) missingStarts.delete(key);
+        }
         if (missingStarts.size === 0) break;
         startSearchBytes = totalBytesRead;
       }
@@ -563,13 +590,14 @@ interface ContextFold {
   asOfSeq: number;
   turn: number;
   boundaries: RunHistoryEvent[];
+  openSessionStarts: Map<string, RunHistoryEvent>;
   roots: Map<string, ContextItem>;
   children: Map<string, ContextItem>;
   rootsByTurn: Map<number, Set<string>>;
 }
 
 function createContextFold(): ContextFold {
-  return { asOfSeq: 0, turn: 0, boundaries: [], roots: new Map(), children: new Map(), rootsByTurn: new Map() };
+  return { asOfSeq: 0, turn: 0, boundaries: [], openSessionStarts: new Map(), roots: new Map(), children: new Map(), rootsByTurn: new Map() };
 }
 
 function pruneSettledHistory(fold: ContextFold): void {
@@ -628,6 +656,11 @@ function pruneSettledHistory(fold: ContextFold): void {
 
 function foldContextEvent(fold: ContextFold, event: RunHistoryEvent): void {
   fold.asOfSeq = Math.max(fold.asOfSeq, event.seq);
+  // Queued messages prune turn boundaries while peer reviewers stay open (PR #925 review).
+  if (typeof event.sessionKey === 'string') {
+    if (isSessionStart(event)) fold.openSessionStarts.set(event.sessionKey, event);
+    else if (event.type === 'session.ended') fold.openSessionStarts.delete(event.sessionKey);
+  }
   if (event.type === 'plan.updated' || (event.type === 'tool-call' && stringField(event, 'tool') === 'TodoWrite')) {
     fold.latestPlan = event;
     return;
@@ -692,6 +725,7 @@ function finishContextFold(fold: ContextFold): RunHistoryContext {
   const contextEvents = new Map<number, RunHistoryEvent>();
   if (fold.latestPlan) contextEvents.set(fold.latestPlan.seq, fold.latestPlan);
   for (const event of fold.boundaries) contextEvents.set(event.seq, event);
+  for (const event of fold.openSessionStarts.values()) contextEvents.set(event.seq, event);
   for (const item of [...fold.roots.values(), ...relevantChildren]) {
     contextEvents.set(item.first.seq, item.first);
     contextEvents.set(item.latest.seq, item.latest);
