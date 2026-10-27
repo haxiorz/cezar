@@ -53,30 +53,12 @@ describe('provider action gate', () => {
             reviewers: [{ runner: 'opencode' }, { runner: 'harness' }],
           },
         },
-        undefined,
       ),
     ).toEqual(['claude', 'codex', 'opencode']);
   });
 
-  it('collects command-backed providers from a configured profile', () => {
-    expect(
-      providersRequiredByHarness(
-        { profile: 'multi-optimized' },
-        {
-          models: {
-            codex: { commands: { worker: ['codex', 'exec'] } },
-            kimi: { adapter: 'preset' },
-          },
-          profiles: {
-            'multi-optimized': { workers: ['codex'], reviewers: ['kimi'] },
-          },
-        },
-      ),
-    ).toEqual(['claude', 'codex']);
-  });
-
-  it('includes the Claude host for a standard profile with no configuration', () => {
-    expect(providersRequiredByHarness({ profile: 'standard' }, undefined)).toEqual(['claude']);
+  it('includes the Claude host when a run has no lineup', () => {
+    expect(providersRequiredByHarness({})).toEqual(['claude']);
   });
 
   it('reports disabled before missing credentials', () => {

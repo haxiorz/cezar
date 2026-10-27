@@ -35,7 +35,6 @@ export function providersRequiredByWorkflow(
 }
 
 interface HarnessProviderInput {
-  profile?: string;
   roles?: {
     orchestrator?: { runner?: string };
     implementer?: { runner?: string };
@@ -45,21 +44,17 @@ interface HarnessProviderInput {
 
 /**
  * Dynamic harness phases do not appear in workflow YAML, so the ordinary
- * provider gate cannot see them. Collect runner-backed roles and configured
- * command adapters before a run/worktree exists; HTTP advisors remain covered
- * by the harness readiness probe because they are not cezar providers.
+ * provider gate cannot see them. Collect the runner-backed roles before a
+ * run/worktree exists; advisors remain covered by the harness readiness probe
+ * because they are not cezar providers. No lineup is Claude solo.
  */
-export function providersRequiredByHarness(
-  harness: HarnessProviderInput | undefined,
-  agentHarness: Record<string, unknown> | undefined,
-): ProviderId[] {
+export function providersRequiredByHarness(harness: HarnessProviderInput | undefined): ProviderId[] {
   const required = new Set<ProviderId>();
   const add = (candidate: unknown) => {
     if (candidate === 'claude' || candidate === 'codex' || candidate === 'opencode') {
       required.add(candidate);
     }
   };
-
   if (harness?.roles) {
     add(harness.roles.orchestrator?.runner);
     add(harness.roles.implementer?.runner);
@@ -67,28 +62,6 @@ export function providersRequiredByHarness(
   } else {
     add('claude');
   }
-  if (!harness?.roles && harness?.profile && agentHarness) {
-    const profiles = agentHarness.profiles as Record<string, unknown> | undefined;
-    const profile = profiles?.[harness.profile] as
-      | { workers?: unknown; reviewers?: unknown }
-      | undefined;
-    const models = (agentHarness.models as Record<string, unknown> | undefined) ?? {};
-    const ids = [
-      ...(Array.isArray(profile?.workers) ? profile.workers : []),
-      ...(Array.isArray(profile?.reviewers) ? profile.reviewers : []),
-    ];
-    for (const id of ids) {
-      if (typeof id !== 'string') continue;
-      const model = models[id] as
-        | { adapter?: unknown; commands?: { worker?: unknown; review?: unknown } }
-        | undefined;
-      const command =
-        (Array.isArray(model?.commands?.worker) ? model?.commands?.worker : undefined) ??
-        (Array.isArray(model?.commands?.review) ? model?.commands?.review : undefined);
-      add(command?.[0]);
-    }
-  }
-
   return ORDER.filter((provider) => required.has(provider));
 }
 

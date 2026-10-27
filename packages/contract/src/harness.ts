@@ -8,7 +8,6 @@ import { z } from 'zod';
 
 export const harnessProfileSchema = z.enum([
   'standard',
-  'optimized',
   'multi',
   'multi-optimized',
 ]);
@@ -29,8 +28,6 @@ export const harnessModelRefSchema = z.object({
   model: z.string(),
   effort: harnessEffortSchema.optional(),
   family: z.string().optional(),
-  /** Internal trusted adapter binding, present on config-resolved role lineups. */
-  adapterId: z.string().optional(),
 });
 export type HarnessModelRef = z.infer<typeof harnessModelRefSchema>;
 
@@ -82,6 +79,8 @@ export const harnessPresetSchema = z.object({
 export type HarnessPreset = z.infer<typeof harnessPresetSchema>;
 
 export const harnessStartInputSchema = z.object({
+  /** Derived from the lineup; a value that disagrees with it answers 400 (named profiles no
+   *  longer resolve, and ignoring one would silently run Claude solo). */
   profile: harnessProfileSchema.optional(),
   skillProfile: harnessSkillProfileSchema.optional(),
   roles: harnessRolesInputSchema.optional(),
@@ -119,7 +118,6 @@ export const harnessModelSchema = z.object({
   model: z.string().optional(),
   adapter: z.string().optional(),
   roles: z.array(z.string()),
-  profiles: z.array(z.string()).optional(),
   readiness: z.enum(['ready', 'missing', 'failed', 'unknown']).optional(),
   readinessDetail: z.string().optional(),
   binding: z.string().optional(),
@@ -130,15 +128,14 @@ export const harnessModelSchema = z.object({
 });
 export type HarnessModel = z.infer<typeof harnessModelSchema>;
 
-/** One `/harness/status` roster row: always its profiles, never a live readiness (that is the
- *  probe's). Assignable to `HarnessModel`. */
+/** One `/harness/status` roster row, never a live readiness (that is the probe's). Assignable to
+ *  `HarnessModel`. */
 export const harnessStatusModelSchema = z.object({
   id: z.string(),
   family: z.string().optional(),
   model: z.string().optional(),
   adapter: z.string().optional(),
   roles: z.array(z.string()),
-  profiles: z.array(harnessProfileSchema),
   sameAs: harnessModelSchema.shape.sameAs,
 });
 export type HarnessStatusModel = z.infer<typeof harnessStatusModelSchema>;
@@ -160,8 +157,6 @@ export const harnessStatusResponseSchema = z.object({
    *  disabled so Settings can explain the gate; probe and run starts answer 409. */
   enabled: z.boolean(),
   configured: z.boolean(),
-  profiles: z.array(harnessProfileSchema),
-  driven: z.array(harnessProfileSchema),
   models: z.array(harnessStatusModelSchema),
   runtime: z.object({
     installed: z.boolean(),
@@ -178,11 +173,8 @@ export const harnessStatusResponseSchema = z.object({
 export type HarnessStatusResponse = z.infer<typeof harnessStatusResponseSchema>;
 
 export const harnessProbeInputSchema = z.object({
-  profile: harnessProfileSchema.optional(),
-  roles: harnessRolesInputSchema.optional(),
-}).refine((value) => value.profile !== undefined || value.roles !== undefined, {
-  message: 'profile or roles is required',
-});
+  roles: harnessRolesInputSchema,
+}).strict();
 export type HarnessProbeInput = z.input<typeof harnessProbeInputSchema>;
 
 export const harnessProbeResponseSchema = z.object({

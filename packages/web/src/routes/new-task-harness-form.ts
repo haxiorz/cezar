@@ -4,7 +4,6 @@ import type {
   HarnessModelRef,
   HarnessPreset,
   HarnessProbeResponse,
-  HarnessProfile,
   HarnessRoles,
   HarnessSkillProfile,
   HarnessStatusResponse,
@@ -12,27 +11,6 @@ import type {
   RunnerModelCatalogResponse,
 } from '@open-mercato/cezar-api-client'
 import { modelsForRunner } from './new-task-form'
-
-export interface HarnessProfileOption {
-  id: HarnessProfile
-  label: string
-  desc: string
-}
-
-/**
- * The five operating profiles of the repo's `agentHarness.profiles`, in escalation order.
- * `id` is the om-config wire name and never changes; `label`/`desc` are the human surface.
- *
- * DISPLAY ONLY since 2026-07-27 (user feedback): the composer no longer offers a profile —
- * every Multi-model run is a custom lineup. This list survives as the label map for
- * Settings → Harness, which reports which profiles the repo config declares.
- */
-export const HARNESS_PROFILE_OPTIONS: readonly HarnessProfileOption[] = [
-  { id: 'standard', label: 'Claude solo', desc: 'Claude writes the code; a second, fresh Claude context reviews it. Works with zero setup.' },
-  { id: 'optimized', label: 'Worker offload', desc: 'A sandboxed worker model (e.g. Codex) writes the code; Claude directs and reviews.' },
-  { id: 'multi', label: 'Review council', desc: 'Several independent models (DeepSeek, Kimi, GLM…) each review the diff; findings are merged.' },
-  { id: 'multi-optimized', label: 'Council + worker', desc: 'The worker writes the code and the full multi-model council reviews it.' },
-]
 
 export interface HarnessMode {
   id: 'fix-issue' | 'implement-feature'

@@ -18,12 +18,18 @@ import { z } from 'zod';
 
 export const HARNESS_PROFILES = [
   'standard',
-  'optimized',
   'multi',
   'multi-optimized',
 ] as const;
 
 export type HarnessProfile = (typeof HARNESS_PROFILES)[number];
+
+/** A run's profile is a label derived from its lineup, never a config lookup: no lineup is Claude
+ *  solo, otherwise the implementer's runner names it. */
+export function harnessProfileFor(roles: { implementer: { runner: string } } | undefined): HarnessProfile {
+  if (!roles) return 'standard';
+  return roles.implementer.runner === 'claude' ? 'multi' : 'multi-optimized';
+}
 
 export const harnessProfileSchema = z.enum(HARNESS_PROFILES);
 

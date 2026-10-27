@@ -65,11 +65,9 @@ import {
  * most), one implementer, and 2–5 unique reviewers spanning at least two model families. The
  * route owns fetching and draft state; this stays presentational.
  *
- * The named execution profiles (Claude solo / Worker offload / Review council / Council +
- * worker / High assurance) were removed from this surface (user feedback 2026-07-27): the
+ * The named execution profiles were removed from this surface (user feedback 2026-07-27): the
  * lineup IS the choice, and a second, coarser topology picker above it only asked the same
- * question twice. `agentHarness.profiles` still exists in the repo config — Settings → Harness
- * reports it — but the composer always starts a custom lineup.
+ * question twice. Since PR #925 review cezar no longer resolves `agentHarness.profiles` at all.
  */
 
 /**

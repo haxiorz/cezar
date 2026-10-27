@@ -12,7 +12,7 @@ import { HarnessSection } from './harness-section'
  * Settings → Harness (spec 2026-07-23-harness-orchestration; user feedback
  * 2026-07-23: "i don't see option to check and configure access to different
  * models"): the model-access surface. Shows the roster from
- * `GET /api/v1/harness/status`, marks which profiles this cezar drives, and
+ * `GET /api/v1/harness/status` and
  * routes configuration to a `cez-setup-harness` task — cezar reads the
  * om pipeline's config, it never writes it.
  */
@@ -56,13 +56,11 @@ describe('Settings → Harness', () => {
     serve({
       enabled: true,
       configured: true,
-      profiles: ['standard', 'multi'],
-      driven: ['standard'],
       runtime: BUNDLED_RUNTIME,
       base: NO_BASE_DRIFT,
       models: [
-        { id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard', 'multi'] },
-        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', roles: ['worker', 'reviewer'], profiles: ['multi'] },
+        { id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'] },
+        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', roles: ['worker', 'reviewer'] },
       ],
     })
     mount()
@@ -76,26 +74,22 @@ describe('Settings → Harness', () => {
     serve({
       enabled: true,
       configured: false,
-      profiles: ['standard'],
-      driven: ['standard'],
       runtime: BUNDLED_RUNTIME,
       base: NO_BASE_DRIFT,
-      models: [{ id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard'] }],
+      models: [{ id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'] }],
     })
     mount()
     await waitFor(() => expect(screen.getByText(/no external models configured/i)).toBeTruthy())
-    expect(screen.getByText(/needs no provider config/i)).toBeTruthy()
+    expect(screen.getByText(/advisor reviewers/i)).toBeTruthy()
   })
 
   it('offers configure and check actions that prefill a cez-setup-harness task', async () => {
     serve({
       enabled: true,
       configured: false,
-      profiles: ['standard'],
-      driven: ['standard'],
       runtime: BUNDLED_RUNTIME,
       base: NO_BASE_DRIFT,
-      models: [{ id: 'claude', roles: ['host', 'reviewer'], profiles: ['standard'] }],
+      models: [{ id: 'claude', roles: ['host', 'reviewer'] }],
     })
     mount()
     await waitFor(() => expect(screen.getByRole('link', { name: /configure models/i })).toBeTruthy())
@@ -112,12 +106,10 @@ describe('Settings → Harness', () => {
     serve({
       enabled: false,
       configured: true,
-      profiles: ['standard', 'multi'],
-      driven: ['standard'],
       runtime: BUNDLED_RUNTIME,
       base: NO_BASE_DRIFT,
       models: [
-        { id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'], profiles: ['standard'] },
+        { id: 'claude', family: 'anthropic', model: 'host app', roles: ['host', 'reviewer'] },
       ],
     })
     mount()

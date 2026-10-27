@@ -2,6 +2,8 @@
 
 Harness source of truth: [open-mercato/skills PR #43](https://github.com/open-mercato/skills/pull/43) (`skills/om-harness`).
 
+> **2026-10-28 amendment — no named profiles or configured workers.** A run's profile is derived from its submitted lineup (`standard` without one); cezar no longer resolves `agentHarness.profiles` or runs an implementer through a configured worker command (PR #925 review). The status route no longer reports profiles.
+>
 > **2026-10-28 amendment — no high-assurance packets.** The `high-assurance` profile, packet planning/leases/gates (`packet-run`, `packet-gate`, `packet-release`), the `harness.packet.updated` event and the Packets tab were removed before the first release (PR #925 review): the composer never started them. References to packets below are design history.
 >
 > **2026-07-24 amendment — advisor reviewers**: role-based runs can seat configured `agentHarness` bindings (kimi-subscription, deepseek-api, Zen presets) as reviewers, executed as one packet-less runtime council — see [`2026-07-24-advisor-reviewers.md`](2026-07-24-advisor-reviewers.md).

@@ -167,6 +167,7 @@ import { releaseLedgerIssueClaim, releaseLedgerIssueClaimUnlessParked } from '..
 import { HARNESS_FIX_ISSUE, HARNESS_TEXT_ONLY_ERROR, isHarnessWorkflow } from '../harness/workflows.ts';
 import {
   HARNESS_PROFILES,
+  harnessProfileFor,
   HARNESS_SKILL_PROFILES,
   type HarnessProfile,
   type HarnessSkillProfile,
@@ -6227,16 +6228,13 @@ export class RunManager {
   ): Promise<string | null> {
     if (state.cwd === this.repoRoot) return 'harness workflows require an isolated git worktree';
     const recorded = this.store.getRun(runId)?.harness;
-    let requested = input.harness?.profile ?? recorded?.profile;
     const roles =
       input.harness?.roles ?? (recorded?.roles as unknown as HarnessRolesInput | undefined);
-    if ((!requested || requested === 'standard') && roles) {
-      requested = roles.implementer.runner === 'claude' ? 'multi' : 'multi-optimized';
+    const recordedProfile = input.harness?.profile ?? recorded?.profile;
+    if (!roles && recordedProfile && recordedProfile !== 'standard') {
+      return `harness blocked: profile "${recordedProfile}" needs a role lineup — named agentHarness profiles are no longer resolved`;
     }
-    const profile: HarnessProfile =
-      requested && (HARNESS_PROFILES as readonly string[]).includes(requested)
-        ? (requested as HarnessProfile)
-        : 'standard';
+    const profile = harnessProfileFor(roles);
     const issueId = input.harness?.issueId ?? recorded?.issueId;
     const recordedSkillProfile =
       recorded?.skillProfile &&

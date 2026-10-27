@@ -34,7 +34,6 @@ import {
 import {
   HARNESS_MODES,
   HARNESS_PRESETS_MAX,
-  HARNESS_PROFILE_OPTIONS,
   canSaveHarnessPreset,
   visibleHarnessPresets,
   advisorHarnessOptions,
@@ -581,15 +580,13 @@ describe('harness form rules (spec 2026-07-23-harness-orchestration)', () => {
     const status: HarnessStatusResponse = {
       enabled: true,
       configured: true,
-      profiles: ['standard', 'multi'],
-      driven: ['standard'],
       runtime: { installed: true, source: 'bundled' as const, commit: 'a'.repeat(40) },
       base: { configured: null, remoteDefault: null, stale: false },
       models: [
-        { id: 'claude', family: 'anthropic', model: 'host app', adapter: 'host', roles: ['host', 'reviewer'], profiles: [] },
-        { id: 'kimi', family: 'moonshot', model: 'kimi-code/k3', adapter: 'preset', roles: ['reviewer'], profiles: [] },
-        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', adapter: 'command', roles: ['worker', 'reviewer'], profiles: [] },
-        { id: 'mystery', roles: [] as string[], profiles: [] }, // no adapter → not an advisor binding
+        { id: 'claude', family: 'anthropic', model: 'host app', adapter: 'host', roles: ['host', 'reviewer'] },
+        { id: 'kimi', family: 'moonshot', model: 'kimi-code/k3', adapter: 'preset', roles: ['reviewer'] },
+        { id: 'codex', family: 'openai', model: 'gpt-5.6-sol', adapter: 'command', roles: ['worker', 'reviewer'] },
+        { id: 'mystery', roles: [] as string[] }, // no adapter → not an advisor binding
       ],
     }
     expect(advisorHarnessOptions(status)).toEqual([
@@ -732,23 +729,6 @@ describe('harness form rules (spec 2026-07-23-harness-orchestration)', () => {
     )
     expect(harnessWorkflowName({ source: 'workflow', ref: 'quick-task' })).toBeNull()
     expect(harnessWorkflowName({ source: 'skill', ref: 'harness-fix-issue' })).toBeNull()
-  })
-
-  // Display-only since 2026-07-27: the composer no longer offers a profile, but
-  // Settings -> Harness still labels whatever `agentHarness.profiles` declares.
-  it('keeps the profile label map for the settings status view', () => {
-    expect(HARNESS_PROFILE_OPTIONS.map((p) => p.id)).toEqual([
-      'standard',
-      'optimized',
-      'multi',
-      'multi-optimized',
-    ])
-    expect(HARNESS_PROFILE_OPTIONS.map((p) => p.label)).toEqual([
-      'Claude solo',
-      'Worker offload',
-      'Review council',
-      'Council + worker',
-    ])
   })
 
   it('exposes the two multi-model modes with plain names', () => {

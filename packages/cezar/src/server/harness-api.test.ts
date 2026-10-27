@@ -94,7 +94,7 @@ describe('harness API', () => {
 
     it('probe answers 409 — it spawns live provider transports', async () => {
       disable();
-      const res = await post('/api/v1/harness/probe', { profile: 'standard' });
+      const res = await post('/api/v1/harness/probe', { roles: { orchestrator: { runner: 'claude', model: '' }, implementer: { runner: 'claude', model: '' }, reviewers: [{ runner: 'claude', model: 'opus' }, { runner: 'codex', model: 'gpt-5.6-sol' }] } });
       expect(res.status).toBe(409);
       expect(((await res.json()) as { error: string }).error).toMatch(/disabled/i);
     });
@@ -147,13 +147,12 @@ describe('harness API', () => {
     it('reports config absence honestly', async () => {
       const res = await apiRequest(app, '/api/v1/harness/status');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as { enabled: boolean; configured: boolean; profiles: string[] };
+      const body = (await res.json()) as { enabled: boolean; configured: boolean };
       expect(body.enabled).toBe(true);
       expect(body.configured).toBe(false);
-      expect(body.profiles).toContain('standard');
     });
 
-    it('lists configured agentHarness profiles and the model roster when present', async () => {
+    it('lists the configured model roster when present', async () => {
       mkdirSync(join(repoRoot, '.ai'), { recursive: true });
       writeFileSync(
         join(repoRoot, '.ai', 'agentic.config.json'),
@@ -164,10 +163,6 @@ describe('harness API', () => {
               codex: { adapter: 'command', family: 'openai', model: 'gpt-5.6-sol', roles: ['worker', 'reviewer'] },
               deepseek: { adapter: 'preset', family: 'deepseek', model: 'deepseek-v4-pro', roles: ['reviewer'] },
             },
-            profiles: {
-              standard: { workers: [], reviewers: [] },
-              multi: { workers: [], reviewers: ['codex', 'deepseek'] },
-            },
           },
         }),
         'utf8',
@@ -175,14 +170,11 @@ describe('harness API', () => {
       const res = await apiRequest(app, '/api/v1/harness/status');
       const body = (await res.json()) as {
         configured: boolean;
-        profiles: string[];
-        models: Array<{ id: string; model?: string; family?: string; roles: string[]; profiles: string[] }>;
+        models: Array<{ id: string; model?: string; family?: string; roles: string[] }>;
       };
       expect(body.configured).toBe(true);
-      expect(body.profiles).toEqual(expect.arrayContaining(['standard', 'multi']));
       const codex = body.models.find((m) => m.id === 'codex');
       expect(codex).toMatchObject({ model: 'gpt-5.6-sol', family: 'openai', roles: ['worker', 'reviewer'] });
-      expect(codex?.profiles).toContain('multi');
       expect(body.models.some((m) => m.id === 'claude')).toBe(true);
     });
 
@@ -242,11 +234,11 @@ describe('harness API', () => {
   });
 
   describe('POST /api/v1/harness/probe', () => {
-    it('answers standard readiness without any provider config', async () => {
-      const res = await post('/api/v1/harness/probe', { profile: 'standard' });
+    it('answers the readiness of a runner lineup without any provider config', async () => {
+      const res = await post('/api/v1/harness/probe', { roles: { orchestrator: { runner: 'claude', model: '' }, implementer: { runner: 'claude', model: '' }, reviewers: [{ runner: 'claude', model: 'opus' }, { runner: 'codex', model: 'gpt-5.6-sol' }] } });
       expect(res.status).toBe(200);
       const body = (await res.json()) as { profile: string; ready: boolean; models: Array<{ id: string }> };
-      expect(body.profile).toBe('standard');
+      expect(body.profile).toBe('multi');
       expect(body.ready).toBe(true);
       expect(body.models.map((m) => m.id)).toContain('claude');
     });
@@ -275,7 +267,7 @@ describe('harness API', () => {
         const res = await apiRequest(gated, '/api/v1/harness/probe', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ profile: 'standard' }),
+          body: JSON.stringify({ roles: { orchestrator: { runner: 'claude', model: '' }, implementer: { runner: 'claude', model: '' }, reviewers: [{ runner: 'claude', model: 'opus' }, { runner: 'codex', model: 'gpt-5.6-sol' }] } }),
         });
         expect(await res.json()).toMatchObject({ ready: false, reason: expect.stringMatching(/claude/i) });
         expect(probed).not.toHaveBeenCalled();
@@ -284,48 +276,9 @@ describe('harness API', () => {
       }
     });
 
-    it('reports a configured profile as unavailable when its bindings are absent', async () => {
+    // PR #925 review: named profiles no longer resolve; a probe names its lineup.
+    it('rejects a probe that names a profile instead of a lineup', async () => {
       const res = await post('/api/v1/harness/probe', { profile: 'multi' });
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { ready: boolean; reason?: string };
-      expect(body.ready).toBe(false);
-      expect(body.reason).toMatch(/cez-setup-harness/);
-    });
-
-    it('resolves a configured non-standard profile through the same driver plan', async () => {
-      mkdirSync(join(repoRoot, '.ai'), { recursive: true });
-      writeFileSync(
-        join(repoRoot, '.ai', 'agentic.config.json'),
-        JSON.stringify({
-          agentHarness: {
-            models: {
-              codex: {
-                family: 'openai',
-                model: 'gpt-5.6-sol',
-                roles: ['worker'],
-                commands: { worker: ['codex', 'exec'] },
-              },
-            },
-            profiles: {
-              optimized: {
-                workers: ['codex'],
-                reviewers: [],
-                reviewPolicy: { mode: 'advisory' },
-              },
-            },
-          },
-        }),
-        'utf8',
-      );
-
-      const res = await post('/api/v1/harness/probe', { profile: 'optimized' });
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { ready: boolean; profile: string };
-      expect(body).toMatchObject({ ready: true, profile: 'optimized' });
-    });
-
-    it('rejects an unknown profile', async () => {
-      const res = await post('/api/v1/harness/probe', { profile: 'yolo' });
       expect(res.status).toBe(400);
     });
 
@@ -473,11 +426,12 @@ describe('harness API', () => {
       expect(res.status).toBe(400);
     });
 
-    it('rejects an invalid profile', async () => {
+    // PR #925 review: a named profile no longer resolves; ignoring it would silently run Claude solo.
+    it('rejects a profile its lineup does not derive', async () => {
       const res = await post('/api/v1/runs', {
         task: 'Fix issue #642',
         workflow: HARNESS_FIX_ISSUE,
-        harness: { profile: 'mega' },
+        harness: { profile: 'multi' },
       });
       expect(res.status).toBe(400);
     });
@@ -1260,44 +1214,6 @@ describe('harness API', () => {
       });
       expect(res.status).toBe(409);
       expect(((await res.json()) as { error: string }).error).toMatch(/trusted configuration/);
-    });
-
-    it('rejects a configured profile that resolves to OpenCode before probing or starting', async () => {
-      mkdirSync(join(repoRoot, '.ai'), { recursive: true });
-      writeFileSync(
-        join(repoRoot, '.ai', 'agentic.config.json'),
-        JSON.stringify({
-          agentHarness: {
-            models: {
-              unsafe: {
-                family: 'openrouter',
-                roles: ['worker'],
-                commands: { worker: ['opencode', 'run'] },
-              },
-            },
-            profiles: {
-              optimized: {
-                workers: ['unsafe'],
-                reviewers: [],
-                reviewPolicy: { mode: 'advisory' },
-              },
-            },
-          },
-        }),
-        'utf8',
-      );
-
-      const res = await post('/api/v1/runs', {
-        task: 'Fix issue #642',
-        workflow: HARNESS_FIX_ISSUE,
-        harness: { profile: 'optimized' },
-      });
-
-      expect(res.status).toBe(409);
-      expect(((await res.json()) as { error: string }).error).toMatch(
-        /OpenCode.*stage-only isolation/i,
-      );
-      expect(captured).toBeUndefined();
     });
   });
 

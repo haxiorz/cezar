@@ -1880,59 +1880,13 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(await snapshotHarnessReviewSubject(repo)).not.toBe(afterFetch);
   });
 
-  it('rejects a configured profile when its agentHarness bindings are absent', async () => {
+  // PR #925 review: named agentHarness profiles are no longer resolved; without a lineup only
+  // the Claude-solo standard profile runs.
+  it.each(['multi', 'multi-optimized'] as const)('refuses a %s run that carries no lineup', async (profile) => {
     const h = makeHarness(dir);
-    const error = await runHarnessDriver(h.host, { ...input, profile: 'multi' }, h.deps);
-    expect(error).toMatch(/multi/);
-    expect(error).toMatch(/cez-setup-harness/);
-    expect(h.calls).toHaveLength(0);
+    expect(await runHarnessDriver(h.host, { ...input, profile }, h.deps)).toMatch(/needs a role lineup/);
+    expect(h.calls).toEqual([]);
   });
-
-  it.each(['optimized', 'multi', 'multi-optimized'] as const)(
-    'drives the configured %s profile without silently changing it',
-    async (profile) => {
-      const h = makeHarness(dir);
-      h.deps.loadAgentic = async () => ({
-        baseBranch: 'main',
-        validationCommands: ['echo ok'],
-        agentHarness: {
-          models: {
-            codex: {
-              family: 'openai',
-              model: 'gpt-5.6-sol',
-              roles: ['worker', 'reviewer'],
-              commands: { worker: ['codex', 'exec'], review: ['codex', 'exec'] },
-            },
-            deepseek: {
-              family: 'deepseek',
-              model: 'deepseek-v4-pro',
-              roles: ['reviewer'],
-              adapter: 'preset',
-            },
-          },
-          profiles: {
-            optimized: { workers: ['codex'], reviewers: [], reviewPolicy: { mode: 'advisory' } },
-            multi: {
-              workers: [],
-              reviewers: ['codex', 'deepseek'],
-              reviewPolicy: { mode: 'all-required' },
-            },
-            'multi-optimized': {
-              workers: ['codex'],
-              reviewers: ['codex', 'deepseek'],
-              reviewPolicy: { mode: 'all-required' },
-            },
-          },
-        },
-      });
-
-      const error = await runHarnessDriver(h.host, { ...input, profile }, h.deps);
-
-      expect(error).toBeNull();
-      const ledger = loadLedger(h.host.dataDir, h.host.runId);
-      expect(ledger?.effectiveProfile).toBe(profile);
-    },
-  );
 
   // PR #925 review: feedback that reverted a staged change left it in the index, invisible to the
   // git-derived handoff, and the runtime refused it on every Continue.
@@ -3025,13 +2979,6 @@ describe('harness driver — standard fix-issue graph', () => {
             adapter: 'preset',
           },
         },
-        profiles: {
-          multi: {
-            workers: [],
-            reviewers: ['codex', 'deepseek'],
-            reviewPolicy: { mode: 'all-required' },
-          },
-        },
       },
     });
     let validateCalls = 0;
@@ -3057,7 +3004,18 @@ describe('harness driver — standard fix-issue graph', () => {
     };
 
     expect(
-      await runHarnessDriver(h.host, { ...input, profile: 'multi' }, h.deps),
+      await runHarnessDriver(h.host, {
+        ...input,
+        profile: 'multi',
+        roles: {
+          orchestrator: { runner: 'claude', model: '' },
+          implementer: { runner: 'claude', model: '' },
+          reviewers: [
+            { runner: 'harness', model: 'codex', family: 'openai' },
+            { runner: 'harness', model: 'deepseek', family: 'deepseek' },
+          ],
+        },
+      }, h.deps),
     ).toBeNull();
 
     const criteria = readFileSync(

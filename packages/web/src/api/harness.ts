@@ -10,7 +10,6 @@ import type {
   HarnessInvocationRecord,
   HarnessLedgerResponse,
   HarnessProbeResponse,
-  HarnessProfile,
   HarnessRoles,
   HarnessStatusResponse,
 } from '@open-mercato/cezar-api-client'
@@ -29,18 +28,12 @@ export async function getHarnessStatus(opts?: ReadOptions): Promise<HarnessStatu
   )
 }
 
-/** Readiness of one profile before starting a harness run. */
-export async function probeHarness(
-  profile: HarnessProfile | undefined,
-  roles?: HarnessRoles,
-): Promise<HarnessProbeResponse> {
+/** Readiness of one lineup before starting a harness run. */
+export async function probeHarness(roles: HarnessRoles): Promise<HarnessProbeResponse> {
   return unwrap(
     await cez.api.v1.p[':projectId'].harness.probe.$post({
       param: { projectId: queryScope() },
-      json: {
-        ...(profile ? { profile } : {}),
-        ...(roles ? { roles } : {}),
-      },
+      json: { roles },
     }),
     '/harness/probe',
   )
@@ -181,17 +174,12 @@ export function useHarnessStatus(enabled = true) {
   })
 }
 
-/** Probe one profile's readiness. Keyed per profile so switching the segment shows each
- *  profile's own cached answer instantly; probes are live model calls, so the cache stands. */
-export function useHarnessProbe(
-  profile: HarnessProfile | undefined,
-  roles: HarnessRoles | undefined,
-  enabled = true,
-) {
-  const key = profile ?? JSON.stringify(roles ?? null)
+/** Probe one lineup's readiness. Keyed per lineup so switching back shows its cached answer
+ *  instantly; probes are live model calls, so the cache stands. */
+export function useHarnessProbe(roles: HarnessRoles | null) {
   return useQuery({
-    queryKey: queryKeys.harness.probe(key),
-    queryFn: () => probeHarness(profile, roles),
-    enabled,
+    queryKey: queryKeys.harness.probe(JSON.stringify(roles)),
+    queryFn: () => probeHarness(roles!),
+    enabled: roles !== null,
   })
 }

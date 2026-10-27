@@ -136,9 +136,7 @@ export function MultiModelSurface({
   )
   const harnessRoles = draft.harnessRoles ?? defaultHarnessRoles(harnessOptions)
   const harnessBlocked = harnessRoles === null
-  // The composer always probes the custom lineup (2026-07-27: the named execution profiles
-  // are gone from this surface, so there is no second thing to probe).
-  const harnessProbe = useHarnessProbe(undefined, harnessRoles ?? undefined, harnessRoles !== null)
+  const harnessProbe = useHarnessProbe(harnessRoles)
   const harnessProbeBlock = harnessStartBlock(
     harnessProbe.data,
     harnessProbe.isPending || harnessProbe.isFetching,

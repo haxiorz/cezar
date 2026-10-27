@@ -214,17 +214,13 @@ import {
 import { loadAgenticConfig, resolveHarnessRuntimeInfo } from '../harness/runtime.ts';
 import { probeKey, type ModelProber } from '../harness/probe.ts';
 import { createProjectProber } from '../harness/probe-transports.ts';
-import { resolveHarnessPlan } from '../harness/profile-plan.ts';
 import { harnessArtifactDir } from '../harness/driver.ts';
 import { providerFamilyOf } from '../harness/model-family.ts';
 import { canonicalizeAdvisorRefs } from '../harness/advisor-identity.ts';
 import { opencodeSeatingError, runnerEquivalentOf } from '../harness/reviewer-binding.ts';
 import { releaseLedgerIssueClaim } from '../harness/issue-claim.ts';
 import { readHarnessFsEntry } from '../harness/fs-read.ts';
-import {
-  HARNESS_PROFILES,
-  type HarnessProfile,
-} from '../harness/types.ts';
+import { harnessProfileFor } from '../harness/types.ts';
 import { HARNESS_FIX_ISSUE, HARNESS_TEXT_ONLY_ERROR, isHarnessWorkflow } from '../harness/workflows.ts';
 import { extractTaskRefs } from '../runs/task-refs.ts';
 import {
@@ -4860,20 +4856,6 @@ export function createApp(deps: ServerDeps) {
         loadConfig(repoRoot),
         remoteDefaultBranch(repoRoot).catch(() => null),
       ]);
-      const rawProfiles =
-        (agentic.agentHarness?.profiles as Record<string, unknown> | undefined) ?? {};
-      const configuredProfiles = Object.keys(rawProfiles);
-      const profiles = [...new Set(['standard', ...configuredProfiles])].filter(
-        (profile): profile is HarnessProfile => (HARNESS_PROFILES as readonly string[]).includes(profile),
-      );
-      const profilesUsing = (id: string): HarnessProfile[] =>
-        profiles.filter((profileName) => {
-          const profile = rawProfiles[profileName] as
-            | { workers?: unknown; reviewers?: unknown }
-            | undefined;
-          const uses = (list: unknown) => Array.isArray(list) && list.includes(id);
-          return uses(profile?.workers) || uses(profile?.reviewers);
-        });
       const rawModels =
         (agentic.agentHarness?.models as Record<string, unknown> | undefined) ?? {};
       const models = [
@@ -4883,7 +4865,6 @@ export function createApp(deps: ServerDeps) {
           model: 'host app',
           adapter: 'host',
           roles: ['host', 'reviewer'],
-          profiles,
         },
         ...Object.entries(rawModels).map(([id, raw]) => {
           const model = (raw ?? {}) as {
@@ -4901,7 +4882,6 @@ export function createApp(deps: ServerDeps) {
             roles: Array.isArray(model.roles)
               ? model.roles.filter((role): role is string => typeof role === 'string')
               : [],
-            profiles: profilesUsing(id),
             ...(sameAs ? { sameAs } : {}),
           };
         }),
@@ -4914,8 +4894,6 @@ export function createApp(deps: ServerDeps) {
         // it only reads config files — so Settings can explain the gate.
         enabled: cezarConfig.multiModel,
         configured: agentic.agentHarness !== undefined,
-        profiles,
-        driven: [...HARNESS_PROFILES],
         models,
         base: {
           configured: cezarConfig.baseBranch ?? null,
@@ -4936,38 +4914,19 @@ export function createApp(deps: ServerDeps) {
         return c.json({ error: MULTI_MODEL_DISABLED_ERROR }, 409);
       }
       const agentic = await loadAgenticConfig(repoRoot);
-      const profile = body.profile ?? 'multi-optimized';
-      const resolved = body.roles
-        ? {
-            ok: true as const,
-            plan: {
-              profile,
-              orchestrator: body.roles.orchestrator,
-              implementer: body.roles.implementer,
-              reviewers: body.roles.reviewers,
-              reviewPolicy: 'quorum' as const,
-            },
-          }
-        : resolveHarnessPlan(profile, agentic.agentHarness);
-      if (!resolved.ok) {
-        return c.json({ profile, ready: false, reason: resolved.error, models: [] });
-      }
+      const profile = harnessProfileFor(body.roles);
       const canonical = canonicalizeAdvisorRefs(
-        resolved.plan.reviewers,
+        body.roles.reviewers,
         (agentic.agentHarness?.models ?? {}) as Record<string, unknown>,
       );
       if (!canonical.ok) {
         return c.json({ profile, ready: false, reason: canonical.error, models: [] });
       }
-      const refs = [
-        resolved.plan.orchestrator,
-        resolved.plan.implementer,
-        ...canonical.refs,
-      ];
+      const refs = [body.roles.orchestrator, body.roles.implementer, ...canonical.refs];
       // A disabled provider is a settings fact: probing it was a live, billed call the user had
       // turned off, answered `ready` (PR #925 review).
       const providersBlocked = await providerActionError(
-        providersRequiredByHarness(body.roles ? { profile, roles: body.roles } : { profile }, agentic.agentHarness),
+        providersRequiredByHarness({ roles: body.roles }),
         { repoRoot },
       );
       if (providersBlocked) return c.json({ profile, ready: false, reason: providersBlocked, models: [] });
@@ -5399,17 +5358,18 @@ export function createApp(deps: ServerDeps) {
         );
       }
 
+      const derivedProfile = harnessProfileFor(parsed.data.harness?.roles);
+      if (parsed.data.harness?.profile !== undefined && parsed.data.harness.profile !== derivedProfile) {
+        return c.json(
+          { error: `harness profile "${parsed.data.harness.profile}" needs a matching role lineup — named agentHarness profiles are no longer resolved` },
+          400,
+        );
+      }
       let harnessInput = isHarnessWorkflow(workflow.name)
         ? {
             ...(parsed.data.harness ?? {}),
             skillProfile: parsed.data.harness?.skillProfile ?? ('generic' as const),
-            profile:
-              parsed.data.harness?.profile ??
-              (parsed.data.harness?.roles
-                ? parsed.data.harness.roles.implementer.runner === 'claude'
-                  ? ('multi' as const)
-                  : ('multi-optimized' as const)
-                : ('standard' as const)),
+            profile: derivedProfile,
           }
         : undefined;
       if (harnessInput && parsed.data.readOnly) {
@@ -5497,28 +5457,16 @@ export function createApp(deps: ServerDeps) {
           }
           harnessInput = { ...harnessInput, roles };
         }
-        for (const provider of providersRequiredByHarness(harnessInput, agentic.agentHarness)) {
+        for (const provider of providersRequiredByHarness(harnessInput)) {
           requiredProviders.add(provider);
         }
-        const resolved = harnessInput.roles
-          ? {
-              ok: true as const,
-              plan: {
-                orchestrator: harnessInput.roles.orchestrator,
-                implementer: harnessInput.roles.implementer,
-                reviewers: harnessInput.roles.reviewers,
-              },
-            }
-          : resolveHarnessPlan(harnessInput.profile, agentic.agentHarness);
-        if (!resolved.ok) {
-          return c.json({ error: `harness start blocked: ${resolved.error}` }, 409);
-        }
-        const refs = [
-          resolved.plan.orchestrator,
-          resolved.plan.implementer,
-          ...resolved.plan.reviewers,
-        ];
-        const planSeating = opencodeSeatingError(resolved.plan);
+        const plan = harnessInput.roles ?? {
+          orchestrator: { runner: 'claude' as const, model: '' },
+          implementer: { runner: 'claude' as const, model: '' },
+          reviewers: [],
+        };
+        const refs = [plan.orchestrator, plan.implementer, ...plan.reviewers];
+        const planSeating = opencodeSeatingError(plan);
         if (planSeating) {
           return c.json({ error: `harness start blocked: ${planSeating}` }, 409);
         }

@@ -57,10 +57,11 @@ Three roles, each bound to a concrete `runner/model` pair at run submission
 - **Implementer** — implement and fix phases. Runs sandboxed and stage-only.
 - **Reviewers** — 2–5 per council. Each gets its own fresh, read-only pass.
 
-The lineup is submitted per run — since the 2026-07-27 UX pass there is no profile
-picker; profile names (`standard`, `multi`, `multi-optimized`) survive as display
-labels and for scripted callers. A typical lineup, and the one
-the eval used:
+The lineup is submitted per run, and the run's profile is a label derived from it:
+`multi` when Claude implements, `multi-optimized` when another runner does, and
+`standard` (Claude solo, one fresh Claude reviewer) when no lineup is sent. Named
+`agentHarness.profiles` and configured worker commands are not resolved. A typical
+lineup, and the one the eval used:
 
 ```
 orchestrator   claude / haiku

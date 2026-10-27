@@ -46,7 +46,6 @@ import {
   type HarnessProcessIdentity,
   type ReconcileHarnessProcessResult,
 } from './runtime.js';
-import { excludeFromGit } from '../skills-remote.js';
 import { ignoreProvisioned } from '../skills-provision.js';
 import {
   bundledSkillsDir,
@@ -67,7 +66,6 @@ import {
 } from './council-quorum.js';
 import { providerFamilyOf } from './model-family.js';
 import { accountEnvironment, createProjectProber, probeAccounts } from './probe-transports.js';
-import { resolveHarnessPlan } from './profile-plan.js';
 import {
   HARNESS_DECISION_FINDING_MAX,
   HARNESS_DECISION_FINDINGS_MAX,
@@ -164,7 +162,6 @@ export interface HarnessRoleRef {
   runner: 'claude' | 'codex' | 'opencode';
   model: string;
   effort?: 'low' | 'medium' | 'high' | 'max';
-  adapterId?: string;
 }
 
 /** A reviewer bound in `agentHarness.models` (kimi-subscription, deepseek-api,
@@ -1571,18 +1568,9 @@ export async function runHarnessDriver(
     if (!wasDone) assignBoundaryMessages(phaseId, boundaryMessages);
     const boundaryAppendix = boundaryMessageAppendix(boundaryMessages);
     const resultPath = resultPathFor(phaseId);
-    const sessionResultPath = ref?.adapterId
-      ? join(host.cwd, '.ai', 'qa', `cez-worker-${host.runId}-${phaseId}.json`)
-      : resultPath;
-    if (ref?.adapterId) {
-      // Only the worker's own result files: the shared info/exclude also hides paths in the user's
-      // checkout, where `.ai/qa/` holds real QA evidence (PR #925 review).
-      await excludeFromGit(host.cwd, '/.ai/qa/cez-worker-*.json');
-      mkdirSync(dirname(sessionResultPath), { recursive: true });
-    }
     const phasePrompt = `${prompt}${boundaryAppendix}`;
     const renderedPrompt = `${phasePrompt
-      .replaceAll('$CEZ_HARNESS_RESULT_FILE', sessionResultPath)
+      .replaceAll('$CEZ_HARNESS_RESULT_FILE', resultPath)
       .replaceAll('$CEZ_HARNESS_ARTIFACT_DIR', dirname(resultPath))}\n\n${phaseLocationContract(skill, dirname(resultPath))}\n\n${PHASE_SESSION_CONTRACT}`;
     const budgetError = promptBudgetError(completeModelPrompt(skill, renderedPrompt));
     if (budgetError) return { error: `${phaseId}: ${budgetError}` };
@@ -1609,7 +1597,8 @@ export async function runHarnessDriver(
         prompt: renderedPrompt,
         runner: ref?.runner ?? 'claude',
         model: ref?.model ?? '',
-        adapterId: ref?.adapterId ?? null,
+        // Kept so invocations recorded before configured workers were removed still match.
+        adapterId: null,
         effort: ref?.effort ?? null,
         reviewSubjectSha256: reviewSubjectSha256 ?? null,
         rubricSha256: skill === phaseSkills.codeReview ? skillHash(phaseSkills.codeReview) : null,
@@ -1719,7 +1708,7 @@ export async function runHarnessDriver(
         attempt > 1 && lastContractFailure
           ? `${renderedPrompt}${resultContractRetryAppendix(
               lastContractFailure,
-              sessionResultPath,
+              resultPath,
               true,
             )}`
           : renderedPrompt;
@@ -1738,8 +1727,8 @@ export async function runHarnessDriver(
         phaseId,
         role: ref ? 'assigned' : 'host',
         binding: {
-          runner: ref?.adapterId ? 'harness' : ref?.runner ?? 'claude',
-          model: (ref?.adapterId ?? ref?.model) || undefined,
+          runner: ref?.runner ?? 'claude',
+          model: ref?.model || undefined,
           effort: ref?.effort,
         },
         inputSha256: invocationInputSha256,
@@ -1749,72 +1738,23 @@ export async function runHarnessDriver(
       // file is also the turn-driven session's completion signal. `recursive`: a phase that left a
       // directory here made every Continue throw EISDIR (PR #925 review).
       rmSync(resultPath, { recursive: true, force: true });
-      if (sessionResultPath !== resultPath) {
-        rmSync(sessionResultPath, { recursive: true, force: true });
-      }
       const reviewSubjectBefore = reviewSubjectSha256;
       let failure: string | null;
-      if (ref?.adapterId && (timeoutKey === 'implement' || timeoutKey === 'fix')) {
-        const promptPath = join(
-          artifactDir,
-          `worker-prompt-${phaseId}-${invocation.attempt}.md`,
-        );
-        writeFileSync(promptPath, completeModelPrompt(skill, attemptPrompt), 'utf8');
-        const result = await runtime.run(
-          'worker',
-          [
-            '--config',
-            ledger.trustedConfig!.path,
-            '--profile',
-            ledger.effectiveProfile,
-            '--model',
-            ref.adapterId,
-            '--worktree',
-            host.cwd,
-            '--prompt-file',
-            promptPath,
-          ],
-          {
-            timeoutMs: PHASE_TIMEOUTS_MS[timeoutKey] ?? 30 * 60_000,
-            onSpawn: (identity) => {
-              invocation.process = { ...identity };
-              persist();
-              emitInvocation(invocation);
-            },
-          },
-        );
-        failure = result.ok
-          ? null
-          : `trusted worker adapter failed: ${
-              (result.error ?? result.stderr ?? result.stdout).trim() ||
-              `exit ${result.exitCode}`
-            }`;
-        if (!failure) {
-          try {
-            // Copied as bytes, never through a symlink the adapter left in its place.
-            const entry = readHarnessFsEntry(sessionResultPath);
-            if (entry.kind === 'file') writeFileSync(resultPath, entry.content!);
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-          }
-        }
-      } else {
-        failure = await runAgentInvocation(invocation, {
-          phaseId,
-          name,
-          skill,
-          prompt: attemptPrompt,
-          resultPath,
-          timeoutMs: PHASE_TIMEOUTS_MS[timeoutKey] ?? 30 * 60_000,
-          env: {
-            CEZ_HARNESS_RESULT_FILE: resultPath,
-            CEZ_HARNESS_ARTIFACT_DIR: dirname(resultPath),
-          },
-          ...(ref
-            ? { runner: ref.runner, model: ref.model, effort: ref.effort }
-            : {}),
-        });
-      }
+      failure = await runAgentInvocation(invocation, {
+        phaseId,
+        name,
+        skill,
+        prompt: attemptPrompt,
+        resultPath,
+        timeoutMs: PHASE_TIMEOUTS_MS[timeoutKey] ?? 30 * 60_000,
+        env: {
+          CEZ_HARNESS_RESULT_FILE: resultPath,
+          CEZ_HARNESS_ARTIFACT_DIR: dirname(resultPath),
+        },
+        ...(ref
+          ? { runner: ref.runner, model: ref.model, effort: ref.effort }
+          : {}),
+      });
       const runnerFailure = failure;
       if (reviewSubjectBefore !== undefined) {
         try {
@@ -1972,6 +1912,9 @@ export async function runHarnessDriver(
   };
 
   let roles = input.roles;
+  if (!roles && input.profile !== 'standard') {
+    return `harness blocked: profile "${input.profile}" needs a role lineup — named agentHarness profiles are no longer resolved`;
+  }
   if (roles) {
     ledger.effectiveProfile = input.profile;
     ledger.roles = {
@@ -2024,15 +1967,6 @@ export async function runHarnessDriver(
       return 'harness recovery blocked: the immutable preflight config is missing or changed';
     }
     runtimeAgentic = await loadAgenticFile(trusted.path);
-    if (!roles && input.profile !== 'standard') {
-      const resolved = resolveHarnessPlan(input.profile, runtimeAgentic.agentHarness);
-      if (!resolved.ok) return `harness recovery blocked: ${resolved.error}`;
-      roles = {
-        orchestrator: resolved.plan.orchestrator,
-        implementer: resolved.plan.implementer,
-        reviewers: resolved.plan.reviewers,
-      };
-    }
   }
   const preflightError = await opPhase('preflight', 'Preflight', async () => {
     const selectedSkills = isFeature
@@ -2296,22 +2230,6 @@ export async function runHarnessDriver(
     }
     runtimeAgentic = await loadAgenticFile(trustedConfig.path);
     agentic = runtimeAgentic;
-    if (!roles && input.profile !== 'standard') {
-      const resolved = resolveHarnessPlan(input.profile, agentic.agentHarness);
-      if (!resolved.ok) return { ok: false, error: resolved.error };
-      roles = {
-        orchestrator: resolved.plan.orchestrator,
-        implementer: resolved.plan.implementer,
-        reviewers: resolved.plan.reviewers,
-      };
-      ledger.effectiveProfile = resolved.plan.profile;
-      ledger.roles = {
-        orchestrator: { ...roles.orchestrator },
-        implementer: { ...roles.implementer },
-        reviewers: roles.reviewers.map((reviewer) => ({ ...reviewer })),
-        reviewPolicy: resolved.plan.reviewPolicy,
-      };
-    }
     if (roles) {
       const seating = opencodeSeatingError(roles);
       if (seating) return { ok: false, error: seating };
