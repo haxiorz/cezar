@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { ApiRun, RunEvent } from '@open-mercato/cezar-api-client'
+import type { ApiRun, HarnessPhaseRecord, RunEvent } from '@open-mercato/cezar-api-client'
 
 import { liveTurnStart } from './task-thread'
 import { reduceThread } from './thread-state'
@@ -10,6 +10,58 @@ const end = '2026-09-23T10:04:00.000Z'
 const line = (seq: number, type: string, rest: Record<string, unknown> = {}): RunEvent =>
   ({ seq, ts: start, type, ...rest }) as RunEvent
 const message = (id: string, text: string) => ({ kind: 'message', id, role: 'assistant', text })
+const phaseLine = (seq: number, id: string, name: string, status: HarnessPhaseRecord['status'] = 'running'): RunEvent =>
+  line(seq, 'harness.phase.updated', { stepId: id, phase: { id, name, kind: 'op', status, attempts: 1, artifacts: {}, startedAt: start } satisfies HarnessPhaseRecord })
+
+describe('PR #925 review: gate phase headings', () => {
+  const stepNames = new Map([['preflight', 'Preflight'], ['capture', 'Capture'], ['implement', 'Implement'], ['validate', 'Validate'], ['review', 'Review']])
+  const headings = (events: RunEvent[], names = stepNames) => reduceThread(events, { stepNames: names, atHistoryStart: true }).turns
+    .flatMap((turn) => turn.items).flatMap((entry) => entry.kind === 'note' && entry.marker === 'step-start' ? [entry.text] : [])
+
+  it('labels running gates with no agent session or v1 step-start', () => {
+    expect(headings([
+      phaseLine(1, 'preflight', 'Preflight'),
+      phaseLine(2, 'preflight', 'Preflight', 'done'),
+      phaseLine(3, 'capture', 'Capture'),
+      phaseLine(4, 'capture', 'Capture', 'done'),
+      phaseLine(5, 'implement', 'Implement'),
+      line(6, 'turn.started', { stepId: 'implement', turnId: 'implement' }),
+      line(7, 'turn.completed', { stepId: 'implement', turnId: 'implement', ts: end }),
+      phaseLine(8, 'validate', 'Validate'),
+      phaseLine(9, 'validate', 'Validate', 'done'),
+      phaseLine(10, 'review', 'Review'),
+    ])).toEqual(['Preflight', 'Capture', 'Implement', 'Validate', 'Review'])
+  })
+
+  it('guard: excludes advisor, non-running and malformed metadata without duplicate headings', () => {
+    expect(headings([
+      line(1, 'turn.started', { stepId: 'implement', turnId: 'implement' }),
+      phaseLine(2, 'review', 'Review', 'pending'),
+      phaseLine(3, 'review', 'Review', 'done'),
+      phaseLine(4, 'review', 'Review', 'failed'),
+      phaseLine(5, 'review', 'Review', 'skipped'),
+      line(6, 'harness.phase.updated', { stepId: 'review' }),
+      phaseLine(7, 'impl-review-1', 'Review'),
+      phaseLine(8, 'spec-review-1', 'Spec review'),
+      line(9, 'harness.invocation.updated', { stepId: 'review', invocation: { status: 'running' } }),
+      line(10, 'harness.council.updated', { stepId: 'review' }),
+      line(11, 'turn.started', { stepId: 'implement', turnId: 'next' }),
+      phaseLine(12, 'implement', 'Implement'),
+    ])).toEqual(['Implement'])
+  })
+
+  it('guard: ignores gate metadata on ordinary runs without stepNames', () => {
+    expect(reduceThread([phaseLine(1, 'capture', 'Capture')])).toEqual({ turns: [], lastEventAt: start })
+  })
+
+  it('does not emit the unused initialStep property on first headings', () => {
+    const { turns } = reduceThread([line(1, 'step-start', { stepId: 'spec' })], {
+      stepNames: new Map([['spec', 'Specify']]), atHistoryStart: true,
+    })
+    expect(turns[0]?.items[0]).toMatchObject({ marker: 'step-start', text: 'Specify' })
+    expect(turns[0]?.items[0]).not.toHaveProperty('initialStep')
+  })
+})
 
 describe('PR #925 issue4: lazy session turn adoption', () => {
   it('opens a sessionless phase outside a failed lazy reviewer turn', () => {

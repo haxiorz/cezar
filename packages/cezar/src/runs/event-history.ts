@@ -291,7 +291,8 @@ async function reverseEventsUntil(
         canonical.length >= wantedItems + 1 &&
         chronological.some((event) => event.type === 'user-message' || event.type === 'turn.started')
       ) {
-        break;
+        const page = pageEventSlice(chronological, canonical.slice(-wantedItems));
+        if (sessionsWithoutStarts(page).size === 0) break;
       }
     }
     if (position === 0) {
@@ -363,6 +364,7 @@ async function forwardEventsUntil(
   const events: RunHistoryEvent[] = [];
   let canonical: CanonicalItem[] | undefined;
   let previousBoundary: RunHistoryEvent | undefined;
+  const sessionStarts = new Map<string, RunHistoryEvent>();
   let reachedEnd = true;
   let input: ReturnType<typeof createReadStream> | undefined;
   try {
@@ -373,6 +375,7 @@ async function forwardEventsUntil(
       if (!event) continue;
       if (event.seq <= afterSeq) {
         if (event.type === 'user-message' || event.type === 'turn.started') previousBoundary = event;
+        if (event.type === 'turn.started' && typeof event.sessionKey === 'string') sessionStarts.set(event.sessionKey, event);
         continue;
       }
       if (events.length === 0 && previousBoundary) events.push(previousBoundary);
@@ -388,7 +391,30 @@ async function forwardEventsUntil(
   } finally {
     input?.destroy();
   }
-  return { events, reachedEnd, bytesRead: input?.bytesRead ?? 0, ...(canonical === undefined ? {} : { canonical }) };
+  return { events: withSessionStarts(events, [...sessionStarts.values()]), reachedEnd, bytesRead: input?.bytesRead ?? 0, ...(canonical === undefined ? {} : { canonical }) };
+}
+
+function sessionsWithoutStarts(events: RunHistoryEvent[]): Set<string> {
+  const sessions = new Set<string>();
+  const seen = new Set<string>();
+  // A later turn cannot anchor an earlier one (PR #925 review).
+  for (const event of events) {
+    if (typeof event.sessionKey !== 'string' || seen.has(event.sessionKey)) continue;
+    seen.add(event.sessionKey);
+    if (event.type !== 'turn.started') sessions.add(event.sessionKey);
+  }
+  return sessions;
+}
+
+function withSessionStarts(page: RunHistoryEvent[], earlier: RunHistoryEvent[]): RunHistoryEvent[] {
+  const missing = sessionsWithoutStarts(page);
+  const starts: RunHistoryEvent[] = [];
+  // Every concurrent reviewer's key needs its own boundary (PR #925 review).
+  for (let index = earlier.length - 1; index >= 0 && missing.size > 0; index -= 1) {
+    const event = earlier[index]!;
+    if (event.type === 'turn.started' && typeof event.sessionKey === 'string' && missing.delete(event.sessionKey)) starts.push(event);
+  }
+  return [...starts.sort((a, b) => a.seq - b.seq), ...page];
 }
 
 function pageEventSlice(events: RunHistoryEvent[], selected: CanonicalItem[]): RunHistoryEvent[] {
@@ -405,7 +431,7 @@ function pageEventSlice(events: RunHistoryEvent[], selected: CanonicalItem[]): R
     }
   }
   const pageEvents = events.slice(start);
-  return boundary === undefined ? pageEvents : [boundary, ...pageEvents];
+  return withSessionStarts(boundary === undefined ? pageEvents : [boundary, ...pageEvents], events.slice(0, start));
 }
 
 function forwardPageEventSlice(events: RunHistoryEvent[], selected: CanonicalItem[]): RunHistoryEvent[] {

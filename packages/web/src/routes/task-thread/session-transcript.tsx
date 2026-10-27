@@ -572,7 +572,6 @@ const NOTE_COMPARE_FIELDS = {
   text: true,
   tone: true,
   marker: true,
-  initialStep: true,
   afterTurnEnd: true,
 } satisfies Record<keyof ThreadNote, true>
 

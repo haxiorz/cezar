@@ -44,8 +44,6 @@ export interface ThreadNote {
   tone: 'dim' | 'danger'
   /** A synthetic harness phase boundary (2026-07-29), rendered as a step divider. */
   marker?: 'step-start'
-  /** The first heading has no preceding phase to finish (PR #925 review). */
-  initialStep?: boolean
   /** Only a boundary arriving after completion follows this turn's finish (PR #925 review). */
   afterTurnEnd?: boolean
 }
@@ -566,7 +564,9 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
   const stepNames = options.stepNames
   let currentStepId: string | undefined
   for (const event of events) {
-    const eventStepId = stepNames && !str(event.type)?.startsWith('harness.') ? str(event.stepId) : undefined
+    const runningPhase = event.type === 'harness.phase.updated' && isRecord(event.phase) && event.phase.status === 'running' &&
+      stepNames?.has(str(event.stepId) ?? '')
+    const eventStepId = stepNames && (!str(event.type)?.startsWith('harness.') || runningPhase) ? str(event.stepId) : undefined
     if (stepNames && eventStepId !== undefined && eventStepId !== currentStepId) {
       if (currentStepId !== undefined || options.atHistoryStart === true) {
         const turn = currentTurn()
@@ -574,7 +574,6 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
           origin: 'meta',
           entry: {
             kind: 'note', id: `step-start:${event.seq}`, text: stepDividerLabel(stepNames, eventStepId), tone: 'dim', marker: 'step-start',
-            ...(currentStepId === undefined ? { initialStep: true } : {}),
             ...(turn.completed !== undefined ? { afterTurnEnd: true } : {}),
           },
         })

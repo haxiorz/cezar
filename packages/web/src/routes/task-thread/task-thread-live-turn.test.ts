@@ -58,7 +58,7 @@ describe('PR #925 round3 issue3: restart boundaries', () => {
   const resumedAt = '2026-09-23T11:00:00.000Z'
   const userMessage: RunEvent = { seq: 3, type: 'user-message', text: 'Continue after restart', ts: resumedAt }
 
-  it.each([false, true])('ignores an unclosed pre-crash reviewer (driver tail=%s)', (driverTail) => {
+  it.each([false, true])('guard: ignores an unclosed pre-crash reviewer (driver tail=%s)', (driverTail) => {
     const thread = reduceThread([
       ...started,
       userMessage,
@@ -85,6 +85,30 @@ describe('PR #925 round3 issue3: restart boundaries', () => {
       { seq: 4, type: 'turn.started', turnId: 'new', ts: '2026-09-23T11:01:00.000Z' },
     ])
     expect(liveTurnStart(run, thread)).toBe(resumedAt)
+  })
+})
+
+describe('PR #925 review: mid-council messages', () => {
+  it('guard: keeps the surviving reviewer clock under commentary without a queued message', () => {
+    const thread = reduceThread([
+      ...started,
+      { ...event(3, 'session.ended', 'a', aEnd), reason: 'error' },
+      { seq: 4, type: 'note', stepId: 'review', message: 'Reviewer A failed; B is still reviewing', ts: aEnd },
+    ])
+    expect(liveTurnStart(run, thread)).toBe(bStart)
+  })
+
+  it('keeps the surviving reviewer clock after a queued message and driver note', () => {
+    const aStartedAt = '2026-09-23T10:22:00.000Z'
+    const bStartedAt = '2026-09-23T10:23:00.000Z'
+    const thread = reduceThread([
+      event(1, 'turn.started', 'a', aStartedAt),
+      event(2, 'turn.started', 'b', bStartedAt),
+      { seq: 3, type: 'user-message', text: 'Please also check the tests', ts: '2026-09-23T10:40:00.000Z' },
+      { ...event(4, 'session.ended', 'a', '2026-09-23T10:45:00.000Z'), reason: 'error' },
+      { seq: 5, type: 'note', stepId: 'review', message: 'Reviewer A failed; B is still reviewing', ts: '2026-09-23T10:45:00.000Z' },
+    ])
+    expect(liveTurnStart({ startedAt: '2026-09-23T10:00:00.000Z' } as ApiRun, thread)).toBe(bStartedAt)
   })
 })
 

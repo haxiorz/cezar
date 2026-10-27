@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -83,6 +83,79 @@ describe('canonicalSessionItems', () => {
 });
 
 describe('readRunHistoryPage', () => {
+  it('retains every council start across a reverse-read chunk boundary', async () => {
+    const events: Array<Partial<RunEvent> & Pick<RunEvent, 'seq' | 'type'>> = [
+      { seq: 1, type: 'turn.started', stepId: 'review', sessionKey: 'a', turnId: 'turn_1' },
+      { seq: 2, type: 'note', message: 'x'.repeat(70_000) },
+      { seq: 3, type: 'turn.started', stepId: 'review', sessionKey: 'b', turnId: 'turn_1' },
+    ];
+    for (let index = 0; index < 150; index += 1) events.push({
+      seq: index + 4, type: 'item.completed', stepId: 'review', sessionKey: index % 2 === 0 ? 'a' : 'b',
+      item: { kind: 'message', id: `answer-${index}`, role: 'assistant', text: 'Reviewing' },
+    });
+    const page = await readRunHistoryPage(fixture(events));
+    expect(page.itemCount).toBe(100);
+    expect(page.events.filter((event) => event.type === 'turn.started').map((event) => [event.seq, event.sessionKey])).toEqual([
+      [1, 'a'], [3, 'b'],
+    ]);
+  });
+
+  it('guard: prepends only the latest start for each council session present in the page', async () => {
+    const events: Array<Partial<RunEvent> & Pick<RunEvent, 'seq' | 'type'>> = [
+      { seq: 1, type: 'turn.started', sessionKey: 'unrelated', turnId: 'turn_1' },
+      { seq: 2, type: 'turn.started', sessionKey: 'a', turnId: 'old' },
+      { seq: 3, type: 'turn.started', sessionKey: 'a', turnId: 'new' },
+      { seq: 4, type: 'turn.started', sessionKey: 'b', turnId: 'turn_1' },
+    ];
+    for (let index = 0; index < 150; index += 1) events.push({
+      seq: index + 5, type: 'item.completed', sessionKey: 'b',
+      item: { kind: 'message', id: `answer-${index}`, role: 'assistant', text: 'Reviewing' },
+    });
+    const page = await readRunHistoryPage(fixture(events));
+    expect(page.events.filter((event) => event.type === 'turn.started').map((event) => event.seq)).toEqual([4]);
+  });
+
+  it('retains a reviewer boundary when its next turn also starts inside the page', async () => {
+    const events: Array<Partial<RunEvent> & Pick<RunEvent, 'seq' | 'type'>> = [
+      { seq: 1, type: 'turn.started', sessionKey: 'a', turnId: 'first' },
+      { seq: 2, type: 'turn.started', sessionKey: 'b', turnId: 'first' },
+      ...Array.from({ length: 150 }, (_, index) => ({
+        seq: index + 3, type: 'item.completed', sessionKey: index % 2 === 0 ? 'a' : 'b',
+        item: { kind: 'message', id: `answer-${index}`, role: 'assistant', text: 'Reviewing' },
+      })),
+      { seq: 153, type: 'turn.started', sessionKey: 'a', turnId: 'next' },
+      { seq: 154, type: 'item.completed', sessionKey: 'a', item: { kind: 'message', id: 'next-answer', role: 'assistant', text: 'More review' } },
+    ];
+    const page = await readRunHistoryPage(fixture(events));
+    expect(page.events.filter((event) => event.type === 'turn.started').map((event) => event.seq)).toEqual([1, 2, 153]);
+  });
+
+  it.each([undefined, 'ordinary-step'])('guard: ordinary history pages retain f1a8541a bytes (stepId=%s)', async (stepId) => {
+    const file = fixture([
+      { seq: 1, type: 'turn.started', turnId: 'ordinary', ...(stepId === undefined ? {} : { stepId }) },
+      ...Array.from({ length: 150 }, (_, index) => ({
+        seq: index + 2, type: 'note', message: `note-${index}`, ...(stepId === undefined ? {} : { stepId }),
+      })),
+    ]);
+    const events = readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as RunEvent);
+    const size = statSync(file).size;
+    const cursor = (kind: 'older' | 'newer') => Buffer.from(JSON.stringify({
+      v: 1, kind: 'page', direction: kind, fileSize: size, boundarySeq: kind === 'older' ? 52 : 51,
+    })).toString('base64url');
+    const liveCursor = Buffer.from(JSON.stringify({ v: 1, kind: 'live', offset: size, boundarySeq: 151 })).toString('base64url');
+    const newest = await readRunHistoryPage(file);
+    const older = await readRunHistoryPage(file, newest.olderCursor);
+    const forward = await readRunHistoryPage(file, older.newerCursor);
+    const expectedNewest = {
+      events: [events[0], ...events.slice(51)], itemCount: 100, olderCursor: cursor('older'), liveCursor, asOfSeq: 151, hasOlder: true,
+    };
+    expect(JSON.stringify(newest)).toBe(JSON.stringify(expectedNewest));
+    expect(JSON.stringify(older)).toBe(JSON.stringify({
+      events: events.slice(0, 51), itemCount: 50, newerCursor: cursor('newer'), liveCursor, asOfSeq: 151, hasOlder: false,
+    }));
+    expect(JSON.stringify(forward)).toBe(JSON.stringify(expectedNewest));
+  });
+
   it('returns exactly the newest 100 items and pages the older remainder', async () => {
     const events: Array<Partial<RunEvent> & Pick<RunEvent, 'seq' | 'type'>> = [
       { seq: 1, type: 'turn.started', turnId: 't1' },

@@ -630,6 +630,36 @@ describe('SessionTranscript', () => {
 })
 
 describe('PR #925 issue2: phase completion rows', () => {
+  it('places real gate headings after the completed phase time', () => {
+    const phase = (id: string) => ({ id, name: id, kind: 'op', status: 'running', attempts: 1, artifacts: {} })
+    const thread = reduceThread(asRunEvents([
+      { type: 'turn.started', stepId: 'implement', turnId: 'implement' },
+      { type: 'item.completed', stepId: 'implement', item: { kind: 'message', id: 'answer', role: 'assistant', text: 'Done' } },
+      { type: 'turn.completed', stepId: 'implement', turnId: 'implement' },
+      { type: 'harness.phase.updated', stepId: 'validate', phase: phase('validate') },
+      { type: 'harness.phase.updated', stepId: 'review', phase: phase('review') },
+    ]), { stepNames: new Map([['implement', 'Implement'], ['validate', 'Validate'], ['review', 'Review']]) })
+    const rows = buildTranscriptRows(mainTranscriptSections(run({ task: '' }), thread), 'r1')
+    expect(rows.map((row) => row.content.kind === 'block' ? row.content.block.id : row.content.kind)).toEqual([
+      'answer', 'turn-time', 'step-start:4', 'step-start:5',
+    ])
+    expect(thread.turns[0]?.items.filter((entry) => entry.kind === 'note')).toMatchObject([
+      { text: 'Validate', afterTurnEnd: true }, { text: 'Review', afterTurnEnd: true },
+    ])
+  })
+
+  it('guard: keeps divider timing and keys after removing unused first-heading metadata', () => {
+    const thread = reduceThread(asRunEvents([
+      { type: 'step-start', stepId: 'spec' },
+      { type: 'turn.started', stepId: 'spec', turnId: 'spec' },
+      { type: 'turn.completed', stepId: 'spec', turnId: 'spec' },
+      { type: 'step-start', stepId: 'review' },
+    ]), { stepNames: new Map([['spec', 'Specify'], ['review', 'Review']]), atHistoryStart: true })
+    expect(buildTranscriptRows(mainTranscriptSections(run({ task: '' }), thread), 'r1').map((row) => row.key)).toEqual([
+      'turn-fallback-1:step-start:1', 'turn-fallback-1:turn-time', 'turn-fallback-1:step-start:4',
+    ])
+  })
+
   it('puts the previous phase finish before the next divider without changing keys', () => {
     const thread = reduceThread(asRunEvents([
       { type: 'turn.started', stepId: 'spec', turnId: 'spec-turn' },

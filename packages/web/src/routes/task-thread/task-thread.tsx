@@ -899,7 +899,9 @@ export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefi
   if (last.sessionKey !== undefined || (last.stepId !== undefined && last.turnId === undefined && last.userMessage === undefined && last.startedAt === undefined)) {
     // A resumed council cannot inherit a reviewer's pre-crash clock (PR #925 review).
     const resumeIndex = thread.turns.reduce((latest, turn, index) => turn.userMessage !== undefined ? index : latest, -1)
-    const peers = thread.turns.slice(resumeIndex + 1).filter((turn) => turn.sessionKey !== undefined && turn.stepId === last.stepId)
+    const allPeers = thread.turns.filter((turn) => turn.sessionKey !== undefined && turn.stepId === last.stepId)
+    const resumed = thread.turns.slice(resumeIndex + 1).filter((turn) => turn.sessionKey !== undefined && turn.stepId === last.stepId)
+    const peers = resumed.length > 0 ? resumed : allPeers
     if (peers.length > 0) {
       const open = peers.filter((turn) => turn.completed === undefined && turn.sessionEnded === undefined)
       const earliestStart = (turns: typeof peers) => turns.reduce<string | undefined>((earliest, turn) => {
