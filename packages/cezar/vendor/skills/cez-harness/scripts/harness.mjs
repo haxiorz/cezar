@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, statSync, writeFileSync, mkdirSync, rmSync, unlinkSync } from 'node:fs'
+import { copyFileSync, utimesSync, closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, statSync, writeFileSync, mkdirSync, rmSync, unlinkSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1230,14 +1230,55 @@ function gitAddPaths(args, paths, worktree, options = {}) {
   return git([...args, '--', ...pathspecs], worktree, options)
 }
 
+// Match the driver's normalized index without losing absent sparse entries (PR #925 review).
+function normalizeSparseSubjectIndex(worktree, env) {
+  git(['read-tree', '--reset', 'HEAD'], worktree, { env })
+  const entries = git(['ls-files', '-v', '-z'], worktree, { env }).split('\0').filter(Boolean)
+  const clear = (flag, paths) => {
+    if (paths.length) git(['update-index', flag, '-z', '--stdin'], worktree, { env, input: paths.join('\0') + '\0' })
+  }
+  clear('--no-assume-unchanged', entries.filter((entry) => /^[a-z] /.test(entry)).map((entry) => entry.slice(2)))
+  clear('--no-skip-worktree', entries.filter((entry) => {
+    if (!/^[Ss] /.test(entry)) return false
+    try { lstatSync(join(worktree, entry.slice(2))); return true } catch { return false }
+  }).map((entry) => entry.slice(2)))
+}
+
+// Skip-worktree absences are not reviewed deletions (PR #925 review).
+function stageAddablePaths(worktree, paths, options = {}, sparse = false) {
+  const entries = git(['ls-files', '-v', '-z', '--'], worktree, options).split('\0').filter(Boolean)
+  const tracked = new Set(entries.map((entry) => entry.slice(2)))
+  const skipped = new Set(entries.filter((entry) => /^[Ss] /.test(entry)).map((entry) => entry.slice(2)))
+  const absent = paths.filter((path) => {
+    try { lstatSync(join(worktree, path)); return false } catch { return true }
+  })
+  const ghosts = absent.filter((path) => !tracked.has(path))
+  const sparseAbsent = absent.filter((path) => skipped.has(path))
+  const deletions = sparse ? absent.filter((path) => tracked.has(path) && !skipped.has(path)) : []
+  // Git add rejects exact absent out-of-cone paths even with --sparse (PR #925 review).
+  if (deletions.length) git(['update-index', '--force-remove', '-z', '--stdin'], worktree, { ...options, input: deletions.join('\0') + '\0' })
+  return { ghosts, sparseAbsent, deletions, addable: paths.filter((path) => !ghosts.includes(path) && !sparseAbsent.includes(path) && !deletions.includes(path)) }
+}
+
 function buildWorktreeDiff(worktree, paths = []) {
   const temp = mkdtempSync(join(tmpdir(), 'om-harness-index-'))
   const index = join(temp, 'index')
   const env = { GIT_INDEX_FILE: index }
   try {
-    git(['read-tree', 'HEAD'], worktree, { env })
-    if (paths.length) gitAddPaths(['add', '-A'], paths, worktree, { env })
-    else git(['add', '-A'], worktree, { env })
+    let sparse = false
+    try { sparse = git(['config', '--bool', 'core.sparseCheckout'], worktree).trim() === 'true' } catch {}
+    if (sparse) {
+      const realIndex = join(git(['rev-parse', '--absolute-git-dir'], worktree).trim(), 'index')
+      const { atime, mtime } = statSync(realIndex)
+      copyFileSync(realIndex, index)
+      utimesSync(index, atime, mtime)
+      normalizeSparseSubjectIndex(worktree, env)
+    } else git(['read-tree', 'HEAD'], worktree, { env })
+    const addArgs = ['add', '-A', ...(sparse ? ['--sparse'] : [])]
+    const addable = sparse ? stageAddablePaths(worktree, paths, { env }, sparse).addable : paths
+    if (paths.length) {
+      if (addable.length) gitAddPaths(addArgs, addable, worktree, { env })
+    } else git(addArgs, worktree, { env })
     return git(['diff', '--cached', '--no-ext-diff', '--binary', 'HEAD'], worktree, { env })
   } finally {
     rmSync(temp, { recursive: true, force: true })
@@ -2248,7 +2289,7 @@ function commandVerify(args) {
 }
 
 function validateStagePath(worktree, entry) {
-  const normalized = entry.trim()
+  const normalized = entry.replace(/\r$/, '')
   if (!normalized) return null
   if (/[\u0000-\u001f\u007f]/.test(normalized)) throw new Error('Stage path cannot contain control characters')
   if (isAbsolute(normalized)) throw new Error(`Stage path must be relative: ${normalized}`)
@@ -2271,19 +2312,16 @@ function commandStage(args) {
   const currentHead = currentState.head
   const drift = gitStateDrift(startState, currentState)
   if (drift.length) throw new Error(`Git refs or reflogs changed during staged-only run:\n- ${drift.join('\n- ')}`)
-  // The allowlist is a UNION across every implement/fix round, so it can name
-  const tracked = new Set(git(['ls-files', '-z', '--'], worktree).toString().split('\0').filter(Boolean))
-  const ghosts = paths.filter((path) => !existsSync(join(worktree, path)) && !tracked.has(path))
-  const addable = paths.filter((path) => !ghosts.includes(path))
-  if (!addable.length) throw new Error('Stage allowlist is empty after dropping entries that no longer exist')
   let sparse = false
   try { sparse = git(['config', '--bool', 'core.sparseCheckout'], worktree).trim() === 'true' } catch {}
+  const { ghosts, sparseAbsent, deletions, addable } = stageAddablePaths(worktree, paths, {}, sparse)
+  if (!addable.length && !deletions.length) throw new Error('Stage allowlist is empty after dropping entries that no longer exist')
   const addArgs = ['add', ...(sparse ? ['--sparse'] : [])]
   try {
-    gitAddPaths(addArgs, addable, worktree)
+    if (addable.length) gitAddPaths(addArgs, addable, worktree)
   } catch (error) {
     if (!/index\.lock|unable to create/i.test(String(error.message || ''))) throw error
-    gitAddPaths(addArgs, addable, worktree)
+    if (addable.length) gitAddPaths(addArgs, addable, worktree)
   }
   const staged = git(['diff', '--cached', '--name-status'], worktree).trim()
   if (!staged) throw new Error('Staged diff is empty')
@@ -2293,6 +2331,9 @@ function commandStage(args) {
   const warnings = []
   if (ghosts.length) {
     warnings.push(`allowlist entries dropped — created during the run, deleted again before the handoff:\n${ghosts.join('\n')}`)
+  }
+  if (sparseAbsent.length) {
+    warnings.push(`absent sparse allowlist entries left unchanged; restore with git sparse-checkout add <directory> before deleting:\n${sparseAbsent.join('\n')}`)
   }
   try {
     git(['diff', '--cached', '--check'], worktree)

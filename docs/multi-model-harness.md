@@ -224,8 +224,12 @@ prompt instructions are how you get 8/10 worktree escapes. It's enforced in laye
    reflog still shows. Other refs (tags, other branches) are not part of the
    snapshot; nothing the harness publishes reads them.
 3. **Staging is git-derived.** The allowlist comes from the driver's own diff, the
-   runtime stages exactly those paths, and the driver cross-checks the staged set
-   for exact equality.
+   runtime stages those changes, and the driver cross-checks the staged set for
+   exact equality. Sparse review subjects include materialized out-of-cone edits;
+   absent skip-worktree entries stay unchanged, with a runtime warning when
+   explicitly allowlisted. Exact tracked deletions shown in the subject stay
+   deletions in the handoff. Restore sparse entries with
+   `git sparse-checkout add <directory>` before deleting.
 4. **The validation gate is not sandboxed.** It runs the base ref's commands the
    way CI would, in the worktree the implementer wrote — so the scripts behind
    `npm test` are model-authored code. It gets no provider credentials

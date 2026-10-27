@@ -3173,6 +3173,150 @@ syncBuiltinESMExports();
     return { make, cwd, git: gitTask };
   }
 
+  it.each(['initial', 'F4', 'restart'] as const)('[r8-lock] blocks %s staging when reset stays locked until runtime stage', async (entry) => {
+    const f = round7StageHarness();
+    const lock = join(f.git('rev-parse', '--absolute-git-dir').trim(), 'index.lock');
+    if (entry !== 'initial') {
+      const first = f.make();
+      expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+      const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+      if (entry === 'restart') ledger.phases.find((phase) => phase.id === 'stage')!.status = 'running';
+      else ledger.invocations.find((invocation) => invocation.id === 'runtime:stage')!.inputSha256 = 'expired';
+      saveLedger(first.host.dataDir, first.host.runId, ledger);
+    }
+    const next = f.make();
+    const original = next.agentBehavior.get('implement')!;
+    next.agentBehavior.set('implement', async (req) => {
+      await original(req);
+      f.git('update-index', '--assume-unchanged', 'src/x');
+      writeFileSync(join(f.cwd, 'src/x'), 'hidden edit\n');
+      writeFileSync(lock, 'held');
+      return null;
+    });
+    if (entry !== 'initial') {
+      f.git('update-index', '--assume-unchanged', 'src/x');
+      writeFileSync(join(f.cwd, 'src/x'), 'hidden edit\n');
+      writeFileSync(lock, 'held');
+    }
+    const create = next.deps.createRuntime!;
+    next.deps.createRuntime = (opts) => {
+      const runtime = create(opts);
+      return { ...runtime, run: async (op, args, options) => {
+        if (op === 'stage') rmSync(lock, { force: true });
+        return runtime.run(op, args, options);
+      } };
+    };
+    try {
+      const result = await runHarnessDriver(next.host, input, next.deps);
+      expect(loadLedger(next.host.dataDir, next.host.runId)?.outcome.status).toBe('blocked');
+      expect(result).toMatch(/another git process holds the index lock.*Continue to retry/);
+      expect(next.ops.filter((op) => op.id === 'stage')).toHaveLength(0);
+    } finally { rmSync(lock, { force: true }); }
+  });
+
+  it('[r8-reset-error] blocks on a non-lock reset failure without retrying', async () => {
+    const f = round7StageHarness(); const next = f.make(); const realExec = childProcess.execFileSync; let resets = 0;
+    vi.spyOn(childProcess, 'execFileSync').mockImplementation(((file, args, options) => {
+      const opts = options as { env?: Record<string, string> };
+      if (file === 'git' && Array.isArray(args) && args.includes('read-tree') && !opts?.env?.GIT_INDEX_FILE) {
+        resets += 1; throw new Error('index is corrupt');
+      }
+      return realExec(file, args, options);
+    }) as typeof childProcess.execFileSync); syncBuiltinESMExports();
+    try {
+      const result = await runHarnessDriver(next.host, input, next.deps);
+      expect(loadLedger(next.host.dataDir, next.host.runId)?.outcome.status).toBe('blocked');
+      expect(result).toMatch(/could not reset the harness index.*index is corrupt/);
+      expect(resets).toBe(2); // The existing non-sparse read-tree fallback is retained.
+      expect(next.ops.filter((op) => op.id === 'stage')).toHaveLength(0);
+      expect(loadLedger(next.host.dataDir, next.host.runId)?.outcome.status).toBe('blocked');
+    } finally { vi.restoreAllMocks(); syncBuiltinESMExports(); }
+  });
+
+  it('[r8-backoff] stages hidden edits when the lock is released within backoff', async () => {
+    const f = round7StageHarness(); const next = f.make();
+    const lock = join(f.git('rev-parse', '--absolute-git-dir').trim(), 'index.lock');
+    const original = next.agentBehavior.get('implement')!;
+    next.agentBehavior.set('implement', async (req) => {
+      await original(req); f.git('update-index', '--assume-unchanged', 'src/x');
+      writeFileSync(join(f.cwd, 'src/x'), 'hidden edit\n'); writeFileSync(lock, 'held'); return null;
+    });
+    const realExec = childProcess.execFileSync;
+    let resets = 0;
+    let release: ReturnType<typeof setTimeout> | undefined;
+    vi.spyOn(childProcess, 'execFileSync').mockImplementation(((file, args, options) => {
+      const opts = options as { env?: Record<string, string> };
+      if (file === 'git' && Array.isArray(args) && args.includes('read-tree') && !opts?.env?.GIT_INDEX_FILE && existsSync(lock)) {
+        if (++resets === 1) release = setTimeout(() => rmSync(lock, { force: true }), 1);
+      }
+      return realExec(file, args, options);
+    }) as typeof childProcess.execFileSync);
+    syncBuiltinESMExports();
+    try {
+      expect(await runHarnessDriver(next.host, input, next.deps)).toBeNull();
+      expect(resets).toBeGreaterThanOrEqual(2);
+      expect(f.git('diff', '--cached', '--name-only')).toBe('src/a.txt\nsrc/new\nsrc/x\n');
+      expect(loadLedger(next.host.dataDir, next.host.runId)?.outcome.status).toBe('ready');
+    } finally {
+      if (release) clearTimeout(release);
+      rmSync(lock, { force: true }); vi.restoreAllMocks(); syncBuiltinESMExports();
+    }
+  });
+
+  it.each([['[r8-nested] untracked nested repository stages its gitlink', 'nested repository'], ['guard: [r8-nested] an untracked plain directory lists files', 'plain directory']] as const)('%s', async (_name, kind) => {
+    const f = round7StageHarness(); const next = f.make();
+    next.agentBehavior.set('implement', (req) => {
+      const nested = join(f.cwd, 'nested'); mkdirSync(nested);
+      writeFileSync(join(nested, 'file'), 'content\n');
+      if (kind === 'nested repository') {
+        const git = (...args: string[]) => execFileSync('git', args, { cwd: nested, stdio: ['pipe', 'pipe', 'pipe'] });
+        git('init', '-q'); git('add', '.'); git('-c', 'user.email=test@local', '-c', 'user.name=test', 'commit', '-qm', 'nested');
+      }
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['nested/'] })); return null;
+    });
+    expect(await runHarnessDriver(next.host, input, next.deps)).toBeNull();
+    const paths = kind === 'nested repository' ? ['nested'] : ['nested/file'];
+    expect(loadLedger(next.host.dataDir, next.host.runId)?.stage.stagedPaths).toEqual(paths);
+    expect(f.git('diff', '--cached', '--raw')).toContain(kind === 'nested repository' ? '160000' : '100644');
+    const again = f.make(); expect(await runHarnessDriver(again.host, input, again.deps)).toBeNull();
+    expect(again.ops.filter((op) => op.id === 'stage')).toHaveLength(0);
+  });
+
+  it('[r8-sparse-delete-driver] an out-of-cone git rm reaches ready and reuses its reviewed deletion', async () => {
+    const f = round7StageHarness(); mkdirSync(join(f.cwd, 'outside'));
+    writeFileSync(join(f.cwd, 'outside/file'), 'base\n'); f.git('add', 'outside'); f.git('commit', '-qm', 'outside base');
+    f.git('sparse-checkout', 'set', '--cone', 'src'); const next = f.make();
+    next.agentBehavior.set('implement', (req) => {
+      f.git('rm', '--sparse', 'outside/file');
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['outside/file'] })); return null;
+    });
+    expect(await runHarnessDriver(next.host, input, next.deps)).toBeNull();
+    expect(loadLedger(next.host.dataDir, next.host.runId)?.outcome.status).toBe('ready');
+    expect(f.git('diff', '--cached', '--name-status')).toBe('D\toutside/file\n');
+    const again = f.make(); expect(await runHarnessDriver(again.host, input, again.deps)).toBeNull();
+    expect(again.ops.filter((op) => op.id === 'stage')).toHaveLength(0);
+  });
+
+  it('[r8-events] F4 rediscovery block emits pending phase and stage updates', async () => {
+    const f = round7StageHarness(); const first = f.make();
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    ledger.invocations.find((entry) => entry.id === 'runtime:stage')!.inputSha256 = 'expired';
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+    const next = f.make(); let calls = 0;
+    next.deps.discoverChangedPaths = () => ++calls === 1 ? ['src/a.txt', 'src/new'] : null;
+    expect(await runHarnessDriver(next.host, input, next.deps)).toMatch(/could not derive/);
+    expect(next.events).toContainEqual(expect.objectContaining({ type: 'harness.phase.updated', stepId: 'stage', phase: expect.objectContaining({ status: 'pending' }) }));
+    expect(next.events).toContainEqual({ type: 'harness.stage.updated', stage: { status: 'pending' } });
+  });
+
+  it('guard: [r8-events] reused stage emits no invalidation update', async () => {
+    const f = round7StageHarness(); const first = f.make();
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const next = f.make(); expect(await runHarnessDriver(next.host, input, next.deps)).toBeNull();
+    expect(next.events.filter((event) => event.type === 'harness.stage.updated')).toEqual([]);
+  });
+
   it('[r7-reuse] re-stages identical bytes after a review input expires', async () => {
     const f = round7StageHarness();
     const first = f.make();
