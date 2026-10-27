@@ -344,3 +344,89 @@ describe('PR #925 issue3: compact council clocks and session closure', () => {
     expect(thread.sessionEnded).toEqual({ reason: 'error' })
   })
 })
+
+
+describe('PR #925 review: no current council peers', () => {
+  const resumedAt = '2026-09-23T11:00:00.000Z'
+  const stepNames = new Map([['review', 'Review'], ['fix', 'Fix']])
+
+  it.each([false, true])('starts at recovery before a replacement reviewer opens (closed=%s)', (closed) => {
+    const thread = reduceThread([
+      ...started,
+      ...(closed ? [event(3, 'turn.completed', 'a', aEnd), event(4, 'turn.completed', 'b', bEnd)] : []),
+      { seq: 5, type: 'lifecycle', message: 'cezar restarted — harness run re-queued', ts: resumedAt },
+      { seq: 6, type: 'lifecycle', message: 'run started', ts: resumedAt },
+    ], { stepNames })
+    expect(thread.turns.at(-1)?.sessionKey).toBe('b')
+    expect(liveTurnStart({ ...run, startedAt: resumedAt }, thread)).toBe(resumedAt)
+  })
+
+  it.each(['restart', 'stepped note'])('does not fall back to a mid-council message after %s', (gap) => {
+    const thread = reduceThread([
+      ...started,
+      { seq: 3, type: 'user-message', text: 'Also check tests', queued: true, ts: bStart },
+      event(4, 'turn.completed', 'a', aEnd),
+      event(5, 'turn.completed', 'b', bEnd),
+      ...(gap === 'restart' ? [
+        { seq: 6, type: 'lifecycle', message: 'cezar restarted — harness run re-queued', ts: resumedAt },
+        { seq: 7, type: 'lifecycle', message: 'run started', ts: resumedAt },
+      ] : [{ seq: 6, type: 'note', stepId: 'fix', message: 'Skills installed', ts: resumedAt }]),
+    ], { stepNames })
+    expect(thread.turns.at(-1)?.userMessage?.text).toBe('Also check tests')
+    expect(liveTurnStart(gap === 'restart' ? { ...run, startedAt: resumedAt } : run, thread)).toBe(
+      gap === 'restart' ? resumedAt : aEnd,
+    )
+  })
+
+  it.each(['turn.completed', 'session.ended'])('uses the later unfiltered %s end when recovery predates it', (type) => {
+    const thread = reduceThread([
+      ...started,
+      { seq: 3, type: 'user-message', text: 'Also check tests', queued: true, ts: bStart },
+      { ...event(4, type, 'a', aEnd), reason: 'error' },
+      { ...event(5, type, 'b', bEnd), reason: 'error' },
+      { seq: 6, type: 'note', stepId: 'fix', message: 'Preparing next phase', ts: aEnd },
+    ], { stepNames })
+    expect(liveTurnStart({ ...run, startedAt: bEnd }, thread)).toBe(aEnd)
+  })
+
+  it('guard: Continue after a closed council keeps its message clock even before the run restart', () => {
+    const messageAt = '2026-09-23T10:59:00.000Z'
+    const thread = reduceThread([
+      ...started, event(3, 'turn.completed', 'a', aEnd), event(4, 'turn.completed', 'b', bEnd),
+      { seq: 5, type: 'user-message', text: 'Continue', ts: messageAt },
+      { seq: 6, type: 'lifecycle', message: 'Harness resumed', ts: resumedAt },
+      { seq: 7, type: 'note', stepId: 'review', message: 'Reusing durable ledger', ts: resumedAt },
+    ], { stepNames })
+    expect(liveTurnStart({ ...run, startedAt: resumedAt }, thread)).toBe(messageAt)
+  })
+
+  it('guard: keeps the message clock when no old reviewer has a timestamped end', () => {
+    const thread = reduceThread([
+      ...started,
+      { seq: 3, type: 'user-message', text: 'Continue', ts: bEnd },
+      { seq: 4, type: 'lifecycle', message: 'Harness resumed', ts: resumedAt },
+    ], { stepNames })
+    expect(liveTurnStart({ ...run, startedAt: resumedAt }, thread)).toBe(bEnd)
+  })
+
+  it('guard: without a run start, keyed peers retain their existing clocks', () => {
+    const thread = reduceThread([
+      ...started,
+      { seq: 3, type: 'user-message', text: 'Also check tests', queued: true, ts: bStart },
+      event(4, 'turn.completed', 'a', aEnd), event(5, 'turn.completed', 'b', bEnd),
+      { seq: 6, type: 'lifecycle', message: 'Harness resumed', ts: resumedAt },
+    ], { stepNames })
+    expect(liveTurnStart({} as ApiRun, thread)).toBe(aEnd)
+    expect(liveTurnStart({} as ApiRun, reduceThread(started))).toBe(aStart)
+  })
+
+  it('guard: a pending ordinary message and a stepped note keep the latest-turn rule after restart', () => {
+    const thread = reduceThread([
+      { seq: 1, type: 'turn.started', turnId: 'ordinary', ts: aStart },
+      { seq: 2, type: 'user-message', text: 'Continue', ts: bStart },
+      { seq: 3, type: 'note', stepId: 'fix', message: 'Preparing', ts: resumedAt },
+      { seq: 4, type: 'lifecycle', message: 'run started', ts: resumedAt },
+    ])
+    expect(liveTurnStart({ ...run, startedAt: resumedAt }, thread)).toBe(bStart)
+  })
+})

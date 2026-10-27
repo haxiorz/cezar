@@ -249,6 +249,8 @@ interface DraftTurn {
   sessionKey?: string
   /** Later council activity distinguishes a queued message from Continue (PR #925 review). */
   councilAfterMessage?: boolean
+  /** Explicit queue intent survives partial history windows (PR #925 review). */
+  queuedForPhase?: boolean
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -612,6 +614,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
           pendingAsk = undefined
         }
         const turn = newTurn(event.seq, str(event.stepId))
+        if (event.queued === true) turn.queuedForPhase = true
         const ts = stamp(event.ts)
         turn.userMessage = {
           text,
@@ -637,9 +640,9 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
           break
         }
         const current = turns.at(-1)
-        // Only queued council messages must keep their own clock and row keys (PR #925 review).
+        // Queued phase messages keep their own clock and row keys (PR #925 review).
         const attached = current && current.sessionKey === undefined && current.turnId === undefined && !current.v2Items &&
-          (stepNames === undefined || (!current.councilAfterMessage &&
+          (stepNames === undefined || (!current.queuedForPhase && !current.councilAfterMessage &&
             (current.userMessage === undefined || current.stepId === undefined || current.stepId === str(event.stepId)))) &&
           (current.userMessage !== undefined || sessionTurns.size === 0) ? current : newTurn(event.seq, str(event.stepId))
         attached.stepId ??= str(event.stepId)

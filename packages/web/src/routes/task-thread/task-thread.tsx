@@ -902,8 +902,9 @@ export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefi
     const stepId = last.stepId ?? (pendingMessage ? thread.turns.filter((turn) => turn.sessionKey !== undefined).at(-1)?.stepId : undefined)
     // Continue re-stamps the run; queued messages and nudges do not (PR #925 review).
     const since = run.startedAt !== undefined ? Date.parse(run.startedAt) : -Infinity
-    const peers = thread.turns.filter((turn) => {
-      if (turn.sessionKey === undefined || turn.stepId !== stepId) return false
+    const councilTurns = thread.turns.filter((turn) => turn.sessionKey !== undefined)
+    const peers = councilTurns.filter((turn) => {
+      if (turn.stepId !== stepId) return false
       const at = turn.startedAt ?? turn.lastActivityAt
       return at === undefined || Date.parse(at) >= since
     })
@@ -921,6 +922,17 @@ export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefi
       }, undefined) ?? earliestStart(peers) ?? run.startedAt
       return pendingMessage && last.startedAt !== undefined && endedAt !== undefined && Date.parse(last.startedAt) > Date.parse(endedAt)
         ? last.startedAt : endedAt
+    }
+    // A restarted council must not inherit a dead reviewer's clock (PR #925 review).
+    if (last.sessionKey !== undefined) return run.startedAt
+    if (pendingMessage && last.startedAt !== undefined) {
+      const endedAt = councilTurns.reduce<string | undefined>((latest, turn) => {
+        const endedAt = turn.sessionEnded?.ts ?? turn.completed?.ts
+        return endedAt !== undefined && (latest === undefined || Date.parse(endedAt) > Date.parse(latest)) ? endedAt : latest
+      }, undefined)
+      if (endedAt !== undefined && Date.parse(last.startedAt) < Date.parse(endedAt)) {
+        return run.startedAt !== undefined && Date.parse(run.startedAt) > Date.parse(endedAt) ? run.startedAt : endedAt
+      }
     }
   }
   if (last.completed === undefined) return last.startedAt ?? run.startedAt

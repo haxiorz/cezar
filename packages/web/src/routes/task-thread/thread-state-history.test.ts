@@ -15,6 +15,121 @@ afterEach(() => {
   while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true })
 })
 
+describe('PR #925 review: explicit phase-queued messages', () => {
+  it.each(['stepless note', 'restart lifecycle', 'next-phase note'])(
+    'keeps a flagged message separate across every prepended history window with a %s', async (gap) => {
+      const events: RunEvent[] = []
+      const push = (type: string, rest: Record<string, unknown> = {}) => {
+        const seq = events.length + 1
+        events.push({ seq, ts: new Date(Date.UTC(2026, 8, 23, 10, 0, seq)).toISOString(), type, ...rest })
+      }
+      push('turn.started', { stepId: 'review', sessionKey: 'a', turnId: 'review' })
+      for (let index = 0; index < 60; index += 1) {
+        if (index === 55) {
+          push('user-message', { text: 'Also check tests', queued: true })
+          push('harness.message.queued')
+        }
+        push('item.completed', { stepId: 'review', sessionKey: 'a',
+          item: { kind: 'message', id: `review-${index}`, role: 'assistant', text: `Finding ${index}` } })
+      }
+      push('turn.completed', { stepId: 'review', sessionKey: 'a', turnId: 'review' })
+      push('harness.phase.updated', { stepId: 'review', phase: { id: 'review', status: 'done' } })
+      push(gap === 'restart lifecycle' ? 'lifecycle' : 'note', {
+        message: gap === 'restart lifecycle' ? 'cezar restarted — harness run re-queued' : 'Applying operator feedback',
+        ...(gap === 'next-phase note' ? { stepId: 'fix-2' } : {}),
+      })
+      push('harness.phase.updated', { stepId: 'fix-2', phase: { id: 'fix-2', status: 'running' } })
+      push('turn.started', { stepId: 'fix-2', turnId: 'fix' })
+      for (let index = 0; index < 99; index += 1) push('item.completed', { stepId: 'fix-2',
+        item: { kind: 'message', id: `fix-${index}`, role: 'assistant', text: `Fix ${index}` } })
+      push('turn.completed', { stepId: 'fix-2', turnId: 'fix' })
+      const stepNames = new Map([['review', 'Review'], ['fix-2', 'Fixes']])
+      const rows = (thread: ReturnType<typeof reduceThread>) => buildTranscriptRows(mainTranscriptSections({ task: '' } as ApiRun, thread), 'run')
+      const full = reduceThread(events, { stepNames, atHistoryStart: true })
+      const expected = full.turns.find((turn) => turn.turnId === 'fix')!
+      const start = events.find((line) => line.type === 'turn.started' && line.stepId === 'fix-2')!
+      expect(expected.id).toBe(`turn-seq-${start.seq}`)
+      expect(expected.startedAt).toBe(start.ts)
+      expect(expected.userMessage).toBeUndefined()
+      const expectedRows = rows(full).filter((row) => row.scope === expected.id)
+      const dir = mkdtempSync(join(tmpdir(), 'cez-queued-page-'))
+      dirs.push(dir)
+      const file = join(dir, 'run.ndjson')
+      writeFileSync(file, events.map((line) => JSON.stringify(line)).join('\n') + '\n')
+      let page = await readRunHistoryPage(file)
+      expect(page.events[0]?.type).toBe('user-message')
+      expect(page.events.some((line) => line.sessionKey !== undefined)).toBe(false)
+      let window = page.events
+      let windows = 0
+      for (;;) {
+        windows += 1
+        const thread = reduceThread(window, { stepNames, atHistoryStart: !page.hasOlder })
+        expect(thread.turns.find((turn) => turn.turnId === 'fix'), `paged window ${windows}`).toEqual(expected)
+        expect(rows(thread).filter((row) => row.scope === expected.id)).toEqual(expectedRows)
+        if (!page.olderCursor) break
+        page = await readRunHistoryPage(file, page.olderCursor)
+        window = mergeRunHistoryEvents(page.events, window)
+      }
+      expect(windows).toBeGreaterThan(1)
+      // Include every prepend boundary through the message (PR #925 review).
+      const messageIndex = events.findIndex((line) => line.type === 'user-message')
+      for (let cut = 0; cut <= messageIndex; cut += 1) {
+        const thread = reduceThread(events.slice(cut), { stepNames, atHistoryStart: cut === 0 })
+        expect(thread.turns.find((turn) => turn.turnId === 'fix'), `suffix ${cut}`).toEqual(expected)
+        expect(rows(thread).filter((row) => row.scope === expected.id)).toEqual(expectedRows)
+      }
+    },
+  )
+
+  it('keeps a message queued during a sequential phase out of the next phase clock', () => {
+    const ts = (seq: number) => new Date(Date.UTC(2026, 8, 23, 10, 0, seq)).toISOString()
+    const thread = reduceThread([
+      { seq: 1, ts: ts(1), type: 'turn.started', stepId: 'implement', turnId: 'implement' },
+      { seq: 2, ts: ts(2), type: 'user-message', text: 'Also check tests', queued: true },
+      { seq: 3, ts: ts(3), type: 'turn.completed', stepId: 'implement', turnId: 'implement' },
+      { seq: 4, ts: ts(4), type: 'turn.started', stepId: 'fix', turnId: 'fix' },
+    ], { stepNames: new Map([['implement', 'Implement'], ['fix', 'Fix']]) })
+    expect(thread.turns.at(-1)).toMatchObject({ id: 'turn-seq-4', startedAt: ts(4), turnId: 'fix' })
+    expect(thread.turns[1]?.turnId).toBeUndefined()
+    expect(thread.turns[1]).not.toHaveProperty('queuedForPhase')
+  })
+
+  it.each([undefined, 'fix'])('guard: an unflagged Continue reply still adopts with phase %s', (stepId) => {
+    const ts = '2026-09-23T10:00:00.000Z'
+    const thread = reduceThread([
+      { seq: 1, ts, type: 'user-message', text: 'Continue', ...(stepId ? { stepId } : {}) },
+      { seq: 2, ts, type: 'harness.message.queued' },
+      { seq: 3, ts, type: 'turn.started', stepId: 'fix', turnId: 'fix' },
+    ], { stepNames: new Map([['fix', 'Fix']]) })
+    expect(thread.turns).toHaveLength(1)
+    expect(thread.turns[0]).toMatchObject({ id: 'turn-seq-1', turnId: 'fix', userMessage: { text: 'Continue' } })
+  })
+
+  it('guard: unflagged mid-council messages retain the legacy inference', () => {
+    const ts = '2026-09-23T10:00:00.000Z'
+    const thread = reduceThread([
+      { seq: 1, ts, type: 'user-message', text: 'Also check tests' },
+      { seq: 2, ts, type: 'turn.completed', sessionKey: 'a', stepId: 'review', turnId: 'review' },
+      { seq: 3, ts, type: 'turn.started', stepId: 'fix', turnId: 'fix' },
+    ], { stepNames: new Map([['review', 'Review'], ['fix', 'Fix']]) })
+    expect(thread.turns.find((turn) => turn.turnId === 'fix')).toMatchObject({ id: 'turn-seq-3' })
+    expect(thread.turns[0]?.turnId).toBeUndefined()
+  })
+
+  it.each([false, true])('guard: ordinary messages ignore the queued flag (%s)', (queued) => {
+    const ts = '2026-09-23T10:00:00.000Z'
+    const events: RunEvent[] = [
+      { seq: 1, ts, type: 'user-message', text: 'Follow up', stepId: 'old' },
+      { seq: 2, ts, type: 'turn.completed', sessionKey: 'a', stepId: 'review', turnId: 'review' },
+      { seq: 3, ts, type: 'turn.started', stepId: 'next', turnId: 'next' },
+    ]
+    const expected = reduceThread(events)
+    const thread = reduceThread(events.map((line) => line.type === 'user-message' ? { ...line, queued } : line))
+    expect(thread).toEqual(expected)
+    expect(thread.turns[0]).toMatchObject({ id: 'turn-seq-1', turnId: 'next', userMessage: { text: 'Follow up' } })
+  })
+})
+
 describe('PR #925 review: council history row stability', () => {
   it.each([
     ['keeps the next phase identity without council notes', false],

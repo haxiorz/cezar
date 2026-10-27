@@ -5861,6 +5861,7 @@ export function createApp(deps: ServerDeps) {
           saveLedger(harnessDataDir, id, read.ledger);
           store.appendEvent(id, {
             type: 'user-message',
+            queued: true,
             text: message.text,
             imageCount: 0,
             images: [],
