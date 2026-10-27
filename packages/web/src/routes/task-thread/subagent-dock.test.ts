@@ -12,6 +12,7 @@ import {
   subagentCounts,
 } from './subagent-dock'
 import { reduceThread, type ThreadEntry, type ThreadTurn } from './thread-state'
+import subagentDockSource from './subagent-dock.ts?raw'
 
 /** A `Task` spawn in the shape the claude mapper emits (title precomputed by `toolDisplay`). */
 const task = (id: string, status: ToolStatus, extra: Partial<UiToolItem> = {}): UiToolItem => ({
@@ -43,6 +44,26 @@ const childText = (id: string, parentItemId: string, text: string): Extract<Thre
 })
 
 const turn = (id: string, items: ThreadEntry[]): ThreadTurn => ({ id, items })
+
+describe('PR #925 round3 issue5: parent-key narrowing', () => {
+  it('narrows the parent key without a non-null assertion', () => {
+    expect(/parentKey\(entry\)!/.test(subagentDockSource)).toBe(false)
+  })
+
+  it('guard: ignores parentless and orphan children while retaining ordinary dock and sheet joins', () => {
+    const child = childTool('child', 'a', 'Ran child')
+    const turns = [turn('first', [
+      task('a', 'running'), child,
+      { kind: 'message', id: 'parentless', role: 'assistant', text: 'Main agent' },
+      childTool('orphan', 'missing', 'Ran orphan'),
+    ])]
+    expect(collectSubagents(turns)).toEqual([{
+      id: 'a', title: 'review a', status: 'running', toolCalls: 1, activity: 'Ran child',
+    }])
+    expect(findSubagent(turns, 'a')).toEqual(collectSubagents(turns)[0])
+    expect(subagentChildren(turns, 'a')).toEqual([child])
+  })
+})
 
 describe('collectSubagents — which items become rows', () => {
   it('collects parent-less task items in stream order', () => {

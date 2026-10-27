@@ -687,3 +687,88 @@ describe('PR #925 issue2: phase completion rows', () => {
     ])
   })
 })
+
+describe('PR #925 round3 issue1: divider arrival order', () => {
+  const stepNames = new Map([['spec', 'Specify'], ['review', 'Review'], ['implement', 'Implement']])
+  const rowsFor = (events: object[], harness = true) => {
+    const thread = reduceThread(asRunEvents(events), harness ? { stepNames } : {})
+    return { thread, rows: buildTranscriptRows(mainTranscriptSections(run({ task: '' }), thread), 'r1') }
+  }
+  const ids = (rows: ReturnType<typeof buildTranscriptRows>) => rows.map((row) =>
+    row.content.kind === 'block' ? row.content.block.id : row.content.kind,
+  )
+
+  it('keeps a Continue reply finish below its heading and output', () => {
+    const { thread, rows } = rowsFor([
+      { type: 'turn.started', stepId: 'spec', turnId: 'spec' },
+      { type: 'turn.completed', stepId: 'spec', turnId: 'spec' },
+      { type: 'user-message', text: 'Please revise' },
+      { type: 'harness.feedback.applied', stepId: 'implement' },
+      { type: 'note', stepId: 'implement', message: 'Applying operator feedback' },
+      { type: 'turn.started', stepId: 'implement', turnId: 'implement' },
+      { type: 'item.completed', stepId: 'implement', item: { kind: 'message', id: 'answer', role: 'assistant', text: 'Revised' } },
+      { type: 'turn.completed', stepId: 'implement', turnId: 'implement' },
+    ])
+    const reply = thread.turns.find((turn) => turn.userMessage !== undefined)
+    expect(reply?.turnId).toBe('implement')
+    expect(reply?.items.find((entry) => entry.kind === 'note' && entry.marker === 'step-start')).not.toHaveProperty('afterTurnEnd')
+    expect(ids(rows.filter((row) => row.scope === reply?.id))).toEqual([
+      'user-message', 'step-start:5', 'v1:5', 'answer', 'turn-time',
+    ])
+  })
+
+  it.each([false, true])('does not adopt council commentary into the next phase (advisors=%s)', (advisors) => {
+    const { thread, rows } = rowsFor([
+      { type: 'turn.started', sessionKey: 'a', stepId: 'review', turnId: 'review' },
+      { type: 'note', stepId: 'review', message: 'Reviewer B produced no review' },
+      ...(advisors ? [{ type: 'harness.invocation.updated', stepId: 'impl-review-1' }] : []),
+      { type: 'turn.completed', sessionKey: 'a', stepId: 'review', turnId: 'review' },
+      { type: 'step-start', stepId: 'implement' },
+      { type: 'turn.started', stepId: 'implement', turnId: 'implement' },
+      { type: 'item.completed', stepId: 'implement', item: { kind: 'message', id: 'answer', role: 'assistant', text: 'Fixed' } },
+      { type: 'turn.completed', stepId: 'implement', turnId: 'implement' },
+    ])
+    expect(thread.turns).toHaveLength(3)
+    expect(thread.turns[1]?.turnId).toBeUndefined()
+    expect(thread.turns[1]?.completed).toBeUndefined()
+    const phase = thread.turns[2]
+    expect(phase?.turnId).toBe('implement')
+    expect(ids(rows.filter((row) => row.scope === phase?.id))).toEqual(['answer', 'turn-time'])
+  })
+
+  it('guard: keeps a completed phase finish above a later divider', () => {
+    const { thread, rows } = rowsFor([
+      { type: 'turn.started', stepId: 'spec', turnId: 'spec' },
+      { type: 'item.completed', stepId: 'spec', item: { kind: 'message', id: 'answer', role: 'assistant', text: 'Done' } },
+      { type: 'turn.completed', stepId: 'spec', turnId: 'spec' },
+      { type: 'step-start', stepId: 'implement' },
+    ])
+    expect(ids(rows)).toEqual(['answer', 'turn-time', 'step-start:4'])
+    expect(thread.turns[0]?.turnId).toBe('spec')
+  })
+
+  it('guard: preserves ordinary note adoption, user turns and closing rows', () => {
+    const { thread, rows } = rowsFor([
+      { type: 'note', message: 'Loading' },
+      { type: 'turn.started', turnId: 'first' },
+      { type: 'turn.completed', turnId: 'first' },
+      { type: 'user-message', text: 'Continue' },
+      { type: 'turn.started', turnId: 'next' },
+      { type: 'item.completed', item: { kind: 'message', id: 'answer', role: 'assistant', text: 'Done' } },
+      { type: 'turn.completed', turnId: 'next' },
+    ], false)
+    expect(thread.turns.map((turn) => [turn.id, turn.turnId])).toEqual([['turn-fallback-1', 'first'], ['turn-seq-4', 'next']])
+    expect(ids(rows)).toEqual(['v1:1', 'turn-time', 'user-message', 'answer', 'turn-time'])
+  })
+
+  it('guard: still adopts a user reply after a council', () => {
+    const { thread } = rowsFor([
+      { type: 'turn.started', sessionKey: 'a', stepId: 'review', turnId: 'review' },
+      { type: 'turn.completed', sessionKey: 'a', stepId: 'review', turnId: 'review' },
+      { type: 'user-message', text: 'Continue' },
+      { type: 'turn.started', stepId: 'implement', turnId: 'implement' },
+    ])
+    expect(thread.turns).toHaveLength(2)
+    expect(thread.turns[1]).toMatchObject({ userMessage: { text: 'Continue' }, turnId: 'implement' })
+  })
+})

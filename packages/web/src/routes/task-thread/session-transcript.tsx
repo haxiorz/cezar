@@ -207,7 +207,7 @@ export function buildTranscriptRows(
     }
     const blocks = groupThreadItems([...section.entries])
     const timeBefore = blocks.findIndex((block) =>
-      block.kind === 'entry' && block.entry.kind === 'note' && block.entry.marker === 'step-start' && block.entry.initialStep !== true,
+      block.kind === 'entry' && block.entry.kind === 'note' && block.entry.marker === 'step-start' && block.entry.afterTurnEnd === true,
     )
     const timeRow: TranscriptRowModel | undefined = section.completedAt !== undefined ? {
       key: `${section.id}:turn-time`,
@@ -573,6 +573,7 @@ const NOTE_COMPARE_FIELDS = {
   tone: true,
   marker: true,
   initialStep: true,
+  afterTurnEnd: true,
 } satisfies Record<keyof ThreadNote, true>
 
 const IMAGE_COMPARE_FIELDS = {

@@ -115,13 +115,14 @@ export function TaskThreadRoute() {
     () => (harnessSteps ? new Map(harnessSteps.map((step) => [step.id, step.name])) : undefined),
     [harnessSteps],
   )
+  const atHistoryStart = stepNames !== undefined ? !history.hasOlder : undefined
   const thread = useMemo(
-    () => reduceThread(history.visibleEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames, askAsProse: stepNames !== undefined, atHistoryStart: !history.hasOlder }),
-    [history.visibleEvents, runStatus, run.data?.runner, stepNames, history.hasOlder],
+    () => reduceThread(history.visibleEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames, askAsProse: stepNames !== undefined, atHistoryStart }),
+    [history.visibleEvents, runStatus, run.data?.runner, stepNames, atHistoryStart],
   )
   const currentThread = useMemo(
-    () => reduceThread(history.currentEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames, askAsProse: stepNames !== undefined, atHistoryStart: !history.hasOlder }),
-    [history.currentEvents, runStatus, run.data?.runner, stepNames, history.hasOlder],
+    () => reduceThread(history.currentEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, stepNames, askAsProse: stepNames !== undefined, atHistoryStart }),
+    [history.currentEvents, runStatus, run.data?.runner, stepNames, atHistoryStart],
   )
 
   // Read receipt (#unread-done-items): opening a finished task's thread marks it read — the same
@@ -896,17 +897,21 @@ export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefi
   if (last === undefined) return run.startedAt
   // Driver notes can trail the reviewers; their clocks still belong to the council (PR #925 review).
   if (last.sessionKey !== undefined || (last.stepId !== undefined && last.turnId === undefined && last.userMessage === undefined && last.startedAt === undefined)) {
-    const peers = thread.turns.filter((turn) => turn.sessionKey !== undefined && turn.stepId === last.stepId)
+    // A resumed council cannot inherit a reviewer's pre-crash clock (PR #925 review).
+    const resumeIndex = thread.turns.reduce((latest, turn, index) => turn.userMessage !== undefined ? index : latest, -1)
+    const peers = thread.turns.slice(resumeIndex + 1).filter((turn) => turn.sessionKey !== undefined && turn.stepId === last.stepId)
     if (peers.length > 0) {
       const open = peers.filter((turn) => turn.completed === undefined && turn.sessionEnded === undefined)
-      if (open.length > 0) return open.reduce<string | undefined>((earliest, turn) => {
+      const earliestStart = (turns: typeof peers) => turns.reduce<string | undefined>((earliest, turn) => {
         const startedAt = turn.startedAt
         return startedAt !== undefined && (earliest === undefined || Date.parse(startedAt) < Date.parse(earliest)) ? startedAt : earliest
-      }, undefined) ?? run.startedAt
+      }, undefined)
+      // Compact context can retain a start only on a finished peer (PR #925 review).
+      if (open.length > 0) return earliestStart(open) ?? earliestStart(peers) ?? run.startedAt
       return peers.reduce<string | undefined>((latest, turn) => {
         const endedAt = turn.sessionEnded?.ts ?? turn.completed?.ts
         return endedAt !== undefined && (latest === undefined || Date.parse(endedAt) > Date.parse(latest)) ? endedAt : latest
-      }, undefined) ?? run.startedAt
+      }, undefined) ?? earliestStart(peers) ?? run.startedAt
     }
   }
   if (last.completed === undefined) return last.startedAt ?? run.startedAt

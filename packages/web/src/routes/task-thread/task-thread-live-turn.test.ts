@@ -54,6 +54,76 @@ describe('liveTurnStart — concurrent reviewers', () => {
   })
 })
 
+describe('PR #925 round3 issue3: restart boundaries', () => {
+  const resumedAt = '2026-09-23T11:00:00.000Z'
+  const userMessage: RunEvent = { seq: 3, type: 'user-message', text: 'Continue after restart', ts: resumedAt }
+
+  it.each([false, true])('ignores an unclosed pre-crash reviewer (driver tail=%s)', (driverTail) => {
+    const thread = reduceThread([
+      ...started,
+      userMessage,
+      event(4, 'turn.started', 'resumed', resumedAt),
+      ...(driverTail ? [{ seq: 5, type: 'note', stepId: 'review', message: 'Council resumed', ts: resumedAt } as RunEvent] : []),
+    ])
+    expect(thread.turns[0]?.completed).toBeUndefined()
+    expect(thread.turns[0]?.sessionEnded).toBeUndefined()
+    expect(liveTurnStart(run, thread)).toBe(resumedAt)
+  })
+
+  it('guard: keeps a live reviewer clock across commentary without a resume', () => {
+    const thread = reduceThread([
+      ...started,
+      { seq: 3, type: 'note', stepId: 'review', message: 'Still reviewing', ts: bEnd },
+    ])
+    expect(liveTurnStart(run, thread)).toBe(aStart)
+  })
+
+  it('guard: ordinary user resumes retain the user-message start', () => {
+    const thread = reduceThread([
+      { seq: 1, type: 'turn.started', turnId: 'old', ts: aStart },
+      userMessage,
+      { seq: 4, type: 'turn.started', turnId: 'new', ts: '2026-09-23T11:01:00.000Z' },
+    ])
+    expect(liveTurnStart(run, thread)).toBe(resumedAt)
+  })
+})
+
+describe('PR #925 round3 issue4: compact council fallback', () => {
+  it('uses a finished peer start when compact context leaves open peers without starts', () => {
+    const thread = reduceThread([
+      event(1, 'turn.started', 'b', bStart),
+      event(2, 'turn.completed', 'b', bEnd),
+      { seq: 3, type: 'item.completed', sessionKey: 'a', stepId: 'review', ts: aEnd, item: { kind: 'message', id: 'answer', role: 'assistant', text: 'A is still reviewing' } },
+      { seq: 4, type: 'session.error', sessionKey: 'c', stepId: 'review', ts: aEnd, message: 'Retrying C' },
+    ])
+    expect(thread.turns.slice(1).map((turn) => turn.startedAt)).toEqual([undefined, undefined])
+    expect(liveTurnStart(run, thread)).toBe(bStart)
+  })
+
+  it('uses a peer start when every closure lacks a timestamp', () => {
+    expect(liveTurnStart(run, { turns: [{
+      id: 'b', items: [], sessionKey: 'b', stepId: 'review', startedAt: bStart,
+      completed: { stopReason: 'end_turn' },
+    }] })).toBe(bStart)
+  })
+
+  it('guard: a defined open-peer start wins over an earlier closed peer', () => {
+    expect(liveTurnStart(run, reduceThread([
+      ...started, event(3, 'turn.completed', 'a', aEnd),
+    ]))).toBe(bStart)
+  })
+
+  it('guard: a fully closed council still uses its latest completion', () => {
+    expect(liveTurnStart(run, reduceThread([
+      ...started, event(3, 'turn.completed', 'a', aEnd), event(4, 'turn.completed', 'b', bEnd),
+    ]))).toBe(aEnd)
+  })
+
+  it('guard: ordinary compact turns still fall back to the run start', () => {
+    expect(liveTurnStart(run, { turns: [{ id: 'lazy', items: [] }] })).toBe(run.startedAt)
+  })
+})
+
 describe('PR #925 issue3: compact council clocks and session closure', () => {
   it('uses the earliest defined open-peer start after reloading compact context', () => {
     const thread = reduceThread([

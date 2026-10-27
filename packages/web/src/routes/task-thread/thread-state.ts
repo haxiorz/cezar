@@ -46,6 +46,8 @@ export interface ThreadNote {
   marker?: 'step-start'
   /** The first heading has no preceding phase to finish (PR #925 review). */
   initialStep?: boolean
+  /** Only a boundary arriving after completion follows this turn's finish (PR #925 review). */
+  afterTurnEnd?: boolean
 }
 
 /** An image the run persisted (v1 `image` line: served from `/api/runs/:id/images/…`). */
@@ -564,14 +566,16 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
   const stepNames = options.stepNames
   let currentStepId: string | undefined
   for (const event of events) {
-    const eventStepId = stepNames ? str(event.stepId) : undefined
+    const eventStepId = stepNames && !str(event.type)?.startsWith('harness.') ? str(event.stepId) : undefined
     if (stepNames && eventStepId !== undefined && eventStepId !== currentStepId) {
       if (currentStepId !== undefined || options.atHistoryStart === true) {
-        currentTurn().entries.push({
+        const turn = currentTurn()
+        turn.entries.push({
           origin: 'meta',
           entry: {
             kind: 'note', id: `step-start:${event.seq}`, text: stepDividerLabel(stepNames, eventStepId), tone: 'dim', marker: 'step-start',
             ...(currentStepId === undefined ? { initialStep: true } : {}),
+            ...(turn.completed !== undefined ? { afterTurnEnd: true } : {}),
           },
         })
       }
@@ -615,10 +619,10 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
           break
         }
         const current = turns.at(-1)
-        // A v1 `user-message` line precedes the v2 turn.started for the same turn (observed
-        // wire order) — attach rather than opening a duplicate. A turn that already has a v2
-        // identity or v2 items is someone else's; open fresh.
-        const attached = current && current.sessionKey === undefined && current.turnId === undefined && !current.v2Items ? current : newTurn(event.seq, str(event.stepId))
+        // User messages and ordinary lazy turns can precede turn.started;
+        // council commentary belongs to its own turn (PR #925 review).
+        const attached = current && current.sessionKey === undefined && current.turnId === undefined && !current.v2Items &&
+          (current.userMessage !== undefined || sessionTurns.size === 0) ? current : newTurn(event.seq, str(event.stepId))
         attached.stepId ??= str(event.stepId)
         attached.turnId = turnId
         // First stamp wins: when the v1 line opened this turn a moment ago, when the user sent

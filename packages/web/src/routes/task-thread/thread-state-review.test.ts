@@ -57,6 +57,50 @@ describe('PR #925 issue4: lazy session turn adoption', () => {
   })
 })
 
+describe('PR #925 round3 issue2: council metadata headings', () => {
+  const stepNames = new Map([['spec', 'Specify'], ['spec-review', 'Spec review'], ['review', 'Review'], ['implement', 'Implement']])
+  const markers = (events: RunEvent[]) => reduceThread(events, { stepNames }).turns
+    .flatMap((turn) => turn.items).flatMap((entry) => entry.kind === 'note' && entry.marker === 'step-start' ? [entry.text] : [])
+
+  it.each([['spec-review', 'spec-review-1', 'Spec review'], ['review', 'impl-review-1', 'Review']])(
+    'ignores advisor invocation step ids during %s', (phase, advisorPhase, label) => {
+      expect(markers([
+        line(1, 'step-start', { stepId: 'spec' }),
+        line(2, 'turn.started', { stepId: phase, sessionKey: 'a', turnId: 'review' }),
+        line(3, 'harness.invocation.updated', { stepId: advisorPhase }),
+        line(4, 'item.completed', { stepId: phase, sessionKey: 'a', item: message('answer', 'Review') }),
+        line(5, 'harness.council.updated', { stepId: advisorPhase }),
+        line(6, 'turn.completed', { stepId: phase, sessionKey: 'a', turnId: 'review' }),
+        line(7, 'step-start', { stepId: 'implement' }),
+      ])).toEqual([label, 'Implement'])
+    },
+  )
+
+  it('does not seed the phase cursor from harness metadata', () => {
+    expect(markers([
+      line(1, 'harness.invocation.updated', { stepId: 'impl-review-1' }),
+      line(2, 'turn.started', { stepId: 'review', sessionKey: 'a', turnId: 'review' }),
+    ])).toEqual([])
+  })
+
+  it('guard: preserves real round and unknown phase headings', () => {
+    expect(markers([
+      line(1, 'step-start', { stepId: 'spec' }),
+      line(2, 'note', { stepId: 'spec-review-1', message: 'Reviewing' }),
+      line(3, 'step-start', { stepId: 'packet-PK-01' }),
+    ])).toEqual(['Spec review · round 1', 'packet-PK-01'])
+  })
+
+  it('guard: ordinary runs stay divider-free across phase changes', () => {
+    const events = [line(1, 'note', { stepId: 'spec', message: 'Specifying' }), line(2, 'note', { stepId: 'review', message: 'Reviewing' })]
+    const thread = reduceThread(events)
+    expect(thread.turns.flatMap((turn) => turn.items)).toMatchObject([
+      { id: 'v1:1', text: 'Specifying' }, { id: 'v1:2', text: 'Reviewing' },
+    ])
+    expect(thread.turns.flatMap((turn) => turn.items).some((entry) => entry.kind === 'note' && entry.marker !== undefined)).toBe(false)
+  })
+})
+
 describe('PR #925 issue5: sessionless council commentary', () => {
   it('keeps driver notes in one sessionless tail while reviewers keep streaming', () => {
     const { turns } = reduceThread([

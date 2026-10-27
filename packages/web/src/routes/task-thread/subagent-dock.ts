@@ -187,8 +187,8 @@ export function collectSubagents(turns: ThreadTurn[], runIsTerminal = false): Su
     for (const entry of turns[i]!.items) {
       if (!isChildCandidate(entry)) continue
       if (entry.parentItemId === undefined) continue
-      const parentId = parentKey(entry)!
-      if (!rootIds.has(parentId)) continue
+      const parentId = parentKey(entry)
+      if (parentId === undefined || !rootIds.has(parentId)) continue
       const siblings = childrenOf.get(parentId)
       if (siblings) siblings.push(entry)
       else childrenOf.set(parentId, [entry])

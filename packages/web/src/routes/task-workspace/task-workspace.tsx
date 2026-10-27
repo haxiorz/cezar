@@ -946,13 +946,14 @@ export function ConversationColumn({
     () => (harnessSteps ? new Map(harnessSteps.map((step) => [step.id, step.name])) : undefined),
     [harnessSteps],
   )
+  const atHistoryStart = stepNames !== undefined ? !history.hasOlder : undefined
   const thread = useMemo(
-    () => reduceThread(history.visibleEvents, { activeTurn: run.status === 'running', runner: run.runner, stepNames, askAsProse: stepNames !== undefined, atHistoryStart: !history.hasOlder }),
-    [history.visibleEvents, run.status, run.runner, stepNames, history.hasOlder],
+    () => reduceThread(history.visibleEvents, { activeTurn: run.status === 'running', runner: run.runner, stepNames, askAsProse: stepNames !== undefined, atHistoryStart }),
+    [history.visibleEvents, run.status, run.runner, stepNames, atHistoryStart],
   )
   const currentThread = useMemo(
-    () => reduceThread(history.currentEvents, { activeTurn: run.status === 'running', runner: run.runner, stepNames, askAsProse: stepNames !== undefined, atHistoryStart: !history.hasOlder }),
-    [history.currentEvents, run.status, run.runner, stepNames, history.hasOlder],
+    () => reduceThread(history.currentEvents, { activeTurn: run.status === 'running', runner: run.runner, stepNames, askAsProse: stepNames !== undefined, atHistoryStart }),
+    [history.currentEvents, run.status, run.runner, stepNames, atHistoryStart],
   )
   useRunRecordReconcile(run, history.visibleEvents)
 
