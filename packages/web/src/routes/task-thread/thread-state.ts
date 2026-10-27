@@ -122,7 +122,7 @@ export interface ThreadTurn {
    *  follow each other for the same turn produce one coherent start rather than two. This is the
    *  left-hand side of the turn duration. */
   startedAt?: string
-  /** Reviewer activity distinguishes queued messages from crash resumes (PR #925 review). */
+  /** Compact history can omit the reviewer start needed to exclude old runs (PR #925 review). */
   lastActivityAt?: string
   items: ThreadEntry[]
   /** Latest `plan.updated` snapshot seen during this turn (full-replacement semantics). */
@@ -631,10 +631,9 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
           break
         }
         const current = turns.at(-1)
-        // User messages and ordinary lazy turns can precede turn.started;
-        // council commentary belongs to its own turn (PR #925 review).
+        // Harness messages must not lend their clock or row keys to a phase (PR #925 review).
         const attached = current && current.sessionKey === undefined && current.turnId === undefined && !current.v2Items &&
-          (stepNames === undefined || current.userMessage === undefined || current.stepId === undefined || current.stepId === str(event.stepId)) &&
+          (stepNames === undefined || current.userMessage === undefined) &&
           (current.userMessage !== undefined || sessionTurns.size === 0) ? current : newTurn(event.seq, str(event.stepId))
         attached.stepId ??= str(event.stepId)
         attached.turnId = turnId

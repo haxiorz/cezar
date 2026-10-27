@@ -16,7 +16,10 @@ afterEach(() => {
 })
 
 describe('PR #925 review: council history row stability', () => {
-  it('keeps the next phase identity across every prepended council history window', async () => {
+  it.each([
+    ['keeps the next phase identity without council notes', false],
+    ['guard: keeps the next phase identity with council notes', true],
+  ])('%s across every prepended history window', async (_name, driverNotes) => {
     const events: RunEvent[] = []
     const push = (type: string, rest: Record<string, unknown> = {}) => {
       const seq = events.length + 1
@@ -27,13 +30,13 @@ describe('PR #925 review: council history row stability', () => {
     for (const sessionKey of ['a', 'b']) push('turn.started', { stepId: 'review', sessionKey, turnId: 'turn_1' })
     for (let index = 0; index < 160; index += 1) {
       if (index === 50) push('user-message', { text: 'Also check tests' })
-      if (index === 70) push('note', { stepId: 'review', origin: 'driver', message: 'Still reviewing' })
+      if (index === 70 && driverNotes) push('note', { stepId: 'review', origin: 'driver', message: 'Still reviewing' })
       push('item.completed', { stepId: 'review', sessionKey: index % 2 === 0 ? 'a' : 'b',
         item: { kind: 'message', id: `review-${index}`, role: 'assistant', text: `Finding ${index}` } })
     }
     for (const sessionKey of ['a', 'b']) push('turn.completed', { stepId: 'review', sessionKey, turnId: 'turn_1' })
     phase('review', 'done')
-    push('note', { stepId: 'review', origin: 'driver', message: 'Council found blocking issues' })
+    if (driverNotes) push('note', { stepId: 'review', origin: 'driver', message: 'Council found blocking issues' })
     phase('fix-2')
     push('session.started', { stepId: 'fix-2', backend: 'claude' })
     push('turn.started', { stepId: 'fix-2', turnId: 'fix-turn' })
@@ -44,7 +47,10 @@ describe('PR #925 review: council history row stability', () => {
     const reduce = (lines: RunEvent[], hasOlder: boolean) => reduceThread(lines, { stepNames, atHistoryStart: !hasOlder })
     const full = reduce(events, false)
     const expected = full.turns.find((turn) => turn.turnId === 'fix-turn')!
+    const phaseStart = events.find((event) => event.type === 'turn.started' && event.stepId === 'fix-2')!
     expect(expected.userMessage).toBeUndefined()
+    expect(expected.id).toBe(`turn-seq-${phaseStart.seq}`)
+    expect(expected.startedAt).toBe(phaseStart.ts)
     const rows = (thread: ReturnType<typeof reduceThread>) => buildTranscriptRows(mainTranscriptSections({ task: '' } as ApiRun, thread), 'run')
     const expectedRows = rows(full)
     const dir = mkdtempSync(join(tmpdir(), 'cez-phase-page-'))
@@ -69,6 +75,13 @@ describe('PR #925 review: council history row stability', () => {
         row.content.block.kind === 'entry' && (visible.has(row.content.block.entry.id) || visibleNotes.has(row.content.block.entry.id) ||
           visibleHeadings.has(row.content.block.entry.id))).map((row) => row.key)
       expect(phaseRows(rows(thread))).toEqual(phaseRows(expectedRows))
+      const phaseTimes = (entries: typeof expectedRows) => entries.filter((row) => row.content.kind === 'turn-time' && row.scope === expected.id)
+      expect(phaseTimes(rows(thread))).toEqual(phaseTimes(expectedRows))
+      const bubble = rows(thread).findIndex((row) => row.content.kind === 'user-message')
+      if (bubble !== -1) {
+        const fixRow = rows(thread).findIndex((row) => row.content.kind === 'block' && row.content.block.kind === 'entry' && row.content.block.entry.id === 'fix-0')
+        expect(bubble).toBeLessThan(fixRow)
+      }
       if (!page.olderCursor) break
       page = await readRunHistoryPage(file, page.olderCursor)
       window = mergeRunHistoryEvents(page.events, window)
@@ -76,15 +89,61 @@ describe('PR #925 review: council history row stability', () => {
     expect(windows).toBeGreaterThan(2)
   })
 
-  it.each([undefined, 'fix-2'])('guard: harness messages still adopt a matching or unset phase (step=%s)', (stepId) => {
+  // A queued bubble already precedes its section's entries; adoption only corrupts phase clocks (PR #925 review).
+  it.each<[string, string | undefined]>([
+    ['keeps harness messages separate from an unset phase', undefined],
+    ['keeps harness messages separate from a matching phase', 'fix-2'],
+    ['guard: keeps harness messages separate from a different phase', 'review'],
+  ])('%s', (_name, stepId) => {
     const ts = '2026-09-23T10:00:00.000Z'
-    const { turns } = reduceThread([
+    const thread = reduceThread([
       { seq: 1, ts, type: 'user-message', text: 'Continue' },
       ...(stepId ? [{ seq: 2, ts, type: 'note', stepId, message: 'Preparing' }] : []),
       { seq: 3, ts, type: 'turn.started', stepId: 'fix-2', turnId: 'next' },
     ], { stepNames: new Map([['fix-2', 'Fixes']]) })
-    expect(turns).toHaveLength(1)
-    expect(turns[0]).toMatchObject({ id: 'turn-seq-1', turnId: 'next', stepId: 'fix-2', startedAt: ts, userMessage: { text: 'Continue' } })
+    expect(thread.turns).toHaveLength(2)
+    expect(thread.turns[0]).toMatchObject({ id: 'turn-seq-1', startedAt: ts, userMessage: { text: 'Continue' } })
+    expect(thread.turns[0]?.turnId).toBeUndefined()
+    expect(thread.turns[1]).toMatchObject({ id: 'turn-seq-3', turnId: 'next', stepId: 'fix-2', startedAt: ts })
+    const rows = buildTranscriptRows(mainTranscriptSections({ task: '' } as ApiRun, thread), 'run')
+    expect(rows[0]?.content.kind).toBe('user-message')
+    expect(rows.map((row) => row.key)).toEqual([
+      'turn-seq-1:user',
+      ...(stepId ? ['turn-seq-1:v1:2'] : []),
+      ...(stepId && stepId !== 'fix-2' ? ['turn-seq-1:step-start:3'] : []),
+    ])
+  })
+
+  it('guard: harness lazy commentary still attaches before any council exists', () => {
+    const thread = reduceThread([
+      { seq: 1, type: 'note', stepId: 'fix-2', message: 'Preparing', ts: '2026-09-23T09:59:00.000Z' },
+      { seq: 2, type: 'turn.started', stepId: 'fix-2', turnId: 'next', ts: '2026-09-23T10:00:00.000Z' },
+    ], { stepNames: new Map([['fix-2', 'Fixes']]) })
+    expect(thread.turns).toHaveLength(1)
+    expect(thread.turns[0]).toMatchObject({ id: 'turn-fallback-1', turnId: 'next', stepId: 'fix-2', startedAt: '2026-09-23T10:00:00.000Z' })
+  })
+
+  const at = (seq: number, type: string, rest: Record<string, unknown> = {}): RunEvent => ({
+    seq, type, ts: '2026-09-23T10:00:00.000Z', stepId: 'fix-2', ...rest,
+  })
+  const note = { message: 'Preparing' }
+  const item = { item: { kind: 'message', id: 'answer', role: 'assistant', text: 'Working' } }
+  it.each<[string, RunEvent[], string | undefined, string]>([
+    ['no current turn', [], undefined, 'turn-seq-10'],
+    ['a turn already started', [at(1, 'turn.started', { turnId: 'old' })], undefined, 'turn-seq-10'],
+    ['a v2-covered lazy turn', [at(1, 'item.completed', item)], undefined, 'turn-seq-10'],
+    ['a keyed current turn', [at(1, 'turn.started', { sessionKey: 'a', turnId: 'old' })], undefined, 'turn-seq-10'],
+    ['council commentary', [at(1, 'turn.started', { sessionKey: 'a', turnId: 'old' }), at(2, 'note', note)], undefined, 'turn-seq-10'],
+    ['a keyed lazy turn', [at(1, 'note', { ...note, sessionKey: 'a' })], 'a', 'turn-seq-1'],
+    ['a keyed turn already started', [at(1, 'turn.started', { sessionKey: 'a', turnId: 'old' })], 'a', 'turn-seq-10'],
+    ['a keyed v2-covered turn', [at(1, 'item.completed', { ...item, sessionKey: 'a' })], 'a', 'turn-seq-10'],
+    ['a closed keyed lazy turn', [at(1, 'note', { ...note, sessionKey: 'a' }), at(2, 'session.ended', { sessionKey: 'a', reason: 'error' })], 'a', 'turn-seq-10'],
+  ])('guard: retains turn.started routing after %s', (_name, before, sessionKey, id) => {
+    const thread = reduceThread([
+      ...before,
+      at(10, 'turn.started', { turnId: 'next', ...(sessionKey !== undefined ? { sessionKey } : {}) }),
+    ], { stepNames: new Map([['fix-2', 'Fixes']]) })
+    expect(thread.turns.at(-1)).toMatchObject({ id, turnId: 'next', stepId: 'fix-2', startedAt: '2026-09-23T10:00:00.000Z' })
   })
 
   it('guard: ordinary phases still attach to their message even when its step differs', () => {

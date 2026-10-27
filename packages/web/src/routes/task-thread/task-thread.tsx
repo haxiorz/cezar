@@ -899,17 +899,15 @@ export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefi
   // Queued messages and driver notes can trail an active council (PR #925 review).
   const pendingMessage = last.userMessage !== undefined && last.turnId === undefined
   if (last.sessionKey !== undefined || pendingMessage || (last.stepId !== undefined && last.turnId === undefined && last.startedAt === undefined)) {
-    // A resumed council cannot inherit a reviewer's pre-crash clock (PR #925 review).
-    const resumeIndex = thread.turns.reduce((latest, turn, index) => turn.userMessage !== undefined ? index : latest, -1)
-    const resume = thread.turns[resumeIndex]
     const stepId = last.stepId ?? (pendingMessage ? thread.turns.filter((turn) => turn.sessionKey !== undefined).at(-1)?.stepId : undefined)
-    const allPeers = thread.turns.filter((turn) => turn.sessionKey !== undefined && turn.stepId === stepId)
-    const resumed = thread.turns.slice(resumeIndex + 1).filter((turn) => turn.sessionKey !== undefined && turn.stepId === stepId)
-    const activeAfterMessage = resume === undefined || allPeers.some((turn) =>
-      turn.lastActivityAt !== undefined && resume.startedAt !== undefined && Date.parse(turn.lastActivityAt) > Date.parse(resume.startedAt),
-    )
-    const peers = resumed.length > 0 ? resumed : activeAfterMessage ? allPeers : []
-    if (peers.length > 0 && (!pendingMessage || peers.some((turn) => turn.completed === undefined && turn.sessionEnded === undefined))) {
+    // Continue re-stamps the run; queued messages and nudges do not (PR #925 review).
+    const since = run.startedAt !== undefined ? Date.parse(run.startedAt) : -Infinity
+    const peers = thread.turns.filter((turn) => {
+      if (turn.sessionKey === undefined || turn.stepId !== stepId) return false
+      const at = turn.startedAt ?? turn.lastActivityAt
+      return at === undefined || Date.parse(at) >= since
+    })
+    if (peers.length > 0) {
       const open = peers.filter((turn) => turn.completed === undefined && turn.sessionEnded === undefined)
       const earliestStart = (turns: typeof peers) => turns.reduce<string | undefined>((earliest, turn) => {
         const startedAt = turn.startedAt
@@ -917,12 +915,13 @@ export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefi
       }, undefined)
       // Compact context can retain a start only on a finished peer (PR #925 review).
       if (open.length > 0) return earliestStart(open) ?? earliestStart(peers) ?? run.startedAt
-      return peers.reduce<string | undefined>((latest, turn) => {
+      const endedAt = peers.reduce<string | undefined>((latest, turn) => {
         const endedAt = turn.sessionEnded?.ts ?? turn.completed?.ts
         return endedAt !== undefined && (latest === undefined || Date.parse(endedAt) > Date.parse(latest)) ? endedAt : latest
       }, undefined) ?? earliestStart(peers) ?? run.startedAt
+      return pendingMessage && last.startedAt !== undefined && endedAt !== undefined && Date.parse(last.startedAt) > Date.parse(endedAt)
+        ? last.startedAt : endedAt
     }
-    if (allPeers.length > 0 && resume !== undefined && last.startedAt === undefined) return resume.startedAt ?? run.startedAt
   }
   if (last.completed === undefined) return last.startedAt ?? run.startedAt
   return last.completed.ts ?? run.startedAt
