@@ -894,6 +894,15 @@ function HistoryBoundary({
  *  the run is still `running` — the next step spinning up), the moment that turn closed; with no
  *  turn at all yet, the run's own start. */
 export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefined {
+  const at = threadTurnStart(run, thread)
+  if (!run.harness || run.startedAt === undefined || at === undefined) return at
+  const last = thread.turns.at(-1)
+  // Continue persists its reply just before execute re-stamps the run (PR #925 review).
+  if (last?.userMessage !== undefined && last.queued !== true && at === last.userMessage.ts) return at
+  return Date.parse(at) < Date.parse(run.startedAt) ? run.startedAt : at
+}
+
+function threadTurnStart(run: ApiRun, thread: ThreadState): string | undefined {
   const last = thread.turns.at(-1)
   if (last === undefined) return run.startedAt
   // Queued messages and driver notes can trail an active council (PR #925 review).

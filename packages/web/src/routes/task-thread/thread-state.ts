@@ -117,6 +117,8 @@ export interface ThreadTurn {
    *  prompt is the run's `task`, which the view renders from the run record. `ts` is when that
    *  line was persisted (#941). */
   userMessage?: { text: string; imageCount: number; images: string[]; ts?: string }
+  /** Explicit harness queue intent distinguishes a pending message from Continue (PR #925 review). */
+  queued?: boolean
   /** Wall clock of the event that OPENED this turn — the `user-message` line when there is one,
    *  otherwise `turn.started` (#941). First stamp wins, so the v1 line and the v2 event that
    *  follow each other for the same turn produce one coherent start rather than two. This is the
@@ -978,6 +980,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         ...(draft.stepId !== undefined ? { stepId: draft.stepId } : {}),
         ...(draft.sessionKey !== undefined ? { sessionKey: draft.sessionKey } : {}),
         ...(draft.userMessage !== undefined ? { userMessage: draft.userMessage } : {}),
+        ...(stepNames !== undefined && draft.queuedForPhase === true ? { queued: true } : {}),
         ...(draft.startedAt !== undefined ? { startedAt: draft.startedAt } : {}),
         ...(draft.lastActivityAt !== undefined ? { lastActivityAt: draft.lastActivityAt } : {}),
         ...(draft.planEntries !== undefined ? { planEntries: draft.planEntries } : {}),
