@@ -12,6 +12,8 @@ import {
 } from '@open-mercato/cezar-contract';
 
 const READ_CHUNK_BYTES = 64 * 1024;
+// One MiB covers nearby council starts without searching the implement archive (PR #925 review).
+const SESSION_START_SEARCH_BYTES = 1024 * 1024;
 const MAX_CURSOR_BYTES = 2_048;
 
 const pageCursorSchema = z.object({
@@ -268,6 +270,9 @@ async function reverseEventsUntil(
   let totalBytesRead = 0;
   let fileHighWater = 0;
   let canonical: CanonicalItem[] | undefined;
+  const sessionAnchors = new Set<string>();
+  let missingStarts: Set<string> | undefined;
+  let startSearchBytes = 0;
   try {
     while (position > 0) {
       const length = Math.min(READ_CHUNK_BYTES, position);
@@ -282,8 +287,20 @@ async function reverseEventsUntil(
         const event = parseLine(lines[index]!);
         if (event) {
           fileHighWater = Math.max(fileHighWater, event.seq);
-          if (event.seq < beforeSeq) reversed.push(event);
+          if (event.seq < beforeSeq) {
+            reversed.push(event);
+            if (isSessionStart(event) && typeof event.sessionKey === 'string') {
+              missingStarts?.delete(event.sessionKey);
+              // Session anchors also close pre-launch notes; later turns cannot (PR #925 review).
+              if (event.type !== 'turn.started') sessionAnchors.add(event.sessionKey);
+            }
+          }
         }
+      }
+      if (missingStarts !== undefined) {
+        canonical = undefined;
+        if (missingStarts.size === 0 || totalBytesRead - startSearchBytes >= SESSION_START_SEARCH_BYTES) break;
+        continue;
       }
       const chronological = [...reversed].reverse();
       canonical = canonicalSessionItems(chronological);
@@ -292,7 +309,10 @@ async function reverseEventsUntil(
         chronological.some((event) => event.type === 'user-message' || event.type === 'turn.started')
       ) {
         const page = pageEventSlice(chronological, canonical.slice(-wantedItems));
-        if (sessionsWithoutStarts(page).size === 0) break;
+        missingStarts = sessionsWithoutStarts(page);
+        for (const key of sessionAnchors) missingStarts.delete(key);
+        if (missingStarts.size === 0) break;
+        startSearchBytes = totalBytesRead;
       }
     }
     if (position === 0) {
@@ -375,7 +395,7 @@ async function forwardEventsUntil(
       if (!event) continue;
       if (event.seq <= afterSeq) {
         if (event.type === 'user-message' || event.type === 'turn.started') previousBoundary = event;
-        if (event.type === 'turn.started' && typeof event.sessionKey === 'string') sessionStarts.set(event.sessionKey, event);
+        if (isSessionStart(event) && typeof event.sessionKey === 'string') sessionStarts.set(event.sessionKey, event);
         continue;
       }
       if (events.length === 0 && previousBoundary) events.push(previousBoundary);
@@ -394,6 +414,10 @@ async function forwardEventsUntil(
   return { events: withSessionStarts(events, [...sessionStarts.values()]), reachedEnd, bytesRead: input?.bytesRead ?? 0, ...(canonical === undefined ? {} : { canonical }) };
 }
 
+function isSessionStart(event: RunHistoryEvent): boolean {
+  return event.type === 'session' || event.type === 'session.started' || event.type === 'turn.started';
+}
+
 function sessionsWithoutStarts(events: RunHistoryEvent[]): Set<string> {
   const sessions = new Set<string>();
   const seen = new Set<string>();
@@ -401,7 +425,7 @@ function sessionsWithoutStarts(events: RunHistoryEvent[]): Set<string> {
   for (const event of events) {
     if (typeof event.sessionKey !== 'string' || seen.has(event.sessionKey)) continue;
     seen.add(event.sessionKey);
-    if (event.type !== 'turn.started') sessions.add(event.sessionKey);
+    if (!isSessionStart(event)) sessions.add(event.sessionKey);
   }
   return sessions;
 }
@@ -412,9 +436,9 @@ function withSessionStarts(page: RunHistoryEvent[], earlier: RunHistoryEvent[]):
   // Every concurrent reviewer's key needs its own boundary (PR #925 review).
   for (let index = earlier.length - 1; index >= 0 && missing.size > 0; index -= 1) {
     const event = earlier[index]!;
-    if (event.type === 'turn.started' && typeof event.sessionKey === 'string' && missing.delete(event.sessionKey)) starts.push(event);
+    if (isSessionStart(event) && typeof event.sessionKey === 'string' && missing.delete(event.sessionKey)) starts.push(event);
   }
-  return [...starts.sort((a, b) => a.seq - b.seq), ...page];
+  return starts.length === 0 ? page : [...starts, ...page].sort((a, b) => a.seq - b.seq);
 }
 
 function pageEventSlice(events: RunHistoryEvent[], selected: CanonicalItem[]): RunHistoryEvent[] {
