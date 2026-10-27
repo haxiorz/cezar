@@ -164,6 +164,7 @@ describe('harness phase-boundary composer', () => {
         body: {
           text: 'Preserve the public compatibility alias.',
           images: [],
+          idempotencyKey: expect.any(String),
         },
       })
     })

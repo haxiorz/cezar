@@ -297,8 +297,11 @@ export function NewTaskRoute() {
    */
   const scopeKeyOf = (id: string): string | null =>
     projects.data?.bootProject === id ? null : id
-  const sourcesReady =
-    skills.data !== undefined && workflows.data !== undefined && !uiState.isPending
+  // A catalog fetch that FAILED is settled, not loading: waiting on `data` alone left a remote
+  // cockpit whose /skills or /workflows request errored saying "Still loading" forever (31eda062).
+  const catalogFailed =
+    (skills.isError && skills.data === undefined) || (workflows.isError && workflows.data === undefined)
+  const sourcesReady = !skills.isPending && !workflows.isPending && !uiState.isPending
   const taskWorkflows = withoutHarnessWorkflows(workflowList)
   // The draft's pick alone — a fresh `/new` selects nothing. Keep harness workflows available
   // only to the Multi-model surface while ordinary Task composition resolves against its
@@ -325,9 +328,13 @@ export function NewTaskRoute() {
     draft.variants <= 1 &&
     draft.dispatch === null &&
     (draft.readOnly ?? (config.data?.profile === 'trunk' && looksLikeQuestion(draft.text)))
+  // Without a catalog the draft's pick cannot be checked here — send it and let the server judge,
+  // rather than silently swapping the user's skill for quick-task.
   const source =
-    resolveSource(draft.source, skillList, taskWorkflows) ??
-    projectDefaultSource(config.data, askWanted, skillList)
+    (catalogFailed
+      ? (harnessWorkflowName(draft.source) ? null : draft.source)
+      : resolveSource(draft.source, skillList, taskWorkflows)) ??
+    projectDefaultSource(config.data, askWanted, catalogFailed ? null : skillList)
   const selectedSkill = source?.source === 'skill'
     ? skillList.find((skill) => skill.name === source.ref)
     : undefined
@@ -596,7 +603,7 @@ export function NewTaskRoute() {
     if (notice === null || !sourcesReady) return
     setNotice(null)
     const unknownSkill =
-      deepLink.skill !== '' && !skillList.some((s) => s.name === deepLink.skill)
+      deepLink.skill !== '' && !catalogFailed && !skillList.some((s) => s.name === deepLink.skill)
         ? deepLink.skill
         : ''
     if (unknownSkill !== '') {
@@ -949,7 +956,7 @@ export function NewTaskRoute() {
           ariaLabel="Describe a task for the agent"
           sendAriaLabel={composerMode === 'multi' ? 'Start multi-model run' : startChoice ? 'Schedule task' : 'Start task'}
           sendLabel={composerMode !== 'multi' && startChoice ? 'Schedule task' : undefined}
-          submitDisabled={!!scheduleRecovery || recovering || (composerMode !== 'multi' && !!startChoice && !scheduleReady)}
+          submitDisabled={!!scheduleRecovery || recovering || !sourcesReady || (composerMode !== 'multi' && !!startChoice && !scheduleReady)}
           disabled={!providersReady}
           disabledReason={
             providers.isPending

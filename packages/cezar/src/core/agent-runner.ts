@@ -72,7 +72,7 @@ export interface AgentRunSpec {
    *  level; opencode has no documented channel in version 1 and deliberately
    *  ignores it. Absent = the backend's own default. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'max';
-  /** Wall-clock kill switch for the run (ms). */
+  /** Inactivity kill switch for the run (ms): no output for this long stops it; 0 disables. */
   timeoutMs?: number;
   /**
    * Stable session id (UUID) so the user can take over interactively later:

@@ -948,6 +948,25 @@ describe('harness API', () => {
       ]);
     });
 
+    it('queues a retried phase-boundary message once', async () => {
+      const run = store.createRun({ title: 't', workflow: HARNESS_FIX_ISSUE, task: 'x', steps: [] });
+      store.updateRun(run.id, { status: 'queued', harness: { profile: 'standard', workflow: HARNESS_FIX_ISSUE } });
+      saveLedger(dataDir, run.id, createLedger({
+        workflow: HARNESS_FIX_ISSUE,
+        requestedProfile: 'standard',
+        subject: { kind: 'brief', text: 'x' },
+      }));
+      const body = { text: 'Also handle X.', images: [], idempotencyKey: '0192f2a4-7c1e-7d4a-9b2f-3c4d5e6f7a8b' };
+
+      const first = await post(`/api/v1/runs/${run.id}/messages`, body);
+      const retried = await post(`/api/v1/runs/${run.id}/messages`, body);
+
+      expect(await first.json()).toEqual({ queuedForPhase: true });
+      expect(await retried.json()).toEqual({ queuedForPhase: true });
+      const after = readLedger(dataDir, run.id);
+      expect(after.status === 'valid' ? after.ledger.pendingMessages : []).toHaveLength(1);
+    });
+
     // PR #925 review: Continue re-queues a harness run that already has a ledger. A message sent
     // while it waited was stacked onto the folded prompt, which the resume ignores — acknowledged,
     // never applied.
