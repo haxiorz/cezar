@@ -7,12 +7,14 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { z } from 'zod';
 import {
@@ -78,6 +80,7 @@ import {
   boundedFindings,
   advisorCouncilTimeoutMs,
   advisorCouncilResultMaxBytes,
+  packetLedgerResultMaxBytes,
 } from './prompt-budget.js';
 import { harnessStageResultSchema, samePathSet } from './stage-result.js';
 import { loadTrustedHarnessSkill } from './skill-binding.js';
@@ -306,21 +309,35 @@ export function roleRefId(ref: HarnessReviewerRef): string {
 function hashWorktreeContentVsHead(
   hash: ReturnType<typeof createHash>,
   cwd: string,
-  git: (args: string[]) => Buffer,
+  git: (args: string[], env?: Record<string, string>) => Buffer,
 ): void {
   hash.update('\0head\0');
   hash.update(git(['rev-parse', 'HEAD']));
-  const paths = git([
-    'status',
-    '--porcelain=v1',
-    '-z',
-    '--untracked-files=all',
-    '--no-renames',
-  ])
+  // Ignore absent sparse entries, but expose flagged edits in a private index (PR #925 review).
+  const absentSparse = new Set(git(['ls-files', '-v', '-z']).toString('utf8').split('\0')
+    .filter((entry) => /^[Ss] /.test(entry) && !existsSync(join(cwd, entry.slice(2))))
+    .map((entry) => entry.slice(2)));
+  const temporary = mkdtempSync(join(tmpdir(), 'cez-subject-index-'));
+  let status: Buffer;
+  try {
+    const env = { GIT_INDEX_FILE: join(temporary, 'index') };
+    git(['read-tree', 'HEAD'], env);
+    status = git([
+      'status',
+      '--porcelain=v1',
+      '-z',
+      '--untracked-files=all',
+      '--no-renames',
+    ], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+  const paths = status
     .toString('utf8')
     .split('\0')
     .filter(Boolean)
     .map((entry) => entry.slice(3))
+    .filter((path) => !absentSparse.has(path))
     .sort();
   for (const path of paths) {
     hash.update('\0');
@@ -344,12 +361,12 @@ function hashWorktreeContentVsHead(
 
 export async function snapshotHarnessReviewSubject(cwd: string): Promise<string> {
   const hash = createHash('sha256');
-  const git = (args: string[]): Buffer =>
+  const git = (args: string[], env?: Record<string, string>): Buffer =>
     execFileSync('git', args, {
       cwd,
       encoding: 'buffer',
       maxBuffer: 256 * 1024 * 1024,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', ...pinnedGitEnv(cwd) },
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', ...pinnedGitEnv(cwd), ...env },
     });
   hashWorktreeContentVsHead(hash, cwd, git);
   hash.update('\0head-reflog\0');
@@ -363,12 +380,12 @@ export async function snapshotHarnessReviewSubject(cwd: string): Promise<string>
  * itself does not. */
 export async function snapshotHarnessStageSubject(cwd: string): Promise<string> {
   const hash = createHash('sha256');
-  const git = (args: string[]): Buffer =>
+  const git = (args: string[], env?: Record<string, string>): Buffer =>
     execFileSync('git', args, {
       cwd,
       encoding: 'buffer',
       maxBuffer: 256 * 1024 * 1024,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', ...pinnedGitEnv(cwd) },
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', ...pinnedGitEnv(cwd), ...env },
     });
   hashWorktreeContentVsHead(hash, cwd, git);
   return hash.digest('hex');
@@ -381,11 +398,34 @@ export function resetIndexToHead(cwd: string): void {
   if (!env) return;
   const git = (args: string[]) => execFileSync('git', args, {
     cwd,
-    stdio: 'ignore',
+    encoding: 'utf8',
+    maxBuffer: 256 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'ignore'],
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env },
   });
   try {
-    git(['read-tree', 'HEAD']);
+    try { git(['read-tree', '-m', 'HEAD']); } catch { git(['read-tree', 'HEAD']); }
+    const hidden = git(['ls-files', '-v', '-z']).split('\0')
+      .filter((entry) => /^[a-zS] /.test(entry) && existsSync(join(cwd, entry.slice(2))))
+      .map((entry) => entry.slice(2));
+    // Preserve absent sparse entries and unchanged stat caches (PR #925 review).
+    // Git applies only one flag mode per update-index call.
+    let batch: string[] = [];
+    let bytes = 0;
+    for (const path of hidden) {
+      if (batch.length && bytes + Buffer.byteLength(path) > 32_768) {
+        git(['update-index', '--no-assume-unchanged', '--', ...batch]);
+        git(['update-index', '--no-skip-worktree', '--', ...batch]);
+        batch = [];
+        bytes = 0;
+      }
+      batch.push(path);
+      bytes += Buffer.byteLength(path) + 1;
+    }
+    if (batch.length) {
+      git(['update-index', '--no-assume-unchanged', '--', ...batch]);
+      git(['update-index', '--no-skip-worktree', '--', ...batch]);
+    }
   } catch {
     // The stage op's own index checks still refuse anything left behind.
   }
@@ -453,7 +493,14 @@ export async function preserveAndRestorePacket(cwd: string, paths: readonly stri
     for (let parent = dirname(resolve(cwd, path)); parent !== resolve(cwd); parent = dirname(parent)) {
       if (!parent.startsWith(resolve(cwd) + sep)) throw new Error(`packet path escapes the worktree: ${path}`);
       let symlink = false;
-      try { symlink = lstatSync(parent).isSymbolicLink(); } catch (error) {
+      try {
+        const entry = lstatSync(parent);
+        symlink = entry.isSymbolicLink();
+        if (!symlink && !entry.isDirectory() && !paths.some((scope) => {
+          const allowed = resolve(cwd, scope);
+          return parent === allowed || parent.startsWith(allowed + sep);
+        })) throw new Error(`packet path has an out-of-scope non-directory parent: ${path}`);
+      } catch (error) {
         if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
       }
       if (symlink) throw new Error(`packet path has a symlink parent: ${path}`);
@@ -1060,9 +1107,9 @@ export async function runHarnessDriver(
 
   const sha256 = (value: string | Buffer): string =>
     createHash('sha256').update(value).digest('hex');
-  const hashFile = (path: string): string | null => {
+  const hashFile = (path: string, maxBytes = HARNESS_JSON_ARTIFACT_MAX_BYTES * 4): string | null => {
     try {
-      const entry = readHarnessFsEntry(path, HARNESS_JSON_ARTIFACT_MAX_BYTES * 4);
+      const entry = readHarnessFsEntry(path, maxBytes);
       return entry.kind === 'file' && entry.content !== null ? sha256(entry.content) : null;
     } catch {
       return null;
@@ -1080,6 +1127,7 @@ export async function runHarnessDriver(
     id: string,
     inputSha256: string,
     schema: z.ZodType<T>,
+    maxBytes = HARNESS_JSON_ARTIFACT_MAX_BYTES,
   ): T | null => {
     const invocation = ledger.invocations.find((entry) => entry.id === id);
     if (
@@ -1091,7 +1139,7 @@ export async function runHarnessDriver(
     ) {
       return null;
     }
-    const bytesHash = hashFile(invocation.artifactPath);
+    const bytesHash = hashFile(invocation.artifactPath, Math.max(HARNESS_JSON_ARTIFACT_MAX_BYTES * 4, maxBytes));
     if (bytesHash !== invocation.artifactSha256) {
       invocation.status = 'interrupted';
       invocation.error = 'completed invocation artifact is missing or changed';
@@ -1101,7 +1149,7 @@ export async function runHarnessDriver(
       return null;
     }
     try {
-      const parsed = schema.safeParse(JSON.parse(readHarnessArtifactText(invocation.artifactPath)));
+      const parsed = schema.safeParse(JSON.parse(readHarnessArtifactText(invocation.artifactPath, maxBytes)));
       if (parsed.success) return parsed.data;
     } catch {
     }
@@ -1178,6 +1226,7 @@ export async function runHarnessDriver(
     status: 'completed' | 'failed' | 'interrupted',
     opts: {
       artifactPath?: string;
+      artifactMaxBytes?: number;
       error?: string;
       modelId?: string;
       persistNow?: boolean;
@@ -1193,7 +1242,7 @@ export async function runHarnessDriver(
     invocation.process = undefined;
     if (opts.artifactPath) {
       invocation.artifactPath = opts.artifactPath;
-      invocation.artifactSha256 = hashFile(opts.artifactPath) ?? undefined;
+      invocation.artifactSha256 = hashFile(opts.artifactPath, opts.artifactMaxBytes) ?? undefined;
     }
     if (status === 'completed' && opts.modelId) {
       const model = ledger.models.find((entry) => entry.id === opts.modelId);
@@ -2884,9 +2933,14 @@ export async function runHarnessDriver(
       join(dirname(sealed.script), '..', 'references', 'review-result.schema.json'),
     ];
     // Match the timeout's fixed prompt allowance (PR #925 review).
-    const fixedBytes = Buffer.byteLength(op.criteriaText) + 8_192 + rubricFiles.reduce(
-      (bytes, path) => bytes + (existsSync(path) ? Buffer.byteLength(readHarnessArtifactText(path)) : 0), 0,
-    );
+    let fixedBytes: number;
+    try {
+      fixedBytes = Buffer.byteLength(op.criteriaText) + 8_192 + rubricFiles.reduce(
+        (bytes, path) => bytes + (existsSync(path) ? Buffer.byteLength(readHarnessArtifactText(path)) : 0), 0,
+      );
+    } catch (error) {
+      return { rows, error: `advisor council failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
     const configuredModels = runtimeAgentic.agentHarness?.models as Record<string, { maxInputBytes?: unknown }> | undefined;
     const resultMaxBytes = advisorCouncilResultMaxBytes(
       op.members.map((member) => member.entry ?? configuredModels?.[member.councilId] ?? {}), subjectBytes, fixedBytes,
@@ -3447,9 +3501,13 @@ export async function runHarnessDriver(
 
     const packetResultPath = (packetId: string) =>
       join(packetRunDir, 'packets', packetId, 'packet-result.json');
+    const packetProfiles = agentic.agentHarness?.profiles as Record<string, {
+      packetPolicy?: { budgets?: Parameters<typeof packetLedgerResultMaxBytes>[0] };
+    }> | undefined;
+    const packetMaxBytes = packetLedgerResultMaxBytes(packetProfiles?.['high-assurance']?.packetPolicy?.budgets);
     const readPacket = (packetId: string): Record<string, unknown> | null => {
       try {
-        const value = JSON.parse(readHarnessArtifactText(packetResultPath(packetId)));
+        const value = JSON.parse(readHarnessArtifactText(packetResultPath(packetId), packetMaxBytes));
         return value && typeof value === 'object' && !Array.isArray(value)
           ? (value as Record<string, unknown>)
           : null;
@@ -3534,7 +3592,7 @@ export async function runHarnessDriver(
           host.emit({ type: 'note', message: `packet ${id} failed-attempt diff preserved at ${preservedPath ?? artifactPath}; its allowed paths restored to HEAD` });
           return null;
         } catch (error) {
-          return `packet ${id} replacement refused: could not preserve and restore its allowed paths (${error instanceof Error ? error.message : String(error)}); diff artifact: ${error instanceof PacketRestoreError ? error.artifactPath : artifactPath}`;
+          return `packet ${id} replacement refused: could not preserve and restore its allowed paths (${error instanceof Error ? error.message : String(error)})${error instanceof PacketRestoreError ? `; diff artifact: ${error.artifactPath}` : ''}`;
         }
       };
 
@@ -3563,6 +3621,7 @@ export async function runHarnessDriver(
           writeFileSync(releaseArtifactPath, readFileSync(packetResultPath(effectiveId)));
           finishInvocation(interruptedRelease, 'completed', {
             artifactPath: releaseArtifactPath,
+            artifactMaxBytes: packetMaxBytes,
           });
         }
         if (!readPacket(`${source.id}-resume-${attempt + 1}`)) {
@@ -3617,6 +3676,10 @@ export async function runHarnessDriver(
             emitInvocation(releaseInvocation);
           },
         });
+        if (host.isCancelled()) {
+          finishInvocation(releaseInvocation, 'interrupted', { error: 'run cancelled during packet release' });
+          return 'cancelled';
+        }
         if (!released.ok) {
           const reason = `packet ${source.id} recovery could not release its stale lease: ${(released.error ?? released.stderr).trim()}`;
           finishInvocation(releaseInvocation, 'failed', { error: reason });
@@ -3625,6 +3688,7 @@ export async function runHarnessDriver(
         writeFileSync(releaseArtifactPath, readFileSync(packetResultPath(effectiveId)));
         finishInvocation(releaseInvocation, 'completed', {
           artifactPath: releaseArtifactPath,
+          artifactMaxBytes: packetMaxBytes,
         });
         const restoreError = await restoreAttempt(effectiveId);
         if (restoreError) return restoreError;
@@ -3657,6 +3721,7 @@ export async function runHarnessDriver(
         workerInvocationId,
         workerInputSha256,
         packetStateSchema,
+        packetMaxBytes,
       );
       if (
         !recoveredWorker &&
@@ -3673,6 +3738,7 @@ export async function runHarnessDriver(
           writeFileSync(workerArtifactPath, readFileSync(packetResultPath(effectiveId)));
           finishInvocation(interruptedWorker, 'completed', {
             artifactPath: workerArtifactPath,
+            artifactMaxBytes: packetMaxBytes,
             modelId: roleRefId(roles?.implementer ?? { runner: 'claude', model: '' }),
           });
           recoveredWorker = state;
@@ -3705,6 +3771,7 @@ export async function runHarnessDriver(
               gateInvocationId,
               gateInputSha256For(state),
               packetStateSchema,
+              packetMaxBytes,
             )
           : null;
       if (!recoveredGate && stateName === 'gated' && packetStateHasWorkerEvidence(state, manifest)) {
@@ -3734,6 +3801,7 @@ export async function runHarnessDriver(
           writeFileSync(gateArtifactPath, readFileSync(packetResultPath(effectiveId)));
           finishInvocation(interruptedGate, 'completed', {
             artifactPath: gateArtifactPath,
+            artifactMaxBytes: packetMaxBytes,
           });
           recoveredGate = state;
         }
@@ -3809,6 +3877,7 @@ export async function runHarnessDriver(
               (packetState ? `packet runtime exited ${result.exitCode} in state ${String(packetState.state)}` : `packet runtime wrote no ledger for ${effectiveId}`);
             finishInvocation(invocation, 'failed', {
               ...(packetState ? { artifactPath: packetResultPath(effectiveId) } : {}),
+              artifactMaxBytes: packetMaxBytes,
               error: reason,
             });
             recordPacket(source.id, {
@@ -3827,6 +3896,7 @@ export async function runHarnessDriver(
           );
           finishInvocation(invocation, 'completed', {
             artifactPath: workerArtifactPath,
+            artifactMaxBytes: packetMaxBytes,
             modelId: roleRefId(roles?.implementer ?? { runner: 'claude', model: '' }),
           });
         }
@@ -3961,6 +4031,7 @@ export async function runHarnessDriver(
           );
           finishInvocation(gateInvocation, 'completed', {
             artifactPath: gateArtifactPath,
+            artifactMaxBytes: packetMaxBytes,
           });
         }
         recordPacket(source.id, {

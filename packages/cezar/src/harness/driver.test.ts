@@ -41,6 +41,7 @@ import {
   type HarnessAgentPhaseRequest,
 } from './driver.js';
 import { probeKey, type ProbeVerdict } from './probe.js';
+import { HarnessRuntime } from './runtime.js';
 
 /**
  * The phase driver (spec 2026-07-23-harness-orchestration, Architecture §1):
@@ -439,6 +440,181 @@ describe('harness driver — standard fix-issue graph', () => {
         },
       },
     },
+  });
+
+  function realPacketHarness(options: { large?: boolean; fail?: boolean } = {}) {
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'test@local');
+    git('config', 'user.name', 'test');
+    mkdirSync(join(dir, 'src/runs'), { recursive: true });
+    mkdirSync(join(dir, 'test/unit'), { recursive: true });
+    writeFileSync(join(dir, 'src/runs/store.ts'), 'base\n');
+    writeFileSync(join(dir, 'test/unit/store.test.ts'), 'test\n');
+    git('add', 'src', 'test');
+    git('commit', '-qm', 'base');
+    pinWorktreeGitDir(dir, join(dir, '.git'));
+    writeFileSync(join(dir, '.git/info/exclude'), '.ai/cezar/\n.claude/\n');
+    const h = makeHarness(dir);
+    delete h.deps.discoverChangedPaths;
+    const worker = join(dir, '.ai/cezar/codex');
+    const failFile = join(dir, '.ai/cezar/fail-worker');
+    if (options.fail) writeFileSync(failFile, 'fail');
+    writeFileSync(worker, `#!${process.execPath}
+const fs = require('node:fs');
+fs.writeFileSync('src/runs/store.ts', 'worker edit\\n');
+process.exit(fs.existsSync('.ai/cezar/fail-worker') ? 99 : 0);
+`);
+    chmodSync(worker, 0o755);
+    const reviewer = join(dir, '.ai/cezar/reviewer.cjs');
+    writeFileSync(reviewer, `
+const fs = require('node:fs');
+const prompt = fs.readFileSync(process.env.OM_HARNESS_PROMPT_FILE, 'utf8');
+const verbose = ${!!options.large} && prompt.includes('Assigned lens:') && !prompt.includes('fresh finding-verification pass');
+const findings = verbose ? Array.from({ length: 160 }, (_, i) => ({
+  fingerprint: process.env.OM_HARNESS_MODEL + '-' + i,
+  severity: 'nit', category: 'correctness', title: 'finding ' + i,
+  location: { path: 'src/runs/store.ts', line: 1 }, evidence: 'x'.repeat(6000),
+  impact: 'test evidence', remediation: 'test suggestion', confidence: 0.9,
+})) : [];
+process.stdout.write(JSON.stringify({ verdict: 'approve', findings, notes: [] }));
+`);
+    const reviewerIds = options.large ? ['deepseek', 'google', 'mistral', 'qwen'] : ['deepseek', 'google'];
+    const risks = { low: reviewerIds.length, medium: reviewerIds.length, high: reviewerIds.length, critical: reviewerIds.length };
+    const config = {
+      validation: { commands: ['echo ok'] },
+      agentHarness: {
+        version: 1, delivery: { mode: 'stage-only' },
+        models: {
+          worker: { family: 'openai', model: 'test', adapter: 'command', reasoningEffort: 'high', roles: ['worker'],
+            workerSecurity: { network: 'disabled', remoteWrites: 'disabled', refWrites: 'disabled', enforcedBy: 'codex-workspace-write-sandbox' },
+            commands: { worker: [worker, 'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral', '--config', 'model_reasoning_effort={reasoningEffort}', '--sandbox', 'workspace-write', '--cd', '{worktree}', '--model', '{model}', '-'] } },
+          ...Object.fromEntries(reviewerIds.map((id) => [id, {
+            family: id, model: id, adapter: 'command', roles: ['reviewer'], maxInputBytes: 20_000_000,
+            commands: { review: [process.execPath, reviewer] },
+          }])),
+        },
+        profiles: { 'high-assurance': { workers: ['worker'], reviewers: reviewerIds, reviewPolicy: { mode: 'all-required' }, packetPolicy: {
+          mode: 'adversarial', reviewersByRisk: risks, minimumFamiliesByRisk: risks, verificationReviewers: 1,
+          lenses: ['correctness'], separateFixer: true, maxFixCycles: 1, blockingSeverities: ['blocker', 'major'],
+          budgets: { maxWorkerInvocations: 1, maxReviewerInvocations: 8, maxFixerInvocations: 1, maxReviewInputBytes: 100_000_000 },
+        } } },
+      },
+    };
+    h.deps.loadAgentic = async () => ({ baseBranch: 'main', validationCommands: ['echo ok'], agentHarness: config.agentHarness });
+    h.deps.exportConfig = async (_repo, _ref, dest) => {
+      const path = join(dest, 'trusted-agentic.config.json');
+      writeFileSync(path, JSON.stringify(config));
+      return { path, ref: 'HEAD' };
+    };
+    const script = new URL('../../vendor/skills/cez-harness/scripts/harness.mjs', import.meta.url).pathname;
+    const stopModule = join(dir, '.ai/cezar/stop-release.mjs');
+    writeFileSync(stopModule, `
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const rename = fs.renameSync;
+fs.renameSync = (from, to) => {
+  rename(from, to);
+  if (String(to).endsWith('/packet-result.json') && JSON.parse(fs.readFileSync(to, 'utf8')).state === 'aborted') process.kill(process.pid, 'SIGTERM');
+};
+syncBuiltinESMExports();
+`);
+    let cancelled = false;
+    let stopRelease = false;
+    h.host.isCancelled = () => cancelled;
+    h.deps.createRuntime = (opts) => {
+      const real = new HarnessRuntime({ ...opts, script, env: { ...opts.env, CEZ_HARNESS_REVIEW_SKILL: 'cez-code-review' } });
+      return { kill: () => real.kill(), run: async (op, args, settings) => {
+        h.ops.push({ kind: 'op', id: op, args });
+        if (op === 'packet-release' && stopRelease) {
+          // Kill only after the real runtime durably saved aborted (PR #925 review).
+          const killed = spawnSync(process.execPath, ['--import', stopModule, script, op, ...args], {
+            cwd: dir, encoding: 'utf8', env: { ...process.env, ...opts.env, CEZ_HARNESS_REVIEW_SKILL: 'cez-code-review' },
+          });
+          expect(killed.signal, killed.stderr).toBe('SIGTERM');
+          cancelled = true;
+          return { ok: false, exitCode: null, stdout: killed.stdout, stderr: killed.stderr, durationMs: 0, error: 'op "packet-release" cancelled' };
+        }
+        return real.run(op, args, settings);
+      } };
+    };
+    return { ...h, git, failFile, cancelRelease: () => { stopRelease = true; }, resume: () => { cancelled = false; stopRelease = false; } };
+  }
+
+  it('[r4-3] Stop during real packet release is interrupted and Continue recovers', async () => {
+    const h = realPacketHarness({ fail: true });
+    const packetInput = { ...input, profile: 'high-assurance' as const };
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toMatch(/packet PK-01 failed/);
+    h.cancelRelease();
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toBeNull();
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.invocations.find((invocation) => invocation.id === 'packet-release:PK-01:1')).toMatchObject({ status: 'interrupted' });
+    rmSync(h.failFile);
+    h.resume();
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toBeNull();
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.packets[0]).toMatchObject({ effectiveId: 'PK-01-resume-2', state: 'gated' });
+    expect(h.ops.filter((op) => op.id === 'packet-release')).toHaveLength(1);
+  }, 30_000);
+
+  it('guard: [r4-3] an uncancelled real packet release completes and resumes', async () => {
+    const h = realPacketHarness({ fail: true });
+    const packetInput = { ...input, profile: 'high-assurance' as const };
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toMatch(/packet PK-01 failed/);
+    rmSync(h.failFile);
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toBeNull();
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.invocations.find((invocation) => invocation.id === 'packet-release:PK-01:1')).toMatchObject({ status: 'completed' });
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.stage.status).toBe('staged');
+  }, 30_000);
+
+  it.each([
+    ['[r4-4] consumes and reuses a real packet ledger exceeding both generic artifact caps', true],
+    ['guard: [r4-4] small real packet ledgers still gate and reuse without rerunning work', false],
+  ] as const)('%s', async (_name, large) => {
+    const h = realPacketHarness({ large });
+    const packetInput = { ...input, profile: 'high-assurance' as const };
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toBeNull();
+    const packetPath = join(harnessArtifactDir(h.host.dataDir, h.host.runId), 'packet-runtime/packets/PK-01/packet-result.json');
+    if (large) expect(readFileSync(packetPath).length).toBeGreaterThan(8_000_000);
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toBeNull();
+    expect(h.ops.filter((op) => op.id === 'packet-run')).toHaveLength(1);
+    expect(h.ops.filter((op) => op.id === 'packet-gate')).toHaveLength(1);
+    expect(loadLedger(h.host.dataDir, h.host.runId)?.outcome.status).toBe('ready');
+  }, 30_000);
+
+  it('[r4-7] a refusal before preservation omits a nonexistent diff artifact', async () => {
+    const h = realPacketHarness({ fail: true });
+    const packetInput = { ...input, profile: 'high-assurance' as const };
+    expect(await runHarnessDriver(h.host, packetInput, h.deps)).toMatch(/packet PK-01 failed/);
+    rmSync(join(dir, 'src'), { recursive: true });
+    symlinkSync(join(dir, 'absent'), join(dir, 'src'));
+    const error = await runHarnessDriver(h.host, packetInput, h.deps);
+    expect(error).toContain('symlink parent');
+    expect(error).not.toContain('diff artifact:');
+    expect(existsSync(join(harnessArtifactDir(h.host.dataDir, h.host.runId), 'packet-failed-diff-PK-01.patch'))).toBe(false);
+  }, 30_000);
+
+  it.each([
+    ['[r4-6] a non-file rubric fails the council without rejecting the driver', false],
+    ['guard: [r4-6] a regular rubric still lets the council complete', true],
+  ] as const)('%s', async (_name, regular) => {
+    const h = makeHarness(dir);
+    h.deps.loadAgentic = async () => highAssuranceAgentic();
+    h.agentBehavior.set('implement', (req) => {
+      const rubric = join(harnessArtifactDir(h.host.dataDir, h.host.runId), 'trusted-skills/om-code-review/references/output-format.md');
+      mkdirSync(dirname(rubric), { recursive: true });
+      if (regular) writeFileSync(rubric, '# rubric');
+      else mkdirSync(rubric);
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: ['src/runs/store.ts'] }));
+      return null;
+    });
+    const result = await runHarnessDriver(h.host, { ...input, roles: {
+      orchestrator: { runner: 'claude', model: '' }, implementer: { runner: 'claude', model: '' },
+      reviewers: [{ runner: 'harness', model: 'deepseek', family: 'deepseek' }, { runner: 'harness', model: 'codex', family: 'openai' }],
+    } }, h.deps);
+    if (regular) expect(result).toBeNull();
+    else {
+      expect(result).toContain('artifact is not a regular file');
+      expect(loadLedger(h.host.dataDir, h.host.runId)?.outcome.status).toBe('blocked');
+    }
   });
 
   it.each([true, false])('[round3-1] cancellation while preparing the prober prevents probes (roles=%s)', async (withRoles) => {
@@ -2560,7 +2736,7 @@ describe('harness driver — standard fix-issue graph', () => {
 
   it.each([
     ['[round3-7] a restore refusal names the numbered preserved artifact', true],
-    ['guard: a restore refusal without a collision names the original artifact', false],
+    ['guard: [r4-7] a restore refusal without a collision names the original artifact', false],
   ] as const)('%s', async (_name, collision) => {
     const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
     git('init', '-q', '-b', 'main');
