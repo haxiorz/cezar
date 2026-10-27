@@ -321,6 +321,7 @@ function hashWorktreeContentVsHead(
   const gitDir = pinnedGitEnv(cwd)?.GIT_DIR ?? git(['rev-parse', '--absolute-git-dir']).toString('utf8').trim();
   const temporary = mkdtempSync(join(indexRoot ?? gitDir, 'cez-subject-index-'));
   let status: Buffer;
+  const gitlinks = new Map<string, string>();
   try {
     const indexPath = join(temporary, 'index');
     const env = { GIT_INDEX_FILE: indexPath };
@@ -341,6 +342,17 @@ function hashWorktreeContentVsHead(
       '--untracked-files=all',
       '--no-renames',
     ]);
+    const directories = status.toString('utf8').split('\0').filter(Boolean).map((entry) => entry.slice(3).replace(/\/$/, '')).filter((path) => {
+      try { return lstatSync(join(cwd, path)).isDirectory(); } catch { return false; }
+    });
+    // Snapshot gitlink commits through the same Git operation as staging (PR #925 review).
+    for (const batch of harnessPathBatches(directories)) privateGit(['add', '--sparse', '--no-warn-embedded-repo', '--', ...batch.map((path) => `:(literal)${path}`)]);
+    if (directories.length) {
+      for (const entry of privateGit(['ls-files', '--stage', '-z']).toString('utf8').split('\0')) {
+        const match = /^160000 ([a-f0-9]+) 0\t(.*)$/s.exec(entry);
+        if (match) gitlinks.set(match[2]!, match[1]!);
+      }
+    }
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -357,7 +369,9 @@ function hashWorktreeContentVsHead(
     const absolute = join(cwd, path);
     try {
       const entry = readHarnessFsEntry(absolute);
-      if (entry.kind === 'symlink') hash.update(`symlink:${entry.target}`);
+      const gitlink = gitlinks.get(path.replace(/\/$/, ''));
+      if (gitlink) hash.update(`gitlink:${gitlink}`);
+      else if (entry.kind === 'symlink') hash.update(`symlink:${entry.target}`);
       else if (entry.kind === 'file') {
         // Git tracks the executable bit and file type as part of the reviewed change.
         hash.update(`file:${entry.stat.mode & 0o111 ? 'executable' : 'regular'}\0`);
@@ -539,6 +553,11 @@ export async function preserveAndRestorePacket(cwd: string, paths: readonly stri
   const batches = scopes.length ? harnessPathBatches(scopes) : [[]];
   const headPaths = [...new Set(batches.flatMap((batch) => names(['ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', ...batch])))];
   const currentPaths = [...new Set(batches.flatMap((batch) => names(['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', ...batch])))];
+  const skipped = new Set(names(['ls-files', '-v', '-z']).filter((entry) => /^[Ss] /.test(entry)).map((entry) => entry.slice(2)));
+  const restorePaths = headPaths.filter((path) => {
+    if (!skipped.has(path)) return true;
+    try { lstatSync(join(cwd, path)); return true; } catch { return false; }
+  });
   const affected = [...new Set([...headPaths, ...currentPaths])];
   for (const path of affected) {
     for (let parent = dirname(resolve(cwd, path)); parent !== resolve(cwd); parent = dirname(parent)) {
@@ -585,7 +604,7 @@ export async function preserveAndRestorePacket(cwd: string, paths: readonly stri
       rmSync(join(cwd, path), { force: true });
       git(['update-index', '--force-remove', '--', path]);
     }
-    for (const batch of harnessPathBatches(headPaths.map((path) => `:(literal)${path}`))) {
+    for (const batch of harnessPathBatches(restorePaths.map((path) => `:(literal)${path}`))) {
       git(['restore', '--source=HEAD', '--staged', '--worktree', '--', ...batch]);
     }
     if ((await harnessDiff(cwd, paths, `${artifactPath}.index`)).length) {
@@ -599,7 +618,7 @@ export async function preserveAndRestorePacket(cwd: string, paths: readonly stri
 
 function currentChangedPaths(cwd: string): string[] | null {
   try {
-    const tracked = execFileSync('git', ['-c', 'core.hooksPath=/dev/null', 'diff', '--name-only', '-z', 'HEAD', '--'], {
+    const tracked = execFileSync('git', ['-c', 'core.hooksPath=/dev/null', 'diff', '--no-renames', '--name-only', '-z', 'HEAD', '--'], {
       cwd,
       encoding: 'utf8',
       maxBuffer: 256 * 1024 * 1024,
@@ -5907,8 +5926,9 @@ export async function runHarnessDriver(
           await new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
           continue;
         }
+        const lockPath = join(pinnedGitEnv(host.cwd)?.GIT_DIR ?? '', 'index.lock');
         const reason = locked
-          ? 'another git process holds the index lock — Continue to retry'
+          ? `another git process holds the index lock — Continue to retry; if no git process is running, delete ${lockPath}, then Continue`
           : `could not reset the harness index — Continue to retry: ${error}`;
         setOutcome({ status: 'blocked', blockingReasons: [reason] });
         return reason;

@@ -3173,7 +3173,76 @@ syncBuiltinESMExports();
     return { make, cwd, git: gitTask };
   }
 
-  it.each(['initial', 'F4', 'restart'] as const)('[r8-lock] blocks %s staging when reset stays locked until runtime stage', async (entry) => {
+  it('guard: [r9-input] ordinary stage input hash retains the version 2 serialization', async () => {
+    const f = round7StageHarness(); const first = f.make();
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    const artifactDir = harnessArtifactDir(first.host.dataDir, first.host.runId);
+    const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
+    const expected = digest(JSON.stringify({
+      inputHashVersion: 2, operation: 'stage',
+      startStateSha256: digest(readFileSync(join(artifactDir, 'start-state.json'))),
+      allowlistSha256: digest(readFileSync(join(artifactDir, 'allowlist.txt'))),
+      subjectSha256: await snapshotHarnessStageSubject(f.cwd),
+    }));
+    expect(loadLedger(first.host.dataDir, first.host.runId)?.invocations.find((entry) => entry.id === 'runtime:stage')?.inputSha256).toBe(expected);
+  });
+
+  it.each(['git mv', 'similar replacement', 'symlink retarget', 'sparse'] as const)('[r9-rename] real stage reaches ready and resumes after %s', async (kind) => {
+    const f = round7StageHarness();
+    let source = 'src/x';
+    if (kind === 'symlink retarget') {
+      rmSync(join(f.cwd, source)); symlinkSync('a.txt', join(f.cwd, source));
+      symlinkSync('x', join(f.cwd, 'src/retarget'));
+      f.git('add', source, 'src/retarget'); f.git('commit', '-qm', 'symlink base');
+    }
+    if (kind === 'similar replacement') {
+      writeFileSync(join(f.cwd, source), 'line\n'.repeat(50));
+      f.git('add', source); f.git('commit', '-qm', 'similar base');
+    }
+    if (kind === 'sparse') {
+      mkdirSync(join(f.cwd, 'outside')); source = 'outside/x';
+      writeFileSync(join(f.cwd, source), 'base\n'); f.git('add', source); f.git('commit', '-qm', 'sparse base');
+      f.git('sparse-checkout', 'set', '--cone', 'src');
+    }
+    const paths = [source, 'src/y', ...(kind === 'symlink retarget' ? ['src/retarget'] : [])].sort();
+    const head = f.git('rev-parse', 'HEAD'); const reflog = f.git('reflog', 'show', 'HEAD');
+    const first = f.make();
+    first.agentBehavior.set('implement', (req) => {
+      if (kind === 'git mv') f.git('mv', source, 'src/y');
+      else {
+        if (kind === 'sparse') f.git('rm', '--sparse', source);
+        else rmSync(join(f.cwd, source));
+        if (kind === 'symlink retarget') {
+          symlinkSync('a.txt', join(f.cwd, 'src/y'));
+          rmSync(join(f.cwd, 'src/retarget')); symlinkSync('y', join(f.cwd, 'src/retarget'));
+        }
+        else writeFileSync(join(f.cwd, 'src/y'), kind === 'similar replacement' ? 'line\n'.repeat(49) + 'changed\n' : 'base\n');
+      }
+      writeFileSync(req.resultPath, JSON.stringify({ changedPaths: paths })); return null;
+    });
+    expect(await runHarnessDriver(first.host, input, first.deps)).toBeNull();
+    expect(loadLedger(first.host.dataDir, first.host.runId)?.stage.stagedPaths).toEqual(paths);
+    expect(loadLedger(first.host.dataDir, first.host.runId)?.outcome.status).toBe('ready');
+    // A cached rename must retain both paths before the fallback reset (PR #925 review).
+    const ledger = loadLedger(first.host.dataDir, first.host.runId)!;
+    ledger.invocations.find((invocation) => invocation.id === 'runtime:stage')!.inputSha256 = 'expired';
+    saveLedger(first.host.dataDir, first.host.runId, ledger);
+    const restaged = f.make(); expect(await runHarnessDriver(restaged.host, input, restaged.deps)).toBeNull();
+    expect(restaged.ops.filter((op) => op.id === 'stage')).toHaveLength(1);
+    const indexPath = join(f.git('rev-parse', '--absolute-git-dir').trim(), 'index'); const index = readFileSync(indexPath);
+    const resumed = f.make(); expect(await runHarnessDriver(resumed.host, input, resumed.deps)).toBeNull();
+    expect(resumed.ops.filter((op) => op.id === 'stage')).toHaveLength(0);
+    expect(readFileSync(indexPath)).toEqual(index);
+    const recovery = loadLedger(resumed.host.dataDir, resumed.host.runId)!;
+    recovery.phases.find((phase) => phase.id === 'stage')!.status = 'running';
+    recovery.stage = { status: 'pending' }; saveLedger(resumed.host.dataDir, resumed.host.runId, recovery);
+    const restarted = f.make(); expect(await runHarnessDriver(restarted.host, input, restarted.deps)).toBeNull();
+    expect(restarted.ops.filter((op) => op.id === 'stage')).toHaveLength(1);
+    expect(loadLedger(restarted.host.dataDir, restarted.host.runId)?.stage.stagedPaths).toEqual(paths);
+    expect(f.git('rev-parse', 'HEAD')).toBe(head); expect(f.git('reflog', 'show', 'HEAD')).toBe(reflog);
+  });
+
+  it.each(['initial', 'F4', 'restart'] as const)('[r9-lock] blocks %s staging with actionable stale-lock recovery', async (entry) => {
     const f = round7StageHarness();
     const lock = join(f.git('rev-parse', '--absolute-git-dir').trim(), 'index.lock');
     if (entry !== 'initial') {
@@ -3210,11 +3279,13 @@ syncBuiltinESMExports();
       const result = await runHarnessDriver(next.host, input, next.deps);
       expect(loadLedger(next.host.dataDir, next.host.runId)?.outcome.status).toBe('blocked');
       expect(result).toMatch(/another git process holds the index lock.*Continue to retry/);
+      expect(result).toContain(`if no git process is running, delete ${lock}, then Continue`);
+      expect(readFileSync(lock, 'utf8')).toBe('held');
       expect(next.ops.filter((op) => op.id === 'stage')).toHaveLength(0);
     } finally { rmSync(lock, { force: true }); }
   });
 
-  it('[r8-reset-error] blocks on a non-lock reset failure without retrying', async () => {
+  it('guard: [r8-reset-error] blocks on a non-lock reset failure without retrying', async () => {
     const f = round7StageHarness(); const next = f.make(); const realExec = childProcess.execFileSync; let resets = 0;
     vi.spyOn(childProcess, 'execFileSync').mockImplementation(((file, args, options) => {
       const opts = options as { env?: Record<string, string> };
@@ -3226,14 +3297,14 @@ syncBuiltinESMExports();
     try {
       const result = await runHarnessDriver(next.host, input, next.deps);
       expect(loadLedger(next.host.dataDir, next.host.runId)?.outcome.status).toBe('blocked');
-      expect(result).toMatch(/could not reset the harness index.*index is corrupt/);
+      expect(result).toBe('could not reset the harness index — Continue to retry: index is corrupt');
       expect(resets).toBe(2); // The existing non-sparse read-tree fallback is retained.
       expect(next.ops.filter((op) => op.id === 'stage')).toHaveLength(0);
       expect(loadLedger(next.host.dataDir, next.host.runId)?.outcome.status).toBe('blocked');
     } finally { vi.restoreAllMocks(); syncBuiltinESMExports(); }
   });
 
-  it('[r8-backoff] stages hidden edits when the lock is released within backoff', async () => {
+  it('guard: [r8-backoff] stages hidden edits when the lock is released within backoff', async () => {
     const f = round7StageHarness(); const next = f.make();
     const lock = join(f.git('rev-parse', '--absolute-git-dir').trim(), 'index.lock');
     const original = next.agentBehavior.get('implement')!;

@@ -1503,15 +1503,38 @@ function nullSeparated(value) {
 
 function dirtyPaths(worktree) {
   return [...new Set([
-    ...nullSeparated(git(['diff', '--name-only', '-z'], worktree)),
-    ...nullSeparated(git(['diff', '--cached', '--name-only', '-z'], worktree)),
+    ...nullSeparated(git(['diff', '--no-renames', '--name-only', '-z'], worktree)),
+    ...nullSeparated(git(['diff', '--cached', '--no-renames', '--name-only', '-z'], worktree)),
     ...nullSeparated(git(['ls-files', '--others', '--exclude-standard', '-z'], worktree))
-  ])].sort()
+  ].map((path) => path.replace(/\/$/, '')))].sort()
+}
+
+// Match staging's gitlink commit without entering the nested repository (PR #925 review).
+function dirtyGitlinks(worktree, paths) {
+  const directories = paths.filter((path) => {
+    try { return lstatSync(join(worktree, path)).isDirectory() } catch { return false }
+  })
+  const commits = new Map()
+  if (!directories.length) return commits
+  const temporary = mkdtempSync(join(git(['rev-parse', '--absolute-git-dir'], worktree).trim(), 'cez-packet-index-'))
+  const env = { GIT_INDEX_FILE: join(temporary, 'index') }
+  try {
+    git(['read-tree', 'HEAD'], worktree, { env })
+    gitAddPaths(['add', '--sparse'], directories, worktree, { env })
+    for (const entry of nullSeparated(git(['ls-files', '--stage', '-z'], worktree, { env }))) {
+      const match = /^160000 ([a-f0-9]+) 0\t(.*)$/s.exec(entry)
+      if (match) commits.set(match[2], match[1])
+    }
+  } finally { rmSync(temporary, { recursive: true, force: true }) }
+  return commits
 }
 
 function captureDirtyState(worktree) {
   const state = {}
-  for (const path of dirtyPaths(worktree)) {
+  const paths = dirtyPaths(worktree)
+  const gitlinks = dirtyGitlinks(worktree, paths)
+  for (const path of paths) {
+    if (gitlinks.has(path)) { state[path] = `gitlink:${gitlinks.get(path)}`; continue }
     const absolute = join(worktree, path)
     try {
       const entry = readEntryNoFollow(absolute)
@@ -2340,7 +2363,7 @@ function commandStage(args) {
   } catch (error) {
     warnings.push(`whitespace findings in the staged diff (cosmetic — clean before committing if your CI checks them):\n${String(error.message || '').trim()}`)
   }
-  const stagedPaths = nullSeparated(git(['diff', '--cached', '--name-only', '-z'], worktree))
+  const stagedPaths = nullSeparated(git(['diff', '--cached', '--no-renames', '--name-only', '-z'], worktree))
   const allowed = (entry) => paths.some((scope) => entry === scope || entry.startsWith(`${scope}/`))
   const unexpected = stagedPaths.filter((entry) => !allowed(entry))
   if (unexpected.length) throw new Error(`Staged paths outside allowlist: ${unexpected.join(', ')}`)

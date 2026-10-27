@@ -230,6 +230,8 @@ prompt instructions are how you get 8/10 worktree escapes. It's enforced in laye
    explicitly allowlisted. Exact tracked deletions shown in the subject stay
    deletions in the handoff. Restore sparse entries with
    `git sparse-checkout add <directory>` before deleting.
+   Renames stage as a delete plus an add. Untracked nested repositories stage as
+   gitlinks, whose commit ids are included in review and packet snapshots.
 4. **The validation gate is not sandboxed.** It runs the base ref's commands the
    way CI would, in the worktree the implementer wrote — so the scripts behind
    `npm test` are model-authored code. It gets no provider credentials
