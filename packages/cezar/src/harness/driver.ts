@@ -4978,17 +4978,20 @@ export async function runHarnessDriver(
       });
     }
 
-    const unconsumedMessages = ledger.pendingMessages.filter(
-      (message) => !message.consumedAt,
-    );
-    if (unconsumedMessages.length > 0) {
+    const unappliedMessagesBlock = (): string | null => {
+      mergeOperatorMutations();
+      const unconsumedMessages = ledger.pendingMessages.filter((message) => !message.consumedAt);
+      if (unconsumedMessages.length === 0) return null;
       const reason =
         UNAPPLIED_MESSAGES_REASON +
         unconsumedMessages.map((message) => message.id).join(', ') +
         ' — Continue applies them as feedback';
       setOutcome({ status: 'blocked', blockingReasons: [reason] });
+      persist();
       return reason;
-    }
+    };
+    const unappliedBeforeStage = unappliedMessagesBlock();
+    if (unappliedBeforeStage) return unappliedBeforeStage;
 
     const invalidateStage = (): void => {
       const phase = ledger.phases.find((entry) => entry.id === 'stage');
@@ -5272,6 +5275,13 @@ export async function runHarnessDriver(
         `Staged by the cezar harness driver (stage-only: no commit, push, or PR was created).`,
       ].join('\n'),
     };
+    // A message the server queued while the stage op ran was acknowledged; it blocks the handoff
+    // instead of being dropped (PR #925 review).
+    const unappliedAfterStage = unappliedMessagesBlock();
+    if (unappliedAfterStage) {
+      host.emit({ type: 'harness.stage.updated', stage: ledger.stage });
+      return unappliedAfterStage;
+    }
     if (ledger.outcome.status === 'pending') {
       setOutcome({ status: 'ready', blockingReasons: [] });
     }

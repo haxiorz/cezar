@@ -1411,6 +1411,33 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(loadLedger(first.host.dataDir, first.host.runId)?.loops.fixRounds).toBe(0);
   });
 
+  // PR #925 review (M5): a message the server queued while the stage op ran was acknowledged,
+  // then dropped — the outcome turned ready without reading it.
+  it('blocks the handoff on a message that arrives while staging runs', async () => {
+    const h = makeHarness(dir);
+    const create = h.deps.createRuntime!;
+    h.deps.createRuntime = (opts) => {
+      const runtime = create(opts);
+      return {
+        ...runtime,
+        run: async (op, args, options) => {
+          if (op === 'stage') {
+            const external = loadLedger(h.host.dataDir, h.host.runId)!;
+            external.pendingMessages.push({ id: 'during-stage', text: 'Rename the helper too.', createdAt: new Date().toISOString() });
+            saveLedger(h.host.dataDir, h.host.runId, external);
+          }
+          return runtime.run(op, args, options);
+        },
+      };
+    };
+
+    expect(await runHarnessDriver(h.host, input, h.deps)).toMatch(/during-stage/);
+    const ledger = loadLedger(h.host.dataDir, h.host.runId)!;
+    expect(ledger.outcome.status).toBe('blocked');
+    expect(ledger.pendingMessages).toEqual([expect.objectContaining({ id: 'during-stage' })]);
+    expect(ledger.pendingMessages[0]?.consumedAt).toBeUndefined();
+  });
+
   // PR #925 review: fix-2 took a message and failed; feedback then restarted at implement, round 1
   // approved, and the message — still assigned to the superseded fix-2 — blocked staging forever.
   it('hands a superseded phase’s unconsumed message to the feedback restart', async () => {
