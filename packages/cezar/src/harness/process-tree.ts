@@ -42,7 +42,7 @@ export function signalAgentProcessTree(
 /** Is any process still alive in the child's group? Signal 0 only checks for
  * existence and permission — it delivers nothing. A surviving group member is
  * why escalation cannot be tied to the leader's own exit (2026-07-27). */
-function groupStillAlive(pid: number): boolean {
+export function groupStillAlive(pid: number): boolean {
   if (process.platform === 'win32') return false;
   try {
     process.kill(-pid, 0);

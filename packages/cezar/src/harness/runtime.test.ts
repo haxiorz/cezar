@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -168,6 +168,66 @@ describe('harness runtime bridge', () => {
 
     await expect(reconcileHarnessProcess(identity!)).resolves.toEqual({ status: 'terminated' });
     await expect(pending).resolves.toMatchObject({ ok: false });
+  });
+
+  // PR #925 review (M6): recovery returned `terminated` once the LEADER exited, so a member
+  // that ignores SIGTERM kept writing the worktree beside the replacement work.
+  describe.skipIf(process.platform === 'win32')('restart recovery of a recorded process group', () => {
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'EPERM';
+      }
+    };
+    const recordedGroup = async (leaderExits: boolean) => {
+      const token = 'token-' + Math.random().toString(16).slice(2);
+      const childPidFile = join(dir, 'child.pid');
+      const leader = spawn(
+        process.execPath,
+        [
+          '-e',
+          `const { spawn } = require('node:child_process');
+const child = spawn('/bin/sh', ['-c', "trap '' TERM; while :; do sleep 0.05; done"], { stdio: 'ignore' });
+require('node:fs').writeFileSync(${JSON.stringify(childPidFile)}, String(child.pid));
+child.unref();
+${leaderExits ? 'setTimeout(() => process.exit(0), 50);' : 'setInterval(() => {}, 60_000);'}`,
+        ],
+        { detached: true, stdio: 'ignore', env: { ...process.env, CEZ_PROCESS_TOKEN: token } },
+      );
+      leader.unref();
+      expect(await waitFor(() => existsSync(childPidFile) && readFileSync(childPidFile, 'utf8') !== '')).toBe(true);
+      const child = Number(readFileSync(childPidFile, 'utf8'));
+      if (leaderExits) expect(await waitFor(() => !alive(leader.pid!))).toBe(true);
+      return { identity: { pid: leader.pid!, token, startedAt: new Date().toISOString(), group: true }, child };
+    };
+    const reap = (pid: number) => {
+      try {
+        process.kill(-pid, 'SIGKILL');
+      } catch {
+      }
+    };
+
+    it('waits out a member that ignores SIGTERM after the leader exits', async () => {
+      const { identity, child } = await recordedGroup(false);
+      try {
+        await expect(reconcileHarnessProcess(identity)).resolves.toEqual({ status: 'terminated' });
+        expect(alive(child)).toBe(false);
+      } finally {
+        reap(identity.pid);
+      }
+    }, 20_000);
+
+    it('terminates the survivors of a leader that was already gone', async () => {
+      const { identity, child } = await recordedGroup(true);
+      try {
+        await expect(reconcileHarnessProcess(identity)).resolves.toEqual({ status: 'terminated' });
+        expect(alive(child)).toBe(false);
+      } finally {
+        reap(identity.pid);
+      }
+    }, 20_000);
   });
 
   it('bounds captured runtime output exactly at the configured cap', async () => {

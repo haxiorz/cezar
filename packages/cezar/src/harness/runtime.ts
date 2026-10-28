@@ -18,7 +18,7 @@ import { z } from 'zod';
 import { discoverSkills, type Skill } from '../skills.js';
 import type { HarnessValidationCheck } from './types.js';
 import { readHarnessFsEntry, readRegularFileFollowing } from './fs-read.js';
-import { terminateAgentProcessTree, trackAgentProcessTree } from './process-tree.js';
+import { groupStillAlive, terminateAgentProcessTree, trackAgentProcessTree } from './process-tree.js';
 
 /**
  * The runtime bridge (spec 2026-07-23-harness-orchestration, Architecture §2):
@@ -196,12 +196,19 @@ function signalOwnedProcess(
 }
 
 /** Reconcile one process recorded by a paid invocation after a Cezar restart. Only a matching
- * identity token authorizes group termination; unsupported inspection fails closed. */
+ * identity token authorizes group termination; unsupported inspection fails closed. A recorded
+ * group is done only when its last member is: the leader exiting proved nothing about a
+ * SIGTERM-ignoring child, which then wrote the worktree beside the replacement (PR #925 review). */
 export async function reconcileHarnessProcess(
   identity: HarnessProcessIdentity,
 ): Promise<ReconcileHarnessProcessResult> {
+  const grouped = identity.group !== false && process.platform !== 'win32';
+  const alive = () => (grouped ? groupStillAlive(identity.pid) : processExists(identity.pid));
+  // A live group's id is never handed to a new process, so survivors of a leader that is gone
+  // are still this invocation's — there is no leader left to show the token.
+  const orphanedGroup = () => grouped && !processExists(identity.pid) && groupStillAlive(identity.pid);
   const match = processHasToken(identity);
-  if (match === false) {
+  if (match === false && !orphanedGroup()) {
     return processExists(identity.pid)
       ? { status: 'mismatch', error: `pid ${identity.pid} no longer belongs to this harness invocation` }
       : { status: 'absent' };
@@ -212,35 +219,34 @@ export async function reconcileHarnessProcess(
       error: `cannot verify process identity for pid ${identity.pid} on ${process.platform}`,
     };
   }
+  const settled = async (): Promise<boolean> => {
+    const deadline = Date.now() + PROCESS_KILL_GRACE_MS;
+    while (Date.now() < deadline) {
+      if (!alive()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return !alive();
+  };
   signalOwnedProcess(identity, 'SIGTERM');
-  const deadline = Date.now() + PROCESS_KILL_GRACE_MS;
-  while (Date.now() < deadline) {
-    if (!processExists(identity.pid)) return { status: 'terminated' };
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  const stillMatches = processHasToken(identity);
-  if (stillMatches !== true) {
-    return stillMatches === false && !processExists(identity.pid)
-      ? { status: 'terminated' }
-      : {
-          status: stillMatches === false ? 'mismatch' : 'unverified',
-          error: `process identity changed while terminating pid ${identity.pid}`,
-        };
+  if (await settled()) return { status: 'terminated' };
+  if (processExists(identity.pid)) {
+    const stillMatches = processHasToken(identity);
+    if (stillMatches !== true) {
+      return {
+        status: stillMatches === false ? 'mismatch' : 'unverified',
+        error: `process identity changed while terminating pid ${identity.pid}`,
+      };
+    }
+  } else if (!orphanedGroup()) {
+    return { status: 'terminated' };
   }
   signalOwnedProcess(identity, 'SIGKILL');
-  const killDeadline = Date.now() + PROCESS_KILL_GRACE_MS;
-  while (Date.now() < killDeadline) {
-    if (!processExists(identity.pid)) return { status: 'terminated' };
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  const afterKill = processHasToken(identity);
-  if (afterKill === false && !processExists(identity.pid)) return { status: 'terminated' };
+  if (await settled()) return { status: 'terminated' };
   return {
-    status: afterKill === false ? 'mismatch' : 'unverified',
-    error:
-      afterKill === true
-        ? `process group ${identity.pid} did not exit after SIGKILL`
-        : `could not verify termination of process group ${identity.pid}`,
+    status: 'unverified',
+    error: grouped
+      ? `process group ${identity.pid} did not exit after SIGKILL`
+      : `pid ${identity.pid} did not exit after SIGKILL`,
   };
 }
 
