@@ -3397,6 +3397,8 @@ export async function runHarnessDriver(
                 signal: controller.signal,
                 logDir: artifactDir,
                 logPrefix: 'validation-baseline-',
+                // Every command, so a later one that is red on main has evidence to compare with.
+                continueAfter: new Set(runtimeAgentic.validationCommands),
                 onSpawn: (identity) => {
                   invocation.process = { ...identity };
                   persist();
@@ -4465,6 +4467,11 @@ export async function runHarnessDriver(
                   signal: controller.signal,
                   logDir: artifactDir,
                   logPrefix: `validation-${validateId}-`,
+                  continueAfter: new Set(
+                    (ledger.baselineValidation ?? [])
+                      .filter((check) => check.status === 'failed')
+                      .map((check) => check.command),
+                  ),
                   onSpawn: (identity) => {
                     invocation.process = { ...identity };
                     persist();

@@ -1203,6 +1203,27 @@ describe('harness driver — standard fix-issue graph', () => {
     expect(h.calls.map((c) => c.id)).not.toContain('stage');
   });
 
+  // PR #925 review: the gate stopped at its first failure, so a command red on main hid every
+  // command after it — in the baseline and in the run.
+  it('runs the baseline in full and lets the run gate continue past a baseline-red command', async () => {
+    const h = makeHarness(dir);
+    h.deps.loadAgentic = async () => ({ baseBranch: 'main', validationCommands: ['yarn lint', 'yarn test'], agentHarness: undefined });
+    const continued: Array<string[]> = [];
+    h.deps.validate = async (commands: string[], _cwd, opts) => {
+      continued.push([...(opts?.continueAfter ?? [])]);
+      return commands.map((command) =>
+        command === 'yarn lint'
+          ? { command, status: 'failed' as const, exitCode: 1, evidence: 'x', failureIds: ['line:src/a.ts: no-unused-vars'] }
+          : { command, status: 'passed' as const, exitCode: 0, evidence: 'ok' },
+      );
+    };
+
+    expect(await runHarnessDriver(h.host, input, h.deps)).toBeNull();
+
+    expect(continued[0]).toEqual(['yarn lint', 'yarn test']);
+    expect(continued[1]).toEqual(['yarn lint']);
+  });
+
   it('pays the baseline gate once — a resume reuses it hash-bound', async () => {
     const h = makeHarness(dir);
     let calls = 0;

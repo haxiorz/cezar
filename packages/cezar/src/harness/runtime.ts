@@ -682,6 +682,33 @@ export function extractFailingTestIds(output: string): string[] {
   return [...ids];
 }
 
+const MAX_OUTPUT_LINE_IDS = 400;
+
+/**
+ * Comparison keys for a failing command whose output names no tests (lint, build, custom
+ * scripts): its distinct normalized lines, ANSI stripped and digit runs collapsed so timings and
+ * line numbers never read as new failures. Past the cap, one digest stands for the rest, so any
+ * difference there still reads as new. Without these, two failures with nothing to compare were
+ * tolerated as the same failure (PR #925 review).
+ */
+export function failingOutputLineIds(output: string): string[] {
+  const ids = new Set<string>();
+  const rest: string[] = [];
+  for (const raw of output.replace(ANSI_PATTERN, '').split('\n')) {
+    const line = raw.replace(/\d+/g, '#').replace(/\s+/g, ' ').trim();
+    if (!line) continue;
+    if (ids.size < MAX_OUTPUT_LINE_IDS) ids.add(`line:${line.slice(0, 160)}`);
+    else rest.push(line);
+  }
+  if (rest.length) ids.add(`overflow:${createHash('sha256').update(rest.join('\n')).digest('hex').slice(0, 16)}`);
+  return [...ids];
+}
+
+function failureIdsOf(output: string): string[] {
+  const tests = extractFailingTestIds(output);
+  return tests.length ? tests : failingOutputLineIds(output);
+}
+
 export type GateRegressionCheck = HarnessValidationCheck & {
   newFailureIds?: string[];
 };
@@ -689,11 +716,12 @@ export type GateRegressionCheck = HarnessValidationCheck & {
 /**
  * Split the gate's failed checks into regressions this run must answer for and
  * failures the baseline already had. A failed check is tolerated only when the
- * same command already failed on the untouched worktree AND its failing-test
- * identities are a subset of the baseline's (or neither side has comparable
- * identities). Timed-out checks are never tolerated — a partial stream proves
- * nothing about identity. Tolerated checks are marked `preexisting` in place so
- * the persisted artifact carries the verdict.
+ * same command already failed on the untouched worktree AND its failure
+ * identities (named tests, else normalized output lines) are a subset of the
+ * baseline's — or, with no output on either side, the exit code matches.
+ * Timed-out checks are never tolerated — a partial stream proves nothing about
+ * identity. Tolerated checks are marked `preexisting` in place so the persisted
+ * artifact carries the verdict.
  */
 export function computeGateRegressions(
   current: HarnessValidationCheck[],
@@ -713,11 +741,11 @@ export function computeGateRegressions(
     }
     const currentIds = check.failureIds ?? [];
     const baseIds = new Set(base.failureIds ?? []);
-    if (currentIds.length === 0 && baseIds.size === 0) {
+    if (currentIds.length === 0 && baseIds.size === 0 && check.exitCode === base.exitCode) {
       check.preexisting = true;
       tolerated.push({
         check,
-        reason: `\`${check.command}\` already failed at baseline (no comparable failure identities)`,
+        reason: `\`${check.command}\` already failed at baseline with the same exit code and no output`,
       });
       continue;
     }
@@ -739,7 +767,9 @@ export function computeGateRegressions(
  * Run the repo's configured validation commands in order, recording the real
  * status, exit code and observed output for each — the gate takes trusted
  * command output, never a model's claim. Later commands after a failure are
- * recorded as `skipped` so the evidence always covers the whole list.
+ * recorded as `skipped` so the evidence always covers the whole list — unless
+ * `continueAfter` names the failed command: one that failed at baseline too
+ * awaits the comparison, and the commands after it still need evidence.
  */
 export async function runValidationCommands(
   commands: string[],
@@ -753,6 +783,7 @@ export async function runValidationCommands(
     env?: Record<string, string>;
     logDir?: string;
     logPrefix?: string;
+    continueAfter?: ReadonlySet<string>;
   } = {},
 ): Promise<HarnessValidationCheck[]> {
   const checks: HarnessValidationCheck[] = [];
@@ -941,7 +972,7 @@ export async function runValidationCommands(
       if (exitRecordError !== undefined) throw exitRecordError;
       opts.onOutput?.(command, result.output);
       const passed = result.code === 0 && !result.timedOut;
-      if (!passed) failed = true;
+      if (!passed && !opts.continueAfter?.has(command)) failed = true;
       let logPath: string | undefined;
       if (opts.logDir) {
         try {
@@ -991,7 +1022,7 @@ export async function runValidationCommands(
             extracted || '(no output)',
             ...(logPath ? [`full output: ${logPath}`] : []),
           ].join('\n'),
-          failureIds: extractFailingTestIds(result.output),
+          failureIds: failureIdsOf(result.output),
           ...(logPath ? { logPath } : {}),
           ...(result.timedOut ? { timedOut: true } : {}),
         });

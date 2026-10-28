@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   HarnessRuntime,
   computeGateRegressions,
+  failingOutputLineIds,
   exportTrustedConfig,
   extractFailingTestIds,
   extractFailureEvidence,
@@ -215,6 +216,15 @@ describe('harness runtime bridge', () => {
       if (previous === undefined) delete process.env.CEZ_TEST_DATABASE_SECRET;
       else process.env.CEZ_TEST_DATABASE_SECRET = previous;
     }
+  });
+
+  // PR #925 review: a command red on main stopped the gate, so nothing after it was measured.
+  it('runValidationCommands continues past a failed command named in continueAfter', async () => {
+    const checks = await runValidationCommands(['echo src/a.ts: error; exit 2', 'echo after'], dir, {
+      continueAfter: new Set(['echo src/a.ts: error; exit 2']),
+    });
+    expect(checks[0]).toMatchObject({ status: 'failed', failureIds: ['line:src/a.ts: error'] });
+    expect(checks[1]).toMatchObject({ command: 'echo after', status: 'passed' });
   });
 
   it('runValidationCommands records real per-command evidence and stops on failure', async () => {
@@ -463,6 +473,18 @@ describe('harness runtime bridge', () => {
     });
   });
 
+  describe('failing output line identities', () => {
+    it('normalizes ANSI, digits and whitespace, and digests lines past the cap', () => {
+      expect(failingOutputLineIds('\u001B[31mERR\u001B[0m  12 files\n\n  ERR 7  files ')).toEqual(['line:ERR # files']);
+      const letters = (i: number) => String.fromCharCode(97 + Math.floor(i / 26)) + String.fromCharCode(97 + (i % 26));
+      const many = Array.from({ length: 450 }, (_, i) => `rule-${letters(i)}`).join('\n');
+      const ids = failingOutputLineIds(many);
+      expect(ids).toHaveLength(401);
+      expect(ids.at(-1)).toMatch(/^overflow:[0-9a-f]{16}$/);
+      expect(failingOutputLineIds(`${many}\nanother`).at(-1)).not.toBe(ids.at(-1));
+    });
+  });
+
   describe('failing-test identity extraction', () => {
     it('normalizes jest FAIL paths and turbo failed tasks, ignoring ANSI codes', () => {
       const output = [
@@ -534,10 +556,33 @@ describe('harness runtime bridge', () => {
       expect(gate.blocking).toHaveLength(1);
     });
 
-    it('tolerates a command-level repeat when neither side has comparable identities', () => {
+    it('tolerates a silent repeat only with the same exit code', () => {
       const gate = computeGateRegressions(
         [failed('yarn lint', [])],
         [failed('yarn lint', [])],
+      );
+      expect(gate.blocking).toHaveLength(0);
+      expect(gate.tolerated).toHaveLength(1);
+      const other = computeGateRegressions(
+        [{ ...failed('yarn lint', []), exitCode: 2 }],
+        [failed('yarn lint', [])],
+      );
+      expect(other.blocking).toHaveLength(1);
+    });
+
+    // PR #925 review: a different lint failure was tolerated because neither side named a test.
+    it('blocks a failure whose output lines the baseline never printed', () => {
+      const baselineIds = failingOutputLineIds('src/a.ts\n  3:7  error  no-unused-vars\n✖ 1 problem');
+      const currentIds = failingOutputLineIds('src/a.ts\n  3:7  error  no-unused-vars\nsrc/b.ts\n  9:1  error  no-undef\n✖ 2 problems');
+      const gate = computeGateRegressions([failed('yarn lint', currentIds)], [failed('yarn lint', baselineIds)]);
+      expect(gate.tolerated).toHaveLength(0);
+      expect(gate.blocking[0]?.newFailureIds).toEqual(['line:src/b.ts', 'line:#:# error no-undef', 'line:✖ # problems']);
+    });
+
+    it('guard: tolerates the same lint failure printed with different line numbers and timings', () => {
+      const gate = computeGateRegressions(
+        [failed('yarn lint', failingOutputLineIds('src/a.ts\n  4:7  error  no-unused-vars\nDone in 1.2s'))],
+        [failed('yarn lint', failingOutputLineIds('src/a.ts\n  3:7  error  no-unused-vars\nDone in 3.9s'))],
       );
       expect(gate.blocking).toHaveLength(0);
       expect(gate.tolerated).toHaveLength(1);
