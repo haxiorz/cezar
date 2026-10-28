@@ -412,28 +412,40 @@ export function reviewerOptions(options: readonly HarnessModelOption[]): Harness
 }
 
 export function defaultHarnessRoles(allOptions: readonly HarnessModelOption[]): HarnessRoles | null {
-  const options = sessionRoleOptions(allOptions)
-  const families = [...new Set(options.map((o) => o.family))]
-  if (families.length < 2 || options.length < 2) return null
+  const sessions = sessionRoleOptions(allOptions)
+  if (sessions.length === 0) return null
   // Named models first. `auto` (model '') is whatever the CLI picks on its own, and for a Codex
   // ChatGPT login that is a model the account refuses — the zero-config lineup opened blocked
   // on a red implementer (2026-09-28). `auto` stays the fallback for a family with no catalog.
-  const byFamily = (family: string) => {
-    const members = options.filter((o) => o.family === family)
-    return [...members.filter((o) => o.model !== ''), ...members.filter((o) => o.model === '')]
-  }
-  const anthropic = byFamily('anthropic')
-  const orchestrator = anthropic.find((o) => o.model === 'sonnet') ?? anthropic[0] ?? options[0]!
-  const otherFamily = families.find((f) => f !== orchestrator.family)!
-  const implementer = byFamily(otherFamily)[0]!
-  const reviewers = [
-    byFamily(orchestrator.family).find((o) => !sameRef(o, orchestrator)) ?? orchestrator,
-    implementer,
+  const named = <T extends HarnessModelOption>(members: readonly T[]): T[] => [
+    ...members.filter((o) => o.model !== ''),
+    ...members.filter((o) => o.model === ''),
   ]
+  const byFamily = <T extends HarnessModelOption>(pool: readonly T[], family: string) =>
+    named(pool.filter((o) => o.family === family))
+  const anthropic = byFamily(sessions, 'anthropic')
+  const orchestrator = anthropic.find((o) => o.model === 'sonnet') ?? anthropic[0] ?? sessions[0]!
+  const otherSessionFamily = [...new Set(sessions.map((o) => o.family))].find((f) => f !== orchestrator.family)
+  const sameFamilyAlt = byFamily(sessions, orchestrator.family).find((o) => !sameRef(o, orchestrator))
+  const implementer = otherSessionFamily ? byFamily(sessions, otherSessionFamily)[0]! : sameFamilyAlt ?? orchestrator
+  const firstReviewer = sameFamilyAlt ?? orchestrator
+  // The council needs a second family. One agent backend is enough for the sessions (PR #925
+  // review): the implementer brings it when it has one, else an OpenCode gateway reviewer, and a
+  // configured advisor only when nothing runner-backed can.
+  const pool = reviewerOptions(allOptions).filter((o) => o.family !== firstReviewer.family)
+  const secondReviewer =
+    implementer.family !== firstReviewer.family
+      ? implementer
+      : named(pool.filter((o) => o.runner !== 'harness'))[0] ?? pool.find((o) => o.runner === 'harness')
+  if (!secondReviewer) return null
+  const asRef = (option: HarnessModelOption): HarnessModelRef =>
+    option.runner === 'harness'
+      ? { runner: 'harness', model: option.model, family: option.family }
+      : { runner: option.runner, model: option.model }
   return {
     orchestrator: { runner: orchestrator.runner, model: orchestrator.model },
     implementer: { runner: implementer.runner, model: implementer.model },
-    reviewers: reviewers.map((r) => ({ runner: r.runner, model: r.model })),
+    reviewers: [asRef(firstReviewer), asRef(secondReviewer)],
   }
 }
 

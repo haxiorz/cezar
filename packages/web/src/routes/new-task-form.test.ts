@@ -683,14 +683,41 @@ describe('harness form rules (spec 2026-07-23-harness-orchestration)', () => {
     expect(sessionRoleOptions(options).map((o) => o.runner)).toEqual(['claude', 'codex'])
   })
 
-  it('a workspace of only claude + opencode cannot field a lineup, and says so', () => {
-    // Two families on paper, one seatable backend in practice. Returning null is what opens
-    // the setup dialog with "Multi-model needs a second agent backend" instead of letting the
-    // user compose something that cannot start.
+  // PR #925 review (M7): one agent backend is enough for the sessions — OpenCode cannot hold
+  // one, but it can review, and the server asks only the council for two families.
+  it('a workspace of only claude + opencode seats Claude and an OpenCode reviewer', () => {
     expect(
       defaultHarnessRoles([
         { runner: 'claude' as const, model: 'haiku', label: 'haiku', family: 'anthropic' },
         { runner: 'opencode' as const, model: 'opencode/gpt-5.6-luna', label: 'luna', family: 'openai' },
+      ]),
+    ).toEqual({
+      orchestrator: { runner: 'claude', model: 'haiku' },
+      implementer: { runner: 'claude', model: 'haiku' },
+      reviewers: [
+        { runner: 'claude', model: 'haiku' },
+        { runner: 'opencode', model: 'opencode/gpt-5.6-luna' },
+      ],
+    })
+  })
+
+  it('falls back to an advisor reviewer only when no runner can bring a second family', () => {
+    const defaults = defaultHarnessRoles([
+      { runner: 'claude' as const, model: 'sonnet', label: 'sonnet', family: 'anthropic' },
+      { runner: 'claude' as const, model: 'opus', label: 'opus', family: 'anthropic' },
+      { runner: 'harness' as const, model: 'kimi', label: 'kimi', family: 'moonshot' },
+    ])
+    expect(defaults?.reviewers).toEqual([
+      { runner: 'claude', model: 'opus' },
+      { runner: 'harness', model: 'kimi', family: 'moonshot' },
+    ])
+  })
+
+  it('guard: a single family with nothing else to review still fields no lineup', () => {
+    expect(
+      defaultHarnessRoles([
+        { runner: 'claude' as const, model: 'haiku', label: 'haiku', family: 'anthropic' },
+        { runner: 'opencode' as const, model: 'opencode/claude-fable-5', label: 'fable', family: 'anthropic' },
       ]),
     ).toBeNull()
   })

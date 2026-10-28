@@ -12,6 +12,7 @@ import { RunStore } from '../runs/store.js';
 import type { RunManager, StartRunInput } from '../workflows/run.js';
 import type { WorkflowDef } from '../workflows/types.js';
 import { connectedProviderAuth } from './provider-auth.testkit.js';
+import { opencodeSeatingError } from '../harness/reviewer-binding.js';
 import { createApp } from './server.js';
 import { agentAccountsPath } from '../paths.ts';
 import { apiRequest } from './loopback-request.testkit.js';
@@ -138,6 +139,14 @@ describe('harness API', () => {
       expect(harnessProbeInputSchema.safeParse({ roles: { ...roles, reviewers } }).success).toBe(false);
     }
     expect(harnessStartInputSchema.safeParse({ roles }).success).toBe(true);
+    // PR #925 review (M7): the lineup the composer now seats for a Claude + OpenCode workspace.
+    const claudeOnly = {
+      orchestrator: { runner: 'claude', model: 'haiku' },
+      implementer: { runner: 'claude', model: 'haiku' },
+      reviewers: [{ runner: 'claude', model: 'haiku' }, { runner: 'opencode', model: 'opencode/gpt-5.6-luna' }],
+    } as const;
+    expect(harnessStartInputSchema.safeParse({ roles: claudeOnly }).success).toBe(true);
+    expect(opencodeSeatingError(claudeOnly)).toBeNull();
     expect(harnessStartInputSchema.safeParse({ baseAcknowledgement: {
       configuredBase: 'main', remoteDefault: 'develop', reason: ' ',
     } }).success).toBe(false);
