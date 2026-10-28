@@ -3252,6 +3252,264 @@ export async function runHarnessDriver(
     });
   };
 
+  type CouncilFinding = ReviewResult['findings'][number] & { by?: string };
+
+  /**
+   * One council round — the spec and implementation councils share it. Runner reviewers fan out
+   * over one read-only subject (2026-07-25) beside the advisor council (2026-07-29); each gets its
+   * attempt budget, the subject is re-verified, the quorum gate decides, and findings merge by
+   * severity and title. `stop` is the run's error, or null when it was cancelled.
+   */
+  const runCouncilRound = async (council: {
+    kind: 'spec' | 'implementation';
+    round: number;
+    councilId: string;
+    councilName: string;
+    skill: string;
+    reviewers: HarnessReviewerRef[];
+    reviewerName: (label: string) => string;
+    /** The reviewer prompt, before the boundary-message appendix. */
+    promptText: string;
+    subjectSha256: string;
+    currentSubjectSha256: () => Promise<string | null>;
+    /** Appended to every reviewer's input hash, after the rubric. */
+    hashExtra?: Record<string, unknown>;
+    /** The advisor council's criteria, before the boundary-message appendix. */
+    advisorCriteria: string;
+    advisorArtifact?: string;
+  }): Promise<{ stop: string | null } | { verdict: 'approve' | 'request_changes'; findings: CouncilFinding[] }> => {
+    const { kind, round, councilId, skill } = council;
+    const councilWasDone = phaseDone(councilId);
+    const councilBoundaryMessages = boundaryMessagesForPhase(councilId, councilWasDone);
+    if (!councilWasDone) assignBoundaryMessages(councilId, councilBoundaryMessages);
+    const councilBoundaryAppendix = boundaryMessageAppendix(councilBoundaryMessages);
+    host.upsertStep({ id: councilId, name: council.councilName, kind: 'agent' });
+    if (!councilWasDone) {
+      startPhase(ledger, { id: councilId, name: council.councilName, kind: 'agent', skill });
+      persist();
+      host.setStepStatus(councilId, 'running');
+      emitPhase(councilId);
+    }
+    const promptText = `${council.promptText}${councilBoundaryAppendix}`;
+    const rubricSha256 = skillHash(skill);
+    const councilReviewers: Array<Record<string, unknown>> = [];
+    const outcomes: CouncilOutcome[] = [];
+    const split = splitReviewers(council.reviewers);
+    const emitCouncil = (extra: { verdict: 'approve' | 'request_changes' | null; findings?: CouncilFinding[] }) =>
+      host.emit({
+        type: 'harness.council.updated',
+        stepId: councilId,
+        council: { round, kind, reviewers: councilReviewers, ...extra },
+      });
+    const runnerWork = pool(split.sessions, MAX_PARALLEL_REVIEWERS, containReviewerThrow(councilId, outcomes, councilReviewers, async (reviewer, idx) => {
+      if (host.isCancelled()) return;
+      const label = roleRefId(reviewer);
+      const resultPath = ownResultPath(`phase-${councilId}-r${idx + 1}`);
+      const renderedPrompt = `${promptText
+        .replaceAll('$CEZ_HARNESS_RESULT_FILE', resultPath)
+        .replaceAll('$CEZ_HARNESS_ARTIFACT_DIR', dirname(resultPath))}\n\n${phaseLocationContract(skill, dirname(resultPath))}\n\n${PHASE_SESSION_CONTRACT}`;
+      const budgetError = promptBudgetError(completeModelPrompt(skill, renderedPrompt));
+      if (budgetError) {
+        outcomes.push({ label, family: councilFamilyOf(reviewer), status: 'failed', reason: budgetError });
+        councilReviewers.push({ id: label, status: 'failed', reason: budgetError });
+        return;
+      }
+      const invocationId = `reviewer:${councilId}:${label}`;
+      const inputSha256 = sha256(
+        JSON.stringify({
+          inputHashVersion: 2,
+          kind: `${kind}-review`,
+          phaseId: councilId,
+          reviewer,
+          prompt: renderedPrompt,
+          subjectSha256: council.subjectSha256,
+          rubricSha256,
+          ...council.hashExtra,
+        }),
+      );
+      let parsed = reusableInvocation(invocationId, inputSha256, reviewResultSchema);
+      if (parsed !== null) {
+        host.emit({ type: 'note', stepId: councilId, message: `reused completed reviewer ${label} from the durable ledger` });
+      }
+      const priorAttempts = attemptsForInput(invocationId, inputSha256);
+      // "Proceed with the survivors" ignores a reviewer that already failed: paying for it
+      // again before the decision applies is what the user declined (PR #925 review).
+      const proceeding =
+        reviewerFailedBefore(invocationId, inputSha256) &&
+        councilProceedAccepted(kind, round, council.subjectSha256);
+      let lastFailure: string | null = proceeding ? priorReviewerFailure(invocationId) : null;
+      let lastContractFailure: string | null = null;
+      for (
+        let attempt = priorAttempts + 1;
+        // A recorded `council.retry` decision extends the budget of 2.
+        !proceeding && attempt <= 2 + councilRetryAllowance(kind, round, council.subjectSha256) && parsed === null;
+        attempt += 1
+      ) {
+        const attemptPrompt =
+          attempt > 1 && lastContractFailure
+            ? `${renderedPrompt}${resultContractRetryAppendix(lastContractFailure, resultPath, false)}`
+            : renderedPrompt;
+        const attemptBudgetError = promptBudgetError(completeModelPrompt(skill, attemptPrompt));
+        if (attemptBudgetError) {
+          lastFailure = attemptBudgetError;
+          break;
+        }
+        const invocation = beginInvocation({
+          id: invocationId,
+          phaseId: councilId,
+          role: 'reviewer',
+          reviewerId: label,
+          binding: {
+            runner: reviewer.runner,
+            model: reviewer.model || undefined,
+            effort: reviewer.effort,
+            family: councilFamilyOf(reviewer),
+          },
+          inputSha256,
+          prompt: completeModelPrompt(skill, attemptPrompt),
+        });
+        // A failed prior attempt can leave a result file behind; attempt 2 of run 0fe16fb7 read
+        // one, announced "the file already exists", and set about editing it. Every attempt starts clean.
+        rmSync(resultPath, { recursive: true, force: true });
+        const failure = await runReadOnlyReviewer(invocation, {
+          concurrent: true,
+          phaseId: councilId,
+          name: council.reviewerName(label),
+          skill,
+          prompt: attemptPrompt,
+          resultPath,
+          timeoutMs: PHASE_TIMEOUTS_MS.review ?? 30 * 60_000,
+          env: { CEZ_HARNESS_RESULT_FILE: resultPath, CEZ_HARNESS_ARTIFACT_DIR: dirname(resultPath) },
+          runner: reviewer.runner,
+          model: reviewer.model,
+          effort: reviewer.effort,
+        });
+        if (host.isCancelled()) {
+          finishInvocation(invocation, 'interrupted', { error: 'run cancelled' });
+          return;
+        }
+        if (failure) {
+          lastFailure = failure;
+          const limited = isUsageLimitMessage(failure);
+          finishInvocation(invocation, limited || classifyAgentFailure(failure) === 'transient' ? 'interrupted' : 'failed', { error: failure });
+          if (limited || !isRetryableReviewerFailure(failure)) break;
+          // The subject changed under this reviewer and stayed changed: the round is void, so a
+          // retry would only pay to review an edit no gate validated (PR #925 review).
+          if (failure.startsWith(REVIEWER_MUTATION_FAILURE) && (await council.currentSubjectSha256()) !== council.subjectSha256) break;
+          continue;
+        }
+        const read = readReviewResultFile(resultPath);
+        parsed = read.result;
+        if (read.salvaged) {
+          host.emit({
+            type: 'note',
+            stepId: councilId,
+            message: `reviewer ${label} wrapped its result JSON in prose — salvaged the embedded review`,
+          });
+        }
+        if (parsed === null) {
+          lastFailure = read.failure ?? 'ended without a valid result file';
+          lastContractFailure = lastFailure.replace(/^the session /, '');
+          finishInvocation(invocation, 'failed', { error: lastFailure });
+        } else {
+          finishInvocation(invocation, 'completed', { artifactPath: resultPath, modelId: label });
+        }
+      }
+      if (parsed === null) {
+        const reason = lastFailure ?? priorReviewerFailure(invocationId);
+        outcomes.push({ label, family: councilFamilyOf(reviewer), status: 'failed', reason });
+        councilReviewers.push({ id: label, ...reviewer, status: 'failed', reason, freshContext: true });
+        host.emit({
+          type: 'note',
+          stepId: councilId,
+          message: `reviewer ${label} produced no review (${reason}) — continuing with the rest of the council`,
+        });
+        return;
+      }
+      outcomes.push({ label, family: councilFamilyOf(reviewer), status: 'completed' });
+      const coerced = coerceReviewVerdict(parsed);
+      councilReviewers.push({
+        id: label,
+        ...reviewer,
+        status: 'completed',
+        freshContext: true,
+        verdict: coerced.verdict,
+        findings: parsed.findings,
+      });
+      if (coerced.coercedFrom) {
+        host.emit({
+          type: 'note',
+          stepId: councilId,
+          message:
+            `reviewer ${label} reported "${coerced.coercedFrom}" alongside its own ` +
+            `blocker/major findings — verdict coerced to "${coerced.verdict}"`,
+        });
+      }
+      emitCouncil({ verdict: null });
+    }));
+    const advisorWork =
+      split.members.length > 0 && !host.isCancelled()
+        ? runAdvisorCouncilOpWithRetry({
+            kindTag: kind === 'spec' ? 'spec' : 'impl',
+            round,
+            members: split.members,
+            retryAllowance: councilRetryAllowance(kind, round, council.subjectSha256),
+            proceedAccepted: councilProceedAccepted(kind, round, council.subjectSha256),
+            criteriaText: `${council.advisorCriteria}${councilBoundaryAppendix}`,
+            ...(council.advisorArtifact ? { artifact: council.advisorArtifact } : {}),
+          })
+        : null;
+    const advisorRun = await settleCouncilGroups(runnerWork, advisorWork);
+    // A cancelled reviewer records no outcome: gating on the survivors would park a
+    // stopped run on a false "below quorum" decision (PR #925 review).
+    if (host.isCancelled()) return { stop: null };
+    const subjectIssue = await councilSubjectIssue(council.subjectSha256, council.currentSubjectSha256);
+    if (subjectIssue) {
+      finishPhase(ledger, councilId, 'failed', subjectIssue);
+      persist();
+      host.setStepStatus(councilId, 'failed', subjectIssue);
+      emitPhase(councilId);
+      return { stop: subjectIssue };
+    }
+    if (advisorWork !== null) {
+      if (advisorRun === null) return { stop: null };
+      foldAdvisorRun(advisorRun, split.members, outcomes, councilReviewers, councilId);
+      if (!advisorRun.error) emitCouncil({ verdict: null });
+    }
+    const gate = resolveCouncilGate(kind, round, outcomes, councilId, council.subjectSha256);
+    if (!gate.proceed) {
+      finishPhase(ledger, councilId, 'failed', gate.error);
+      upsertCouncil(kind, round, { round, kind, reviewers: councilReviewers, verdict: null });
+      persist();
+      host.setStepStatus(councilId, 'failed', gate.error);
+      emitPhase(councilId);
+      return { stop: gate.error };
+    }
+    const byKey = new Map<string, CouncilFinding>();
+    for (const entry of councilReviewers) {
+      const label = entry.id as string;
+      for (const finding of (entry.findings as ReviewResult['findings'] | undefined) ?? []) {
+        const key = `${finding.severity}|${finding.title}`;
+        const current = byKey.get(key);
+        if (current) current.by = `${current.by}, ${label}`;
+        else byKey.set(key, { ...finding, by: label });
+      }
+    }
+    const findings = [...byKey.values()];
+    const verdict: 'approve' | 'request_changes' = councilReviewers.some((r) => r.verdict === 'request_changes')
+      ? 'request_changes'
+      : 'approve';
+    finishPhase(ledger, councilId, 'done');
+    upsertCouncil(kind, round, { round, kind, reviewers: councilReviewers, verdict, findings });
+    const consumedMessageIds = completeBoundaryMessages(councilId, councilBoundaryMessages);
+    persist();
+    host.setStepStatus(councilId, 'done');
+    emitPhase(councilId);
+    emitBoundaryMessagesConsumed(councilId, consumedMessageIds);
+    emitCouncil({ verdict, findings });
+    return { verdict, findings };
+  };
+
   const findingsPrompt = (name: string, findings: readonly ReviewResult['findings'][number][]): string => {
     const path = join(artifactDir, `findings-${name}.json`);
     writeJsonAtomic(path, findings);
@@ -3693,9 +3951,6 @@ export async function runHarnessDriver(
           saveSpecRounds(sround + 1, sround === MAX_SPEC_ROUNDS ? { done: true } : {});
           return undefined;
         };
-        const specSplit = splitReviewers(roles.reviewers);
-        const specRunnerReviewers = specSplit.sessions;
-        const specCouncilMembers = specSplit.members;
         const firstSpecRound = recordedSpecRounds?.round ?? 1;
         // A finished loop is history: implementation already built on its spec.
         for (
@@ -3731,29 +3986,15 @@ export async function runHarnessDriver(
           writeFileSync(specArtifact, specBytes);
           const councilId = sround === 1 ? 'spec-review' : `spec-review-${sround}`;
           const councilName = `Spec council (round ${sround})`;
-          const councilWasDone = phaseDone(councilId);
-          const councilBoundaryMessages = boundaryMessagesForPhase(
+          const specRound = await runCouncilRound({
+            kind: 'spec',
+            round: sround,
             councilId,
-            councilWasDone,
-          );
-          if (!councilWasDone) {
-            assignBoundaryMessages(councilId, councilBoundaryMessages);
-          }
-          const councilBoundaryAppendix =
-            boundaryMessageAppendix(councilBoundaryMessages);
-          host.upsertStep({ id: councilId, name: councilName, kind: 'agent' });
-          if (!councilWasDone) {
-            startPhase(ledger, {
-              id: councilId,
-              name: councilName,
-              kind: 'agent',
-              skill: phaseSkills.preImplement,
-            });
-            persist();
-            host.setStepStatus(councilId, 'running');
-            emitPhase(councilId);
-          }
-          const specPromptText = `${[
+            councilName,
+            skill: phaseSkills.preImplement,
+            reviewers: roles.reviewers,
+            reviewerName: (label) => `${councilName} — ${label}`,
+            promptText: [
               `You are a FRESH review context. Audit the feature SPECIFICATION at ${specPath} (read it from this worktree) to staff-engineer standard, following the already-injected ${phaseSkills.preImplement} instructions in full: risks, backward compatibility, security, data/API contracts, migration and rollback safety, testability, gaps, implementation-readiness, and simplicity.`,
               ``,
               `The feature brief: ${input.task}`,
@@ -3761,256 +4002,21 @@ export async function runHarnessDriver(
               `When you are done write a JSON result file at the path in $CEZ_HARNESS_RESULT_FILE of the shape:`,
               `{"verdict": "approve" | "request_changes", "findings": [{"severity": "blocker|major|minor|nit", "title": "…", "location": "path:line", "evidence": "…"}]}`,
               `Any blocker or major finding means "request_changes"; only minor/nit findings (or none) means "approve".`,
-            ].join('\n')}${councilBoundaryAppendix}`;
-          const councilReviewers: Array<Record<string, unknown>> = [];
-          const outcomes: CouncilOutcome[] = [];
-          // Reviewers fan out (2026-07-25, parity with the om runtime's
-          // `pool(profile.reviewers, maxParallel)`): they are independent fresh
-          // contexts over the same read-only subject, so serializing them only
-          // multiplied the wall clock by the reviewer count. The advisor
-          // council launches alongside this pool (2026-07-29) for the same
-          // reason — the groups share nothing but the read-only subject.
-          const specRunnerWork = pool(specRunnerReviewers, MAX_PARALLEL_REVIEWERS, containReviewerThrow(councilId, outcomes, councilReviewers, async (reviewer, idx) => {
-            if (host.isCancelled()) return;
-            const label = roleRefId(reviewer);
-            const resultPath = ownResultPath(`phase-${councilId}-r${idx + 1}`);
-            const renderedPrompt = `${specPromptText.replaceAll('$CEZ_HARNESS_RESULT_FILE', resultPath)}\n\n${phaseLocationContract(phaseSkills.preImplement, dirname(resultPath))}\n\n${PHASE_SESSION_CONTRACT}`;
-            const budgetError = promptBudgetError(
-              completeModelPrompt(phaseSkills.preImplement, renderedPrompt),
-            );
-            if (budgetError) {
-              outcomes.push({ label, family: councilFamilyOf(reviewer), status: 'failed', reason: budgetError });
-              councilReviewers.push({ id: label, status: 'failed', reason: budgetError });
-              return;
-            }
-            const invocationId = `reviewer:${councilId}:${label}`;
-            const inputSha256 = sha256(
-              JSON.stringify({
-                inputHashVersion: 2,
-                kind: 'spec-review',
-                phaseId: councilId,
-                reviewer,
-                prompt: renderedPrompt,
-                subjectSha256: specSubjectSha256,
-                rubricSha256: skillHash(phaseSkills.preImplement),
-              }),
-            );
-            let parsed = reusableInvocation(invocationId, inputSha256, reviewResultSchema);
-            if (parsed !== null) {
-              host.emit({
-                type: 'note',
-                stepId: councilId,
-                message: `reused completed reviewer ${label} from the durable ledger`,
-              });
-            }
-            const priorAttempts = attemptsForInput(invocationId, inputSha256);
-            // "Proceed with the survivors" ignores a reviewer that already failed: paying for it
-            // again before the decision applies is what the user declined (PR #925 review).
-            const proceeding =
-              reviewerFailedBefore(invocationId, inputSha256) &&
-              councilProceedAccepted('spec', sround, specSubjectSha256);
-            let lastFailure: string | null = proceeding ? priorReviewerFailure(invocationId) : null;
-            let lastContractFailure: string | null = null;
-            for (
-              let attempt = priorAttempts + 1;
-              // A recorded `council.retry` decision extends the budget of 2.
-              !proceeding && attempt <= 2 + councilRetryAllowance('spec', sround, specSubjectSha256) && parsed === null;
-              attempt += 1
-            ) {
-              const attemptPrompt =
-                attempt > 1 && lastContractFailure
-                  ? `${renderedPrompt}${resultContractRetryAppendix(lastContractFailure, resultPath, false)}`
-                  : renderedPrompt;
-              const attemptBudgetError = promptBudgetError(
-                completeModelPrompt(phaseSkills.preImplement, attemptPrompt),
-              );
-              if (attemptBudgetError) {
-                lastFailure = attemptBudgetError;
-                break;
-              }
-              const invocation = beginInvocation({
-                id: invocationId,
-                phaseId: councilId,
-                role: 'reviewer',
-                reviewerId: label,
-                binding: {
-                  runner: reviewer.runner,
-                  model: reviewer.model || undefined,
-                  effort: reviewer.effort,
-                  family: councilFamilyOf(reviewer),
-                },
-                inputSha256,
-                prompt: completeModelPrompt(phaseSkills.preImplement, attemptPrompt),
-              });
-              // A failed prior attempt can leave a result file behind; attempt 2 of run
-              // 0fe16fb7 read one, announced "the file already exists", and set about
-              // editing it instead of writing the contract. Every attempt starts clean.
-              rmSync(resultPath, { recursive: true, force: true });
-              const failure = await runReadOnlyReviewer(invocation, {
-                concurrent: true,
-                phaseId: councilId,
-                name: `${councilName} — ${label}`,
-                skill: phaseSkills.preImplement,
-                prompt: attemptPrompt,
-                resultPath,
-                timeoutMs: PHASE_TIMEOUTS_MS.review ?? 30 * 60_000,
-                env: { CEZ_HARNESS_RESULT_FILE: resultPath, CEZ_HARNESS_ARTIFACT_DIR: dirname(resultPath) },
-                runner: reviewer.runner,
-                model: reviewer.model,
-                effort: reviewer.effort,
-              });
-              if (host.isCancelled()) {
-                finishInvocation(invocation, 'interrupted', { error: 'run cancelled' });
-                return;
-              }
-              if (failure) {
-                lastFailure = failure;
-                const limited = isUsageLimitMessage(failure);
-                finishInvocation(invocation, limited || classifyAgentFailure(failure) === 'transient' ? 'interrupted' : 'failed', { error: failure });
-                if (limited || !isRetryableReviewerFailure(failure)) break;
-                // The spec changed under this reviewer: the round is void, so a retry buys nothing.
-                if (failure.startsWith(REVIEWER_MUTATION_FAILURE) && hashFile(join(host.cwd, specPath)) !== specSubjectSha256) break;
-                continue;
-              }
-              const read = readReviewResultFile(resultPath);
-              parsed = read.result;
-              if (read.salvaged) {
-                host.emit({
-                  type: 'note',
-                  stepId: councilId,
-                  message: `reviewer ${label} wrapped its result JSON in prose — salvaged the embedded review`,
-                });
-              }
-              if (parsed === null) {
-                lastFailure = read.failure ?? 'ended without a valid result file';
-                lastContractFailure = lastFailure.replace(/^the session /, '');
-                finishInvocation(invocation, 'failed', { error: lastFailure });
-              } else {
-                finishInvocation(invocation, 'completed', { artifactPath: resultPath, modelId: label });
-              }
-            }
-            if (parsed === null) {
-              const reason = lastFailure ?? priorReviewerFailure(invocationId);
-              outcomes.push({ label, family: councilFamilyOf(reviewer), status: 'failed', reason });
-              councilReviewers.push({ id: label, ...reviewer, status: 'failed', reason, freshContext: true });
-              host.emit({
-                type: 'note',
-                stepId: councilId,
-                message: `reviewer ${label} produced no review (${reason}) — continuing with the rest of the council`,
-              });
-              return;
-            }
-            outcomes.push({ label, family: councilFamilyOf(reviewer), status: 'completed' });
-            const specCoerced = coerceReviewVerdict(parsed);
-            councilReviewers.push({
-              id: label,
-              ...reviewer,
-              status: 'completed',
-              freshContext: true,
-              verdict: specCoerced.verdict,
-              findings: parsed.findings,
-            });
-            if (specCoerced.coercedFrom) {
-              host.emit({
-                type: 'note',
-                stepId: councilId,
-                message:
-                  `reviewer ${label} reported "${specCoerced.coercedFrom}" alongside its own ` +
-                  `blocker/major findings — verdict coerced to "${specCoerced.verdict}"`,
-              });
-            }
-            host.emit({
-              type: 'harness.council.updated',
-              stepId: councilId,
-              council: { round: sround, kind: 'spec', reviewers: councilReviewers, verdict: null },
-            });
-          }));
-          const specAdvisorWork =
-            specCouncilMembers.length > 0 && !host.isCancelled()
-              ? runAdvisorCouncilOpWithRetry({
-                  kindTag: 'spec',
-                  round: sround,
-                  members: specCouncilMembers,
-                  retryAllowance: councilRetryAllowance('spec', sround, specSubjectSha256),
-                  proceedAccepted: councilProceedAccepted('spec', sround, specSubjectSha256),
-                  criteriaText: `${[
-                      `Spec council criteria (run ${host.runId}).`,
-                      ``,
-                      `The subject is the feature SPECIFICATION at ${specPath} — not a code diff.`,
-                      `Feature brief: ${input.task}`,
-                      ``,
-                      `Judge risks, backward compatibility, gaps, implementation-readiness, and simplicity.`,
-                    ].join('\n')}${councilBoundaryAppendix}`,
-                  artifact: specArtifact,
-                })
-              : null;
-          const specAdvisorRun = await settleCouncilGroups(specRunnerWork, specAdvisorWork);
-          // A cancelled reviewer records no outcome: gating on the survivors would park a
-          // stopped run on a false "below quorum" decision (PR #925 review).
-          if (host.isCancelled()) return null;
-          const specSubjectIssue = await councilSubjectIssue(specSubjectSha256, async () => hashFile(join(host.cwd, specPath)));
-          if (specSubjectIssue) {
-            finishPhase(ledger, councilId, 'failed', specSubjectIssue);
-            persist();
-            host.setStepStatus(councilId, 'failed', specSubjectIssue);
-            emitPhase(councilId);
-            return specSubjectIssue;
-          }
-          if (specAdvisorWork !== null) {
-            if (specAdvisorRun === null) return null;
-            foldAdvisorRun(specAdvisorRun, specCouncilMembers, outcomes, councilReviewers, councilId);
-          }
-          const gate = resolveCouncilGate('spec', sround, outcomes, councilId, specSubjectSha256);
-          if (!gate.proceed) {
-            finishPhase(ledger, councilId, 'failed', gate.error);
-            upsertCouncil('spec', sround, {
-              round: sround,
-              kind: 'spec',
-              reviewers: councilReviewers,
-              verdict: null,
-            });
-            persist();
-            host.setStepStatus(councilId, 'failed', gate.error);
-            emitPhase(councilId);
-            return gate.error;
-          }
-          const byKey = new Map<string, AttributedFinding>();
-          for (const entry of councilReviewers) {
-            const label = entry.id as string;
-            for (const finding of (entry.findings as ReviewResult['findings'] | undefined) ?? []) {
-              const key = `${finding.severity}|${finding.title}`;
-              const current = byKey.get(key);
-              if (current) current.by = `${current.by}, ${label}`;
-              else byKey.set(key, { ...finding, by: label });
-            }
-          }
-          const specFindings = [...byKey.values()];
-          const specVerdict: 'approve' | 'request_changes' = councilReviewers.some(
-            (r) => r.verdict === 'request_changes',
-          )
-            ? 'request_changes'
-            : 'approve';
-          finishPhase(ledger, councilId, 'done');
-          upsertCouncil('spec', sround, {
-            round: sround,
-            kind: 'spec',
-            reviewers: councilReviewers,
-            verdict: specVerdict,
-            findings: specFindings,
+            ].join('\n'),
+            subjectSha256: specSubjectSha256,
+            currentSubjectSha256: async () => hashFile(join(host.cwd, specPath)),
+            advisorCriteria: [
+              `Spec council criteria (run ${host.runId}).`,
+              ``,
+              `The subject is the feature SPECIFICATION at ${specPath} — not a code diff.`,
+              `Feature brief: ${input.task}`,
+              ``,
+              `Judge risks, backward compatibility, gaps, implementation-readiness, and simplicity.`,
+            ].join('\n'),
+            advisorArtifact: specArtifact,
           });
-          const consumedMessageIds = completeBoundaryMessages(
-            councilId,
-            councilBoundaryMessages,
-          );
-          persist();
-          host.setStepStatus(councilId, 'done');
-          emitPhase(councilId);
-          emitBoundaryMessagesConsumed(councilId, consumedMessageIds);
-          host.emit({
-            type: 'harness.council.updated',
-            stepId: councilId,
-            council: { round: sround, kind: 'spec', reviewers: councilReviewers, verdict: specVerdict, findings: specFindings },
-          });
+          if ('stop' in specRound) return specRound.stop;
+          const { verdict: specVerdict, findings: specFindings } = specRound;
           if (specVerdict === 'approve') {
             saveSpecRounds(sround, { done: true });
             break;
@@ -4560,9 +4566,6 @@ export async function runHarnessDriver(
         setOutcome({ status: 'blocked', blockingReasons: [reason] });
         return reason;
       }
-      const codeReviewRubricSha256 =
-        skillHash(phaseSkills.codeReview);
-
       const reviewPromptText = [
         `You are a FRESH review context with no implementation transcript — review this worktree's complete uncommitted diff against the base branch, following the already-injected ${phaseSkills.codeReview} instructions in full.`,
         ``,
@@ -4592,298 +4595,35 @@ export async function runHarnessDriver(
           }`;
         }
         const councilName = `Council review (round ${round})`;
-        const councilWasDone = phaseDone(reviewId);
-        const councilBoundaryMessages = boundaryMessagesForPhase(
-          reviewId,
-          councilWasDone,
-        );
-        if (!councilWasDone) {
-          assignBoundaryMessages(reviewId, councilBoundaryMessages);
-        }
-        const councilBoundaryAppendix =
-          boundaryMessageAppendix(councilBoundaryMessages);
-        const councilReviewPromptText =
-          `${reviewPromptText}${councilBoundaryAppendix}`;
-        host.upsertStep({ id: reviewId, name: councilName, kind: 'agent' });
-        if (!councilWasDone) {
-          startPhase(ledger, {
-            id: reviewId,
-            name: councilName,
-            kind: 'agent',
-            skill: phaseSkills.codeReview,
-          });
-          persist();
-          host.setStepStatus(reviewId, 'running');
-          emitPhase(reviewId);
-        }
-        const councilReviewers: Array<Record<string, unknown>> = [];
-        const outcomes: CouncilOutcome[] = [];
-        const implSplit = splitReviewers(roles.reviewers);
-        const runnerReviewers = implSplit.sessions;
-        const implCouncilMembers = implSplit.members;
-        // Same fan-out as the spec council: independent fresh contexts over
-        // one read-only subject, so they run side by side (2026-07-25) — and
-        // the advisor council launches ALONGSIDE this pool (2026-07-29): the
-        // two groups review the same read-only subject, so serializing them
-        // only added the slower group's wall clock to the faster one's.
-        const runnerReviewerWork = pool(runnerReviewers, MAX_PARALLEL_REVIEWERS, containReviewerThrow(reviewId, outcomes, councilReviewers, async (reviewer, idx) => {
-          if (host.isCancelled()) return;
-          const label = roleRefId(reviewer);
-          const resultPath = ownResultPath(`phase-${reviewId}-r${idx + 1}`);
-          const renderedPrompt = `${councilReviewPromptText
-            .replaceAll('$CEZ_HARNESS_RESULT_FILE', resultPath)
-            .replaceAll('$CEZ_HARNESS_ARTIFACT_DIR', dirname(resultPath))}\n\n${phaseLocationContract(phaseSkills.codeReview, dirname(resultPath))}\n\n${PHASE_SESSION_CONTRACT}`;
-          const budgetError = promptBudgetError(
-            completeModelPrompt(phaseSkills.codeReview, renderedPrompt),
-          );
-          if (budgetError) {
-            outcomes.push({ label, family: councilFamilyOf(reviewer), status: 'failed', reason: budgetError });
-            councilReviewers.push({ id: label, status: 'failed', reason: budgetError });
-            return;
-          }
-          const invocationId = `reviewer:${reviewId}:${label}`;
-          const inputSha256 = sha256(
-            JSON.stringify({
-              inputHashVersion: 2,
-              kind: 'implementation-review',
-              phaseId: reviewId,
-              reviewer,
-              prompt: renderedPrompt,
-              subjectSha256: implementationSubjectSha256,
-              rubricSha256: codeReviewRubricSha256,
-              validationEvidenceSha256,
-            }),
-          );
-          let parsed = reusableInvocation(invocationId, inputSha256, reviewResultSchema);
-          if (parsed !== null) {
-            host.emit({
-              type: 'note',
-              stepId: reviewId,
-              message: `reused completed reviewer ${label} from the durable ledger`,
-            });
-          }
-          const priorAttempts = attemptsForInput(invocationId, inputSha256);
-          // "Proceed with the survivors" ignores a reviewer that already failed: paying for it
-          // again before the decision applies is what the user declined (PR #925 review).
-          const proceeding =
-            reviewerFailedBefore(invocationId, inputSha256) &&
-            councilProceedAccepted('implementation', round, implementationSubjectSha256);
-          let lastFailure: string | null = proceeding ? priorReviewerFailure(invocationId) : null;
-          let lastContractFailure: string | null = null;
-          for (
-            let attempt = priorAttempts + 1;
-            // A recorded `council.retry` decision extends the budget of 2.
-            !proceeding && attempt <= 2 + councilRetryAllowance('implementation', round, implementationSubjectSha256) && parsed === null;
-            attempt += 1
-          ) {
-            const attemptPrompt =
-              attempt > 1 && lastContractFailure
-                ? `${renderedPrompt}${resultContractRetryAppendix(lastContractFailure, resultPath, false)}`
-                : renderedPrompt;
-            const attemptBudgetError = promptBudgetError(
-              completeModelPrompt(phaseSkills.codeReview, attemptPrompt),
-            );
-            if (attemptBudgetError) {
-              lastFailure = attemptBudgetError;
-              break;
-            }
-            const invocation = beginInvocation({
-              id: invocationId,
-              phaseId: reviewId,
-              role: 'reviewer',
-              reviewerId: label,
-              binding: {
-                runner: reviewer.runner,
-                model: reviewer.model || undefined,
-                effort: reviewer.effort,
-                family: councilFamilyOf(reviewer),
-              },
-              inputSha256,
-              prompt: completeModelPrompt(phaseSkills.codeReview, attemptPrompt),
-            });
-            // Same lesson as the spec council (run 0fe16fb7): a failed prior
-            // attempt can leave a result file behind that derails attempt 2.
-            rmSync(resultPath, { recursive: true, force: true });
-            const failure = await runReadOnlyReviewer(invocation, {
-              concurrent: true,
-              phaseId: reviewId,
-              name: `Review — ${label}`,
-              skill: phaseSkills.codeReview,
-              prompt: attemptPrompt,
-              resultPath,
-              timeoutMs: PHASE_TIMEOUTS_MS.review ?? 30 * 60_000,
-              env: { CEZ_HARNESS_RESULT_FILE: resultPath, CEZ_HARNESS_ARTIFACT_DIR: dirname(resultPath) },
-              runner: reviewer.runner,
-              model: reviewer.model,
-              effort: reviewer.effort,
-            });
-            if (host.isCancelled()) {
-              finishInvocation(invocation, 'interrupted', { error: 'run cancelled' });
-              return;
-            }
-            if (failure) {
-              lastFailure = failure;
-              const limited = isUsageLimitMessage(failure);
-              finishInvocation(invocation, limited || classifyAgentFailure(failure) === 'transient' ? 'interrupted' : 'failed', { error: failure });
-              if (limited || !isRetryableReviewerFailure(failure)) break;
-              // The subject changed under this reviewer and stayed changed: the round is void, so a
-              // retry would only pay to review an edit no gate validated (PR #925 review).
-              if (
-                failure.startsWith(REVIEWER_MUTATION_FAILURE) &&
-                (await snapshotReviewSubject(host.cwd)) !== implementationSubjectSha256
-              ) {
-                break;
-              }
-              continue;
-            }
-            const read = readReviewResultFile(resultPath);
-            parsed = read.result;
-            if (read.salvaged) {
-              host.emit({
-                type: 'note',
-                stepId: reviewId,
-                message: `reviewer ${label} wrapped its result JSON in prose — salvaged the embedded review`,
-              });
-            }
-            if (parsed === null) {
-              lastFailure = read.failure ?? 'ended without a valid result file';
-              lastContractFailure = lastFailure.replace(/^the session /, '');
-              finishInvocation(invocation, 'failed', { error: lastFailure });
-            } else {
-              finishInvocation(invocation, 'completed', { artifactPath: resultPath, modelId: label });
-            }
-          }
-          if (parsed === null) {
-            const reason = lastFailure ?? priorReviewerFailure(invocationId);
-            outcomes.push({ label, family: councilFamilyOf(reviewer), status: 'failed', reason });
-            councilReviewers.push({ id: label, ...reviewer, status: 'failed', reason, freshContext: true });
-            host.emit({
-              type: 'note',
-              stepId: reviewId,
-              message: `reviewer ${label} produced no review (${reason}) — continuing with the rest of the council`,
-            });
-            return;
-          }
-          outcomes.push({ label, family: councilFamilyOf(reviewer), status: 'completed' });
-          const implCoerced = coerceReviewVerdict(parsed);
-          councilReviewers.push({
-            id: label,
-            ...reviewer,
-            status: 'completed',
-            freshContext: true,
-            verdict: implCoerced.verdict,
-            findings: parsed.findings,
-          });
-          if (implCoerced.coercedFrom) {
-            host.emit({
-              type: 'note',
-              stepId: reviewId,
-              message:
-                `reviewer ${label} reported "${implCoerced.coercedFrom}" alongside its own ` +
-                `blocker/major findings — verdict coerced to "${implCoerced.verdict}"`,
-            });
-          }
-          host.emit({
-            type: 'harness.council.updated',
-            stepId: reviewId,
-            council: { round, kind: 'implementation', reviewers: councilReviewers, verdict: null },
-          });
-        }));
-        // Advisor reviewers (spec 2026-07-24-advisor-reviewers): one
-        // packet-less runtime council over the worktree diff — the same
-        // subject the runner sessions reviewed, launched concurrently with them.
-        const advisorWork =
-          implCouncilMembers.length > 0 && !host.isCancelled()
-            ? runAdvisorCouncilOpWithRetry({
-                kindTag: 'impl',
-                round,
-                members: implCouncilMembers,
-                retryAllowance: councilRetryAllowance('implementation', round, implementationSubjectSha256),
-                proceedAccepted: councilProceedAccepted('implementation', round, implementationSubjectSha256),
-                criteriaText: `${[
-                    `Role-based cezar council criteria (run ${host.runId}).`,
-                    ``,
-                    `The task under review: ${input.task}`,
-                    `Validation gate: ${
-                      ledger.validation.length === 0
-                        ? 'no commands configured'
-                        : ledger.validation.map((c) => `${c.command} → ${c.status}${c.preexisting ? ' (failed at baseline too — tolerated as pre-existing)' : ''}`).join('; ')
-                    }`,
-                    `Validation evidence sha256: ${validationEvidenceSha256}`,
-                    ``,
-                    `Review the worktree's uncommitted diff (the subject) against these facts.`,
-                  ].join('\n')}${priorRoundsAppendix()}${councilBoundaryAppendix}`,
-              })
-            : null;
-        const settledAdvisorRun = await settleCouncilGroups(runnerReviewerWork, advisorWork);
-        // See the spec council: a stop is not a reviewer failure (PR #925 review).
-        if (host.isCancelled()) return null;
-        const implSubjectIssue = await councilSubjectIssue(implementationSubjectSha256, () => snapshotReviewSubject(host.cwd));
-        if (implSubjectIssue) {
-          finishPhase(ledger, reviewId, 'failed', implSubjectIssue);
-          persist();
-          host.setStepStatus(reviewId, 'failed', implSubjectIssue);
-          emitPhase(reviewId);
-          return implSubjectIssue;
-        }
-        if (advisorWork !== null) {
-          if (settledAdvisorRun === null) return null;
-          foldAdvisorRun(settledAdvisorRun, implCouncilMembers, outcomes, councilReviewers, reviewId);
-          if (!settledAdvisorRun.error) {
-            host.emit({
-              type: 'harness.council.updated',
-              stepId: reviewId,
-              council: { round, kind: 'implementation', reviewers: councilReviewers, verdict: null },
-            });
-          }
-        }
-        const gate = resolveCouncilGate('implementation', round, outcomes, reviewId, implementationSubjectSha256);
-        if (!gate.proceed) {
-          finishPhase(ledger, reviewId, 'failed', gate.error);
-          upsertCouncil('implementation', round, {
-            round,
-            kind: 'implementation',
-            reviewers: councilReviewers,
-            verdict: null,
-          });
-          persist();
-          host.setStepStatus(reviewId, 'failed', gate.error);
-          emitPhase(reviewId);
-          return gate.error;
-        }
-        const byKey = new Map<string, AttributedFinding>();
-        for (const entry of councilReviewers) {
-          const label = entry.id as string;
-          for (const finding of (entry.findings as ReviewResult['findings'] | undefined) ?? []) {
-            const key = `${finding.severity}|${finding.title}`;
-            const current = byKey.get(key);
-            if (current) current.by = `${current.by}, ${label}`;
-            else byKey.set(key, { ...finding, by: label });
-          }
-        }
-        mergedFindings = [...byKey.values()];
-        mergedVerdict = councilReviewers.some((r) => r.verdict === 'request_changes') ? 'request_changes' : 'approve';
-        finishPhase(ledger, reviewId, 'done');
-        upsertCouncil('implementation', round, {
-          round,
+        const implementationRound = await runCouncilRound({
           kind: 'implementation',
-          reviewers: councilReviewers,
-          verdict: mergedVerdict,
-          findings: mergedFindings,
+          round,
+          councilId: reviewId,
+          councilName,
+          skill: phaseSkills.codeReview,
+          reviewers: roles.reviewers,
+          reviewerName: (label) => `Review — ${label}`,
+          promptText: reviewPromptText,
+          subjectSha256: implementationSubjectSha256,
+          currentSubjectSha256: () => snapshotReviewSubject(host.cwd),
+          hashExtra: { validationEvidenceSha256 },
+          advisorCriteria: `${[
+            `Role-based cezar council criteria (run ${host.runId}).`,
+            ``,
+            `The task under review: ${input.task}`,
+            `Validation gate: ${
+              ledger.validation.length === 0
+                ? 'no commands configured'
+                : ledger.validation.map((c) => `${c.command} → ${c.status}${c.preexisting ? ' (failed at baseline too — tolerated as pre-existing)' : ''}`).join('; ')
+            }`,
+            `Validation evidence sha256: ${validationEvidenceSha256}`,
+            ``,
+            `Review the worktree's uncommitted diff (the subject) against these facts.`,
+          ].join('\n')}${priorRoundsAppendix()}`,
         });
-        const consumedMessageIds = completeBoundaryMessages(
-          reviewId,
-          councilBoundaryMessages,
-        );
-        persist();
-        host.setStepStatus(reviewId, 'done');
-        emitPhase(reviewId);
-        emitBoundaryMessagesConsumed(reviewId, consumedMessageIds);
-        host.emit({
-          type: 'harness.council.updated',
-          stepId: reviewId,
-          council: { round, kind: 'implementation', reviewers: councilReviewers, verdict: mergedVerdict, findings: mergedFindings },
-        });
+        if ('stop' in implementationRound) return implementationRound.stop;
+        mergedFindings = implementationRound.findings;
+        mergedVerdict = implementationRound.verdict;
       } else {
         const review = await agentPhase(
           reviewId,
